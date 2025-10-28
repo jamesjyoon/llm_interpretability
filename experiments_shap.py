@@ -507,3 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
 if __name__ == "__main__":
     parser = build_parser()
     run_experiment(parser.parse_args())
+
+
+if __name__ == "__main__":
+    parser = build_parser()
+    run_experiment(parser.parse_args())
