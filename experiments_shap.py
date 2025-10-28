@@ -363,6 +363,16 @@ def _plot_metric_bars(
     output_path = os.path.join(output_dir, "metrics_comparison.png")
     fig.tight_layout()
     fig.savefig(output_path, dpi=200)
+
+    try:  # Attempt inline display for notebook and Colab workflows.
+        from IPython import get_ipython  # type: ignore
+        from IPython.display import display  # type: ignore
+    except ImportError:
+        display = None  # type: ignore
+    else:
+        if get_ipython() is not None:
+            display(fig)
+
     plt.close(fig)
     print(f"Saved metric visualization to {output_path}.")
 
