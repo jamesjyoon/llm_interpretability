@@ -319,6 +319,54 @@ def _ensure_output_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _plot_metric_bars(
+    zero_shot_metrics: Dict[str, float],
+    fine_tuned_metrics: Optional[Dict[str, float]],
+    output_dir: str,
+) -> None:
+    """Visualize classification metrics and save the figure.
+
+    The bar chart focuses on core metrics that are available for both the
+    zero-shot baseline and the optional fine-tuned model.  Matplotlib is
+    imported lazily so that the experiment can still run in lightweight
+    environments that do not preinstall plotting libraries.
+    """
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print("matplotlib is not installed; skipping metric visualization.")
+        return
+
+    metrics = ["accuracy", "precision", "recall", "f1"]
+    zero_values = [zero_shot_metrics.get(metric, float("nan")) for metric in metrics]
+    tuned_values: Optional[List[float]] = None
+    if fine_tuned_metrics is not None:
+        tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
+
+    x = np.arange(len(metrics))
+    width = 0.35 if tuned_values is not None else 0.6
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x - width / 2 if tuned_values is not None else x, zero_values, width, label="Zero-shot")
+    if tuned_values is not None:
+        ax.bar(x + width / 2, tuned_values, width, label="Fine-tuned")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([metric.upper() for metric in metrics])
+    ax.set_ylim(0.0, 1.05)
+    ax.set_ylabel("Score")
+    ax.set_title("Classification Metrics")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    output_path = os.path.join(output_dir, "metrics_comparison.png")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved metric visualization to {output_path}.")
+
+
 def run_experiment(args: argparse.Namespace) -> None:
     config = ExperimentConfig(
         model_name=args.model_name,
@@ -375,6 +423,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
 
     tuned_model: Optional[PeftModel] = None
+    fine_tuned_metrics: Optional[Dict[str, float]] = None
     if args.finetune:
         tuned_model = train_lora_classifier(config, model, processed_dataset)
         tuned_model.save_pretrained(os.path.join(config.output_dir, "lora_adapter"))
@@ -391,6 +440,8 @@ def run_experiment(args: argparse.Namespace) -> None:
         print(json.dumps(_ensure_json_serializable(fine_tuned_metrics), indent=2))
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(fine_tuned_metrics), handle, indent=2)
+
+    _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
 
     if config.run_shap:
         shap_samples = zero_shot_texts[: config.shap_example_count]
