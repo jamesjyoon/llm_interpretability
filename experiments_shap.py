@@ -118,7 +118,7 @@ def _prepare_dataset(
             full_sequences,
             max_length=config.max_seq_length,
             truncation=True,
-            padding="longest",
+            padding="max_length",
         )
         model_inputs["labels"] = model_inputs["input_ids"].copy()
         return model_inputs
