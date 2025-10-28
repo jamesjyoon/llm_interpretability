@@ -126,11 +126,13 @@ def _prepare_dataset(
     processed = dataset.map(_format_examples, batched=True, remove_columns=dataset["train"].column_names)
 
     if config.train_subset:
-        processed["train"] = processed["train"].shuffle(seed=config.random_seed).select(range(config.train_subset))
+        train_dataset = processed["train"].shuffle(seed=config.random_seed)
+        train_count = min(config.train_subset, train_dataset.num_rows)
+        processed["train"] = train_dataset.select(range(train_count))
     if config.eval_subset:
-        processed["validation"] = processed["validation"].shuffle(seed=config.random_seed).select(
-            range(config.eval_subset)
-        )
+        validation_dataset = processed["validation"].shuffle(seed=config.random_seed)
+        validation_count = min(config.eval_subset, validation_dataset.num_rows)
+        processed["validation"] = validation_dataset.select(range(validation_count))
     return processed
 
 
@@ -139,7 +141,9 @@ def _prepare_zero_shot_texts(
 ) -> Tuple[List[str], List[int]]:
     validation_split = original_dataset["validation"]
     if config.eval_subset:
-        validation_split = validation_split.shuffle(seed=config.random_seed).select(range(config.eval_subset))
+        eval_count = min(config.eval_subset, len(validation_split))
+        validation_split = validation_split.shuffle(seed=config.random_seed)
+        validation_split = validation_split.select(range(eval_count))
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
     return texts, labels
