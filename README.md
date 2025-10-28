@@ -2,7 +2,7 @@
 
 ## Binary classification experiment (Colab-ready)
 
-The `experiments.py` script implements the workflow discussed in
+The `experiments_shap.py` script implements the workflow discussed in
 our last meeting: it compares zero-shot and LoRA fine-tuned variants of a
 TinyLLaMA model on a binary sentiment classification task, then captures token
 level SHAP explanations for both models.
@@ -13,7 +13,7 @@ level SHAP explanations for both models.
 2. Clone this repository and install the dependencies:
 
    ```python
-   !git clone https://github.com/<your-org>/llm_interpretability.git
+   !git clone https://github.com/jamesjyoon/llm_interpretability.git
    %cd llm_interpretability
    !pip install -r requirements.txt
    ```
@@ -23,7 +23,7 @@ level SHAP explanations for both models.
    and generates SHAP attributions for the first 10 validation examples.
 
    ```python
-   !python experiments.py --finetune --run-shap --output-dir outputs/sst2_tinyllama
+   !python experiments_shap.py --finetune --run-shap --output-dir outputs/sst2_tinyllama
    ```
 
 4. Inspect the outputs stored under `outputs/sst2_tinyllama/`:
