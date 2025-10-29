@@ -37,8 +37,10 @@ from transformers import (
 )
 
 try:  # pragma: no cover - defensive import for nicer gated model errors
+    from huggingface_hub import login as hf_login
     from huggingface_hub.errors import GatedRepoError, RepoAccessError
 except Exception:  # pragma: no cover - fallback when huggingface_hub is unavailable
+    hf_login = None
     GatedRepoError = RepoAccessError = type("_DummyHFError", (Exception,), {})
 
 
@@ -61,8 +63,22 @@ def _raise_hf_access_error(target: str, model_name: str, exc: Exception) -> NoRe
 LabelTokenMap = Dict[int, int]
 
 
-def _load_label_token_map(tokenizer) -> LabelTokenMap:
-    """Return a mapping from label integers to their token ids.
+def _maybe_login_to_hf(token: Optional[str]) -> None:
+    """Authenticate with Hugging Face when a token is supplied."""
+
+    if not token:
+        return
+    if hf_login is None:  # pragma: no cover - import guard for minimal installs
+        print(
+            "Hugging Face token provided but `huggingface_hub` is unavailable; install it "
+            "to enable automatic authentication."
+        )
+        return
+    hf_login(token, add_to_git_credential=False)
+
+
+def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
+    """Return a mapping from dataset labels to their token ids.
 
     LLaMA-style tokenizers encode numbers with a leading space as a single
     token (e.g., ``" 0"`` becomes ``"▁0"``).  Using the space-prefixed
@@ -70,15 +86,19 @@ def _load_label_token_map(tokenizer) -> LabelTokenMap:
     elsewhere in this module and avoids situations where ``"0"`` would be
     split across multiple tokens.
     """
+
+    if not label_space:
+        raise ValueError("At least one label must be provided to build the token map.")
+
     label_token_map: LabelTokenMap = {}
-    for label in (0, 1):
+    for label in label_space:
         label_text = f" {label}"
         token_ids = tokenizer(
             label_text, add_special_tokens=False, return_attention_mask=False
         )["input_ids"]
         if not token_ids:
             raise ValueError(f"Tokenizer could not encode label {label}.")
-        label_token_map[label] = token_ids[-1]
+        label_token_map[int(label)] = token_ids[-1]
     return label_token_map
 
 
@@ -110,15 +130,26 @@ class ExperimentConfig:
     shap_max_evals: int = 200
     shap_example_count: int = 10
     load_in_4bit: bool = True
+    label_space: Optional[Sequence[int]] = None
 
 
 class PromptFormatter:
     """Converts sentences into classification prompts."""
 
-    def __init__(self) -> None:
+    def __init__(self, label_space: Sequence[int]) -> None:
+        self.label_space = list(label_space)
+        label_list = ", ".join(str(label) for label in self.label_space)
+        if set(self.label_space) == {0, 1}:
+            instruction = (
+                "Respond with only the digit `1` for positive sentiment and `0` for negative sentiment."
+            )
+        else:
+            instruction = (
+                "Respond with only one of the digits {" + label_list + "} to indicate the sentiment class."
+            )
         self.template = (
             "You are a sentiment classifier.\n"
-            "Respond with only the digit `1` for positive sentiment and `0` for negative sentiment.\n"
+            f"{instruction}\n"
             "Tweet: {sentence}\n"
             "Label:"
         )
@@ -187,6 +218,36 @@ def _prepare_zero_shot_texts(
     return texts, labels
 
 
+def _resolve_label_space(config: ExperimentConfig, dataset: DatasetDict) -> List[int]:
+    """Infer the set of labels present in the dataset if not provided explicitly."""
+
+    if config.label_space is not None:
+        return sorted({int(label) for label in config.label_space})
+
+    label_values: set[int] = set()
+    for split in {config.train_split, config.eval_split} & set(dataset.keys()):
+        column = dataset[split][config.label_field]
+        label_values.update(int(label) for label in column)
+
+    if not label_values:
+        raise ValueError("Unable to infer label space from the dataset; please specify `label_space`.")
+
+    return sorted(label_values)
+
+
+def _filter_dataset_by_labels(
+    dataset: DatasetDict, config: ExperimentConfig, label_space: Sequence[int]
+) -> DatasetDict:
+    """Restrict the dataset to the requested label ids."""
+
+    allowed_labels = {int(label) for label in label_space}
+
+    def predicate(example):
+        return int(example[config.label_field]) in allowed_labels
+
+    return dataset.filter(predicate)
+
+
 def _classification_probabilities(
     model: AutoModelForCausalLM,
     tokenizer,
@@ -209,7 +270,10 @@ def _classification_probabilities(
     logits = outputs.logits
     sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
     final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
-    label_token_ids = torch.tensor([label_token_map[0], label_token_map[1]], device=device)
+    ordered_labels = list(sorted(label_token_map))
+    label_token_ids = torch.tensor(
+        [label_token_map[label] for label in ordered_labels], device=device
+    )
     label_logits = final_logits[:, label_token_ids]
     probs = torch.softmax(label_logits, dim=-1)
     return probs.detach().cpu().numpy()
@@ -232,7 +296,7 @@ def _generate_class_predictions(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[List[int], np.ndarray]:
     inputs = tokenizer(
         list(prompts),
         padding=True,
@@ -257,11 +321,14 @@ def _generate_class_predictions(
         )
 
     scores = generation.scores[0]
-    label_token_ids = torch.tensor([label_token_map[0], label_token_map[1]], device=scores.device)
+    ordered_labels = list(sorted(label_token_map))
+    label_token_ids = torch.tensor(
+        [label_token_map[label] for label in ordered_labels], device=scores.device
+    )
     label_logits = scores[:, label_token_ids]
     probs = torch.softmax(label_logits, dim=-1)
-    predictions = probs.argmax(dim=-1).detach().cpu().numpy().astype(np.int64)
-    positive_probs = probs[:, 1].detach().cpu().numpy().astype(np.float32)
+    pred_indices = probs.argmax(dim=-1).detach().cpu().tolist()
+    predictions = [ordered_labels[index] for index in pred_indices]
 
     generated_tokens = generation.sequences[:, -1]
     mismatched_indices: List[int] = []
@@ -274,7 +341,7 @@ def _generate_class_predictions(
             f"for batch indices {mismatched_indices}. Predictions fall back to argmax probabilities."
         )
 
-    return predictions, positive_probs
+    return predictions, probs.detach().cpu().numpy()
 
 
 def _batched(iterator: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
@@ -293,7 +360,8 @@ def evaluate_zero_shot(
     batch_size: int = 8,
 ) -> Dict[str, float]:
     predictions: List[int] = []
-    probabilities: List[float] = []
+    probability_rows: List[List[float]] = []
+    ordered_labels = list(sorted(label_token_map))
     for batch_prompts in _batched(list(prompts), batch_size):
         preds, probs = _generate_class_predictions(
             model,
@@ -303,16 +371,31 @@ def evaluate_zero_shot(
             device,
             max_length,
         )
-        predictions.extend(preds.astype(int).tolist())
-        probabilities.extend(probs.astype(float).tolist())
+        predictions.extend(preds)
+        probability_rows.extend(probs.astype(float).tolist())
+
+    label_set = sorted(set(labels) | set(predictions))
+    average = "binary" if len(label_set) == 2 else "weighted"
 
     metrics = {
         "accuracy": float(accuracy_score(labels, predictions)),
-        "precision": float(precision_score(labels, predictions, zero_division=0)),
-        "recall": float(recall_score(labels, predictions, zero_division=0)),
-        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "precision": float(
+            precision_score(labels, predictions, average=average, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(labels, predictions, average=average, zero_division=0)
+        ),
+        "f1": float(f1_score(labels, predictions, average=average, zero_division=0)),
     }
-    metrics["positive_probability_mean"] = float(np.mean(probabilities))
+
+    if probability_rows:
+        probability_array = np.array(probability_rows, dtype=float)
+        metrics["mean_max_probability"] = float(np.max(probability_array, axis=1).mean())
+        if len(ordered_labels) == 2 and 1 in ordered_labels:
+            positive_index = ordered_labels.index(1)
+            metrics["positive_probability_mean"] = float(
+                probability_array[:, positive_index].mean()
+            )
     return metrics
 
 
@@ -390,7 +473,8 @@ def compute_shap_values(
             max_length,
         )
 
-    explainer = shap.Explainer(predict_fn, masker, output_names=["0", "1"])
+    output_names = [str(label) for label in sorted(label_token_map)]
+    explainer = shap.Explainer(predict_fn, masker, output_names=output_names)
     return explainer(texts, max_evals=max_evals)
 
 
@@ -523,8 +607,9 @@ def _select_label_dimension(values: np.ndarray) -> np.ndarray:
         return values.reshape(1)
     if values.ndim == 1:
         return values
-    class_index = 1 if values.shape[-1] > 1 else 0
-    return values[..., class_index]
+    if values.shape[-1] == 1:
+        return values[..., 0]
+    return values.mean(axis=-1)
 
 
 def _normalize_token_scores(values: np.ndarray, token_count: int) -> np.ndarray:
@@ -615,6 +700,11 @@ def compare_shap_explanations(
 
 
 def run_experiment(args: argparse.Namespace) -> None:
+    provided_token = args.huggingface_token or os.environ.get("HF_TOKEN") or os.environ.get(
+        "HUGGINGFACE_TOKEN"
+    )
+    _maybe_login_to_hf(provided_token)
+
     config = ExperimentConfig(
         model_name=args.model_name,
         dataset_name=args.dataset_name,
@@ -630,6 +720,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         shap_max_evals=args.shap_max_evals,
         load_in_4bit=args.load_in_4bit,
         output_dir=args.output_dir,
+        label_space=args.label_space,
     )
 
     set_seed(config.random_seed)
@@ -658,13 +749,16 @@ def run_experiment(args: argparse.Namespace) -> None:
     if not config.load_in_4bit:
         model.to(device)
 
-    label_token_map = _load_label_token_map(tokenizer)
-    formatter = PromptFormatter()
-
     if config.dataset_config:
         raw_dataset = load_dataset(config.dataset_name, config.dataset_config)
     else:
         raw_dataset = load_dataset(config.dataset_name)
+
+    label_space = _resolve_label_space(config, raw_dataset)
+    if config.label_space is not None:
+        raw_dataset = _filter_dataset_by_labels(raw_dataset, config, label_space)
+    label_token_map = _load_label_token_map(tokenizer, label_space)
+    formatter = PromptFormatter(label_space)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
 
     zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
@@ -756,7 +850,7 @@ def run_experiment(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run binary classification interpretability experiment.")
+    parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
@@ -764,6 +858,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-split", default="test")
     parser.add_argument("--text-field", default="text")
     parser.add_argument("--label-field", default="label")
+    parser.add_argument(
+        "--label-space",
+        nargs="*",
+        type=int,
+        help="Explicit list of label ids to model (defaults to inferring from the dataset)",
+    )
     parser.add_argument("--train-subset", type=int, default=2000)
     parser.add_argument("--eval-subset", type=int, default=1000)
     parser.add_argument("--run-shap", action="store_true")
@@ -776,6 +876,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(load_in_4bit=True)
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--output-dir", default="outputs/tweet_sentiment_extraction")
+    parser.add_argument(
+        "--huggingface-token",
+        default=None,
+        help="Personal access token for gated Hugging Face repositories."
+        " If omitted, the script will fall back to the HF_TOKEN or HUGGINGFACE_TOKEN"
+        " environment variables when present.",
+    )
     return parser
 
 
