@@ -12,7 +12,7 @@ import json
 import os
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -35,6 +35,27 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+
+try:  # pragma: no cover - defensive import for nicer gated model errors
+    from huggingface_hub.errors import GatedRepoError, RepoAccessError
+except Exception:  # pragma: no cover - fallback when huggingface_hub is unavailable
+    GatedRepoError = RepoAccessError = type("_DummyHFError", (Exception,), {})
+
+
+HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
+
+
+def _raise_hf_access_error(target: str, model_name: str, exc: Exception) -> NoReturn:
+    """Surface actionable guidance when gated Hugging Face assets are requested."""
+
+    base_message = (
+        f"Failed to load the {target} for `{model_name}`.\n"
+        f"If the repository is gated, visit https://huggingface.co/{model_name} to request access "
+        "and authenticate before rerunning the script, for example by executing\n"
+        "`from huggingface_hub import login; login(\"YOUR_TOKEN\")` in your Colab runtime.\n"
+        "Alternatively, rerun with `--model-name` set to a public checkpoint."
+    )
+    raise SystemExit(f"{base_message}\nOriginal error: {exc}") from exc
 
 
 LabelTokenMap = Dict[int, int]
@@ -619,7 +640,10 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     _ensure_output_dir(config.output_dir)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    except HF_ACCESS_ERRORS as exc:
+        _raise_hf_access_error("tokenizer", config.model_name, exc)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
@@ -627,7 +651,10 @@ def run_experiment(args: argparse.Namespace) -> None:
     if config.load_in_4bit:
         base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
 
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
+    except HF_ACCESS_ERRORS as exc:
+        _raise_hf_access_error("model", config.model_name, exc)
     if not config.load_in_4bit:
         model.to(device)
 
