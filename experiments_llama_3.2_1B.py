@@ -145,7 +145,9 @@ class PromptFormatter:
             )
         else:
             instruction = (
-                "Respond with only one of the digits {" + label_list + "} to indicate the sentiment class."
+                "Respond with only one of the digits "
+                + label_list
+                + " to indicate the sentiment class."
             )
         self.template = (
             "You are a sentiment classifier.\n"
