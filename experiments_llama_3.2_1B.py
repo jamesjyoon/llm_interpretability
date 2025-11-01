@@ -17,7 +17,14 @@ from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence,
 import numpy as np
 import torch
 from datasets import DatasetDict, load_dataset
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_recall_fscore_support,
+    precision_score,
+    recall_score,
+)
 
 try:
     import shap  # type: ignore
@@ -390,6 +397,28 @@ def evaluate_zero_shot(
         "f1": float(f1_score(labels, predictions, average=average, zero_division=0)),
     }
 
+    per_class_precision, per_class_recall, per_class_f1, per_class_support = (
+        precision_recall_fscore_support(
+            labels,
+            predictions,
+            labels=ordered_labels,
+            zero_division=0,
+        )
+    )
+
+    metrics["per_class"] = {
+        str(label): {
+            "precision": float(per_class_precision[idx]),
+            "recall": float(per_class_recall[idx]),
+            "f1": float(per_class_f1[idx]),
+            "support": int(per_class_support[idx]),
+        }
+        for idx, label in enumerate(ordered_labels)
+    }
+
+    cm = confusion_matrix(labels, predictions, labels=ordered_labels)
+    metrics["confusion_matrix"] = cm.astype(int).tolist()
+
     if probability_rows:
         probability_array = np.array(probability_rows, dtype=float)
         metrics["mean_max_probability"] = float(np.max(probability_array, axis=1).mean())
@@ -638,6 +667,7 @@ def _iter_shap_examples(explanation: shap.Explanation) -> Iterator[Tuple[List[st
 def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object]:
     token_scores = defaultdict(float)
     example_means: List[float] = []
+    example_stds: List[float] = []
 
     for tokens, values in _iter_shap_examples(explanation):
         if not tokens:
@@ -646,6 +676,7 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
         if scores.size == 0:
             continue
         example_means.append(float(scores.mean()))
+        example_stds.append(float(scores.std()))
         for token, score in zip(tokens, scores):
             token_scores[token] += float(score)
 
@@ -653,6 +684,9 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
     if example_means:
         summary["mean_absolute_token_importance"] = float(np.mean(example_means))
         summary["std_absolute_token_importance"] = float(np.std(example_means))
+        summary["median_absolute_token_importance"] = float(np.median(example_means))
+    if example_stds:
+        summary["mean_token_importance_std"] = float(np.mean(example_stds))
 
     if token_scores:
         top_tokens = sorted(token_scores.items(), key=lambda item: item[1], reverse=True)[:5]
@@ -662,11 +696,51 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
     return summary
 
 
+def _collect_shap_statistics(explanation: shap.Explanation) -> List[Dict[str, object]]:
+    statistics: List[Dict[str, object]] = []
+    for index, (tokens, values) in enumerate(_iter_shap_examples(explanation)):
+        if not tokens:
+            continue
+        scores = np.abs(_normalize_token_scores(values, len(tokens)))
+        if scores.size == 0:
+            continue
+        ordering = np.argsort(scores)[::-1]
+        top_tokens = [
+            {"token": tokens[pos], "score": float(scores[pos])}
+            for pos in ordering[:5]
+        ]
+        statistics.append(
+            {
+                "example_index": index,
+                "mean_abs_importance": float(scores.mean()),
+                "std_abs_importance": float(scores.std()),
+                "token_count": len(tokens),
+                "top_tokens": top_tokens,
+            }
+        )
+    return statistics
+
+
+def _pooled_stddev(sample_a: Sequence[float], sample_b: Sequence[float]) -> float:
+    n_a = len(sample_a)
+    n_b = len(sample_b)
+    if n_a < 2 and n_b < 2:
+        return 0.0
+    var_a = np.var(sample_a, ddof=1) if n_a > 1 else 0.0
+    var_b = np.var(sample_b, ddof=1) if n_b > 1 else 0.0
+    denominator = max(n_a + n_b - 2, 1)
+    pooled = ((n_a - 1) * var_a + (n_b - 1) * var_b) / denominator if denominator else 0.0
+    return float(np.sqrt(max(pooled, 0.0)))
+
+
 def compare_shap_explanations(
     zero_shot: shap.Explanation, fine_tuned: shap.Explanation
 ) -> Dict[str, float]:
     cosine_similarities: List[float] = []
     jaccard_scores: List[float] = []
+    zero_means: List[float] = []
+    tuned_means: List[float] = []
+    per_example_correlations: List[float] = []
 
     for (zero_tokens, zero_values), (tuned_tokens, tuned_values) in zip(
         _iter_shap_examples(zero_shot),
@@ -684,6 +758,14 @@ def compare_shap_explanations(
         if denom > 0:
             cosine_similarities.append(float(np.dot(zero_scores, tuned_scores) / denom))
 
+        zero_means.append(float(zero_scores.mean()))
+        tuned_means.append(float(tuned_scores.mean()))
+
+        correlation_matrix = np.corrcoef(zero_scores, tuned_scores)
+        corr_value = correlation_matrix[0, 1]
+        if np.isfinite(corr_value):
+            per_example_correlations.append(float(corr_value))
+
         top_k = min(5, len(zero_scores), len(tuned_scores))
         if top_k == 0:
             continue
@@ -698,6 +780,18 @@ def compare_shap_explanations(
         comparison["mean_token_cosine_similarity"] = float(np.mean(cosine_similarities))
     if jaccard_scores:
         comparison["mean_top_token_jaccard"] = float(np.mean(jaccard_scores))
+    if zero_means and tuned_means:
+        mean_diff = np.array(tuned_means) - np.array(zero_means)
+        comparison["mean_abs_importance_difference"] = float(np.mean(mean_diff))
+        pooled_std = _pooled_stddev(zero_means, tuned_means)
+        if pooled_std > 0:
+            comparison["cohens_d_abs_importance"] = float(
+                (np.mean(tuned_means) - np.mean(zero_means)) / pooled_std
+            )
+    if per_example_correlations:
+        comparison["mean_token_importance_correlation"] = float(
+            np.mean(per_example_correlations)
+        )
     return comparison
 
 
@@ -815,7 +909,9 @@ def run_experiment(args: argparse.Namespace) -> None:
             )
             save_shap_values(zero_shot_shap, os.path.join(config.output_dir, "zero_shot_shap.json"))
             print(f"Saved zero-shot SHAP explanations for {len(shap_samples)} examples.")
-            interpretability_summary = {"zero_shot": summarize_shap_importance(zero_shot_shap)}
+            zero_summary = summarize_shap_importance(zero_shot_shap)
+            zero_summary["per_example_stats"] = _collect_shap_statistics(zero_shot_shap)
+            interpretability_summary = {"zero_shot": zero_summary}
 
             if tuned_model is not None:
                 tuned_shap = compute_shap_values(
@@ -830,11 +926,19 @@ def run_experiment(args: argparse.Namespace) -> None:
                 save_shap_values(tuned_shap, os.path.join(config.output_dir, "fine_tuned_shap.json"))
                 print("Saved fine-tuned SHAP explanations.")
                 tuned_summary = summarize_shap_importance(tuned_shap)
+                tuned_summary["per_example_stats"] = _collect_shap_statistics(tuned_shap)
                 if interpretability_summary is None:
                     interpretability_summary = {}
                 interpretability_summary["fine_tuned"] = tuned_summary
                 if "zero_shot" in interpretability_summary:
                     comparison = compare_shap_explanations(zero_shot_shap, tuned_shap)
+                    zero_stats = interpretability_summary["zero_shot"].get("per_example_stats", [])
+                    tuned_stats = tuned_summary.get("per_example_stats", [])
+                    if len(zero_stats) == len(tuned_stats) and zero_stats:
+                        comparison["per_example_mean_abs_difference"] = [
+                            float(tuned_stats[idx]["mean_abs_importance"] - zero_stats[idx]["mean_abs_importance"])
+                            for idx in range(len(zero_stats))
+                        ]
                     zero_top = set(interpretability_summary["zero_shot"].get("top_tokens", []))
                     tuned_top = set(tuned_summary.get("top_tokens", []))
                     union = zero_top | tuned_top
