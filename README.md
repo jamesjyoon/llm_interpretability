@@ -47,17 +47,7 @@ metrics for both approaches.
    !python experiments_llama_3.5_1B.py --finetune --run-shap --output-dir outputs/tweet_sentiment_extraction
    ```
 
-5. (Optional) Preview the dataset to understand the task schema before
-   training. This uses the 🤗 Datasets dependency installed earlier:
-
-   ```python
-   from datasets import load_dataset
-
-   dataset = load_dataset("mteb/tweet_sentiment_extraction")
-   dataset
-   ```
-
-6. Inspect the outputs stored under `outputs/tweet_sentiment_extraction/`:
+5. Inspect the outputs stored under `outputs/tweet_sentiment_extraction/`:
    - `zero_shot_metrics.json` and `fine_tuned_metrics.json` contain accuracy,
      precision, recall, and F1 scores (averaged per task configuration), plus
      helpful probability summaries such as the mean max-class confidence.
