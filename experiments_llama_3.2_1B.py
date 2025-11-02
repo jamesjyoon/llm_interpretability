@@ -10,6 +10,7 @@ adapter, and computes SHAP token attributions for both models.
 import argparse
 import json
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
@@ -17,6 +18,9 @@ from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence,
 import numpy as np
 import torch
 from datasets import DatasetDict, load_dataset
+from scipy.stats import spearmanr
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -138,6 +142,10 @@ class ExperimentConfig:
     shap_example_count: int = 10
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
+    run_baseline: bool = True
+    baseline_max_features: int = 5000
+    baseline_ngram_range: Tuple[int, int] = (1, 2)
+    baseline_max_iter: int = 1000
 
 
 class PromptFormatter:
@@ -224,6 +232,23 @@ def _prepare_zero_shot_texts(
         validation_split = validation_split.select(range(eval_count))
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
+    return texts, labels
+
+
+def _extract_split_texts(
+    dataset: DatasetDict,
+    split_name: str,
+    text_field: str,
+    label_field: str,
+    subset: Optional[int],
+    seed: int,
+) -> Tuple[List[str], List[int]]:
+    split = dataset[split_name]
+    if subset:
+        subset_size = min(subset, len(split))
+        split = split.shuffle(seed=seed).select(range(subset_size))
+    texts = [str(item) for item in split[text_field]]
+    labels = [int(label) for label in split[label_field]]
     return texts, labels
 
 
@@ -612,6 +637,77 @@ def _plot_metric_bars(
     print(message)
 
 
+def _plot_shap_summary(
+    explanation: shap.Explanation,
+    output_dir: str,
+    prefix: str,
+    top_k: int = 20,
+) -> Optional[str]:
+    """Aggregate SHAP scores and visualize the highest-impact tokens."""
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print("matplotlib is not installed; skipping SHAP visualization.")
+        return None
+
+    token_scores = defaultdict(float)
+    for tokens, values in _iter_shap_examples(explanation):
+        if not tokens:
+            continue
+        scores = np.abs(_normalize_token_scores(values, len(tokens)))
+        if scores.size == 0:
+            continue
+        for token, score in zip(tokens, scores):
+            token_scores[token] += float(score)
+
+    if not token_scores:
+        print(f"No SHAP scores available to visualize for {prefix}; skipping plot.")
+        return None
+
+    top_items = sorted(token_scores.items(), key=lambda item: item[1], reverse=True)[:top_k]
+    tokens = [token for token, _ in top_items]
+    scores = [score for _, score in top_items]
+
+    # Reverse for a top-to-bottom horizontal bar chart.
+    tokens = tokens[::-1]
+    scores = scores[::-1]
+
+    height = max(4.0, 0.35 * len(tokens) + 1.0)
+    fig, ax = plt.subplots(figsize=(9, height))
+    ax.barh(np.arange(len(tokens)), scores, color="#4c72b0")
+    ax.set_yticks(np.arange(len(tokens)))
+    ax.set_yticklabels(tokens)
+    ax.set_xlabel("Total |SHAP| score")
+    ax.set_title(f"Top token contributions ({prefix.replace('_', ' ').title()})")
+    ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_shap_summary.png")
+    fig.savefig(output_path, dpi=200)
+
+    inline_displayed = False
+    try:
+        from IPython import get_ipython  # type: ignore
+        from IPython.display import display  # type: ignore
+    except ImportError:
+        pass
+    else:
+        ipython = get_ipython()
+        if ipython is not None and getattr(ipython, "kernel", None) is not None:
+            display(fig)
+            inline_displayed = True
+
+    plt.close(fig)
+
+    absolute_path = os.path.abspath(output_path)
+    message = f"Saved SHAP visualization to {absolute_path}."
+    if not inline_displayed:
+        message += " Inline display is unavailable in this environment; open the PNG to review the summary."
+    print(message)
+    return absolute_path
+
+
 def _iter_object_container(container) -> Iterator:
     if isinstance(container, np.ndarray) and container.dtype == object:
         for item in container:
@@ -654,6 +750,37 @@ def _normalize_token_scores(values: np.ndarray, token_count: int) -> np.ndarray:
     return label_values.astype(float)
 
 
+def _normalize_distribution(scores: np.ndarray) -> np.ndarray:
+    total = float(scores.sum())
+    if scores.size == 0 or total <= 0:
+        return np.zeros(scores.size, dtype=float)
+    return (scores / total).astype(float)
+
+
+def _gini_coefficient(distribution: np.ndarray) -> float:
+    if distribution.size == 0:
+        return 0.0
+    sorted_values = np.sort(distribution)
+    if sorted_values[-1] == 0:
+        return 0.0
+    cumulative = np.cumsum(sorted_values)
+    total = cumulative[-1]
+    if total <= 0:
+        return 0.0
+    n = distribution.size
+    gini = (n + 1 - 2 * np.sum(cumulative / total)) / n
+    return float(max(gini, 0.0))
+
+
+def _entropy(distribution: np.ndarray) -> float:
+    if distribution.size == 0:
+        return 0.0
+    positive = distribution[distribution > 0]
+    if positive.size == 0:
+        return 0.0
+    return float(-np.sum(positive * np.log(positive)))
+
+
 def _iter_shap_examples(explanation: shap.Explanation) -> Iterator[Tuple[List[str], np.ndarray]]:
     for tokens, values in zip(
         _iter_object_container(explanation.data),
@@ -668,6 +795,8 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
     token_scores = defaultdict(float)
     example_means: List[float] = []
     example_stds: List[float] = []
+    sparsity_values: List[float] = []
+    entropy_values: List[float] = []
 
     for tokens, values in _iter_shap_examples(explanation):
         if not tokens:
@@ -677,6 +806,9 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
             continue
         example_means.append(float(scores.mean()))
         example_stds.append(float(scores.std()))
+        distribution = _normalize_distribution(scores)
+        sparsity_values.append(_gini_coefficient(distribution))
+        entropy_values.append(_entropy(distribution))
         for token, score in zip(tokens, scores):
             token_scores[token] += float(score)
 
@@ -687,6 +819,10 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
         summary["median_absolute_token_importance"] = float(np.median(example_means))
     if example_stds:
         summary["mean_token_importance_std"] = float(np.mean(example_stds))
+    if sparsity_values:
+        summary["mean_token_gini"] = float(np.mean(sparsity_values))
+    if entropy_values:
+        summary["mean_token_entropy"] = float(np.mean(entropy_values))
 
     if token_scores:
         top_tokens = sorted(token_scores.items(), key=lambda item: item[1], reverse=True)[:5]
@@ -741,6 +877,13 @@ def compare_shap_explanations(
     zero_means: List[float] = []
     tuned_means: List[float] = []
     per_example_correlations: List[float] = []
+    spearman_scores: List[float] = []
+    zero_sparsity: List[float] = []
+    tuned_sparsity: List[float] = []
+    zero_entropy: List[float] = []
+    tuned_entropy: List[float] = []
+    top5_overlap: List[float] = []
+    top10_overlap: List[float] = []
 
     for (zero_tokens, zero_values), (tuned_tokens, tuned_values) in zip(
         _iter_shap_examples(zero_shot),
@@ -766,6 +909,18 @@ def compare_shap_explanations(
         if np.isfinite(corr_value):
             per_example_correlations.append(float(corr_value))
 
+        if zero_scores.size > 1 and tuned_scores.size > 1:
+            rho, _ = spearmanr(zero_scores, tuned_scores)
+            if np.isfinite(rho):
+                spearman_scores.append(float(rho))
+
+        zero_dist = _normalize_distribution(zero_scores)
+        tuned_dist = _normalize_distribution(tuned_scores)
+        zero_sparsity.append(_gini_coefficient(zero_dist))
+        tuned_sparsity.append(_gini_coefficient(tuned_dist))
+        zero_entropy.append(_entropy(zero_dist))
+        tuned_entropy.append(_entropy(tuned_dist))
+
         top_k = min(5, len(zero_scores), len(tuned_scores))
         if top_k == 0:
             continue
@@ -774,12 +929,23 @@ def compare_shap_explanations(
         union = zero_top | tuned_top
         if union:
             jaccard_scores.append(len(zero_top & tuned_top) / len(union))
+            top5_overlap.append(len(zero_top & tuned_top) / top_k)
+
+        top_k10 = min(10, len(zero_scores), len(tuned_scores))
+        if top_k10:
+            zero_top10 = set(np.argsort(zero_scores)[-top_k10:])
+            tuned_top10 = set(np.argsort(tuned_scores)[-top_k10:])
+            top10_overlap.append(len(zero_top10 & tuned_top10) / top_k10)
 
     comparison: Dict[str, float] = {}
     if cosine_similarities:
         comparison["mean_token_cosine_similarity"] = float(np.mean(cosine_similarities))
     if jaccard_scores:
         comparison["mean_top_token_jaccard"] = float(np.mean(jaccard_scores))
+    if top5_overlap:
+        comparison["mean_top5_overlap"] = float(np.mean(top5_overlap))
+    if top10_overlap:
+        comparison["mean_top10_overlap"] = float(np.mean(top10_overlap))
     if zero_means and tuned_means:
         mean_diff = np.array(tuned_means) - np.array(zero_means)
         comparison["mean_abs_importance_difference"] = float(np.mean(mean_diff))
@@ -792,7 +958,118 @@ def compare_shap_explanations(
         comparison["mean_token_importance_correlation"] = float(
             np.mean(per_example_correlations)
         )
+    if spearman_scores:
+        comparison["mean_spearman_correlation"] = float(np.mean(spearman_scores))
+    if zero_sparsity:
+        comparison["mean_zero_shot_gini"] = float(np.mean(zero_sparsity))
+    if tuned_sparsity:
+        comparison["mean_fine_tuned_gini"] = float(np.mean(tuned_sparsity))
+    if zero_entropy:
+        comparison["mean_zero_shot_entropy"] = float(np.mean(zero_entropy))
+    if tuned_entropy:
+        comparison["mean_fine_tuned_entropy"] = float(np.mean(tuned_entropy))
     return comparison
+
+
+def _summarize_logistic_coefficients(
+    classifier: LogisticRegression, vectorizer: TfidfVectorizer, top_k: int = 10
+) -> Dict[str, object]:
+    feature_names = vectorizer.get_feature_names_out()
+    coefficients = classifier.coef_
+    classes = classifier.classes_
+
+    summary: Dict[str, object] = {"top_features": {}}
+    if coefficients.ndim == 1:
+        coef = coefficients
+        ordering = np.argsort(np.abs(coef))[::-1][:top_k]
+        summary["top_features"][str(classes[0])] = [
+            {"feature": feature_names[idx], "weight": float(coef[idx])}
+            for idx in ordering
+        ]
+    else:
+        for class_index, class_label in enumerate(classes):
+            coef = coefficients[class_index]
+            ordering = np.argsort(np.abs(coef))[::-1][:top_k]
+            summary["top_features"][str(class_label)] = [
+                {"feature": feature_names[idx], "weight": float(coef[idx])}
+                for idx in ordering
+            ]
+    return summary
+
+
+def evaluate_tfidf_baseline(
+    config: ExperimentConfig,
+    train_texts: Sequence[str],
+    train_labels: Sequence[int],
+    eval_texts: Sequence[str],
+    eval_labels: Sequence[int],
+) -> Dict[str, object]:
+    """Train and evaluate the classical TF–IDF + logistic regression baseline.
+
+    David's and Brennen's notebooks both ground their analysis with this
+    transparent model before probing LLM behavior. Keeping the same reference
+    pipeline in the script ensures our interpretability metrics can be compared
+    against a simple, coefficient-driven classifier instead of only contrasting
+    two large-language-model variants.
+    """
+    vectorizer = TfidfVectorizer(
+        max_features=config.baseline_max_features,
+        ngram_range=config.baseline_ngram_range,
+    )
+    classifier = LogisticRegression(max_iter=config.baseline_max_iter)
+
+    start_time = time.perf_counter()
+    train_matrix = vectorizer.fit_transform(train_texts)
+    classifier.fit(train_matrix, train_labels)
+    training_elapsed = time.perf_counter() - start_time
+
+    eval_matrix = vectorizer.transform(eval_texts)
+    predictions = classifier.predict(eval_matrix)
+    probabilities = classifier.predict_proba(eval_matrix)
+
+    label_set = sorted(set(eval_labels) | set(predictions))
+    average = "binary" if len(label_set) == 2 else "weighted"
+    metrics: Dict[str, object] = {
+        "accuracy": float(accuracy_score(eval_labels, predictions)),
+        "precision": float(
+            precision_score(eval_labels, predictions, average=average, zero_division=0)
+        ),
+        "recall": float(
+            recall_score(eval_labels, predictions, average=average, zero_division=0)
+        ),
+        "f1": float(f1_score(eval_labels, predictions, average=average, zero_division=0)),
+        "training_time_seconds": float(training_elapsed),
+    }
+
+    per_class_precision, per_class_recall, per_class_f1, per_class_support = (
+        precision_recall_fscore_support(
+            eval_labels,
+            predictions,
+            labels=label_set,
+            zero_division=0,
+        )
+    )
+    metrics["per_class"] = {
+        str(label): {
+            "precision": float(per_class_precision[idx]),
+            "recall": float(per_class_recall[idx]),
+            "f1": float(per_class_f1[idx]),
+            "support": int(per_class_support[idx]),
+        }
+        for idx, label in enumerate(label_set)
+    }
+
+    cm = confusion_matrix(eval_labels, predictions, labels=label_set)
+    metrics["confusion_matrix"] = cm.astype(int).tolist()
+
+    if probabilities.size:
+        metrics["mean_max_probability"] = float(np.max(probabilities, axis=1).mean())
+        if len(label_set) == 2 and 1 in label_set:
+            positive_index = label_set.index(1)
+            metrics["positive_probability_mean"] = float(probabilities[:, positive_index].mean())
+
+    metrics.update(_summarize_logistic_coefficients(classifier, vectorizer))
+    return metrics
 
 
 def run_experiment(args: argparse.Namespace) -> None:
@@ -812,6 +1089,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         train_subset=args.train_subset,
         eval_subset=args.eval_subset,
         run_shap=args.run_shap,
+        run_baseline=args.run_baseline,
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
         load_in_4bit=args.load_in_4bit,
@@ -856,6 +1134,36 @@ def run_experiment(args: argparse.Namespace) -> None:
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
+
+    baseline_metrics: Optional[Dict[str, object]] = None
+    if config.run_baseline:
+        train_texts, train_labels = _extract_split_texts(
+            raw_dataset,
+            config.train_split,
+            config.text_field,
+            config.label_field,
+            config.train_subset,
+            config.random_seed,
+        )
+        eval_texts, eval_labels = _extract_split_texts(
+            raw_dataset,
+            config.eval_split,
+            config.text_field,
+            config.label_field,
+            config.eval_subset,
+            config.random_seed,
+        )
+        baseline_metrics = evaluate_tfidf_baseline(
+            config,
+            train_texts,
+            train_labels,
+            eval_texts,
+            eval_labels,
+        )
+        print("TF-IDF baseline metrics:")
+        print(json.dumps(_ensure_json_serializable(baseline_metrics), indent=2))
+        with open(os.path.join(config.output_dir, "baseline_metrics.json"), "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(baseline_metrics), handle, indent=2)
 
     zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
     zero_shot_metrics = evaluate_zero_shot(
@@ -911,6 +1219,11 @@ def run_experiment(args: argparse.Namespace) -> None:
             print(f"Saved zero-shot SHAP explanations for {len(shap_samples)} examples.")
             zero_summary = summarize_shap_importance(zero_shot_shap)
             zero_summary["per_example_stats"] = _collect_shap_statistics(zero_shot_shap)
+            zero_plot_path = _plot_shap_summary(
+                zero_shot_shap, config.output_dir, "zero_shot"
+            )
+            if zero_plot_path:
+                zero_summary["visualization_path"] = zero_plot_path
             interpretability_summary = {"zero_shot": zero_summary}
 
             if tuned_model is not None:
@@ -927,6 +1240,11 @@ def run_experiment(args: argparse.Namespace) -> None:
                 print("Saved fine-tuned SHAP explanations.")
                 tuned_summary = summarize_shap_importance(tuned_shap)
                 tuned_summary["per_example_stats"] = _collect_shap_statistics(tuned_shap)
+                tuned_plot_path = _plot_shap_summary(
+                    tuned_shap, config.output_dir, "fine_tuned"
+                )
+                if tuned_plot_path:
+                    tuned_summary["visualization_path"] = tuned_plot_path
                 if interpretability_summary is None:
                     interpretability_summary = {}
                 interpretability_summary["fine_tuned"] = tuned_summary
@@ -944,6 +1262,9 @@ def run_experiment(args: argparse.Namespace) -> None:
                     union = zero_top | tuned_top
                     if union:
                         comparison["top_token_jaccard_overall"] = len(zero_top & tuned_top) / len(union)
+                    if baseline_metrics is not None:
+                        comparison["baseline_accuracy"] = baseline_metrics.get("accuracy")
+                        comparison["baseline_f1"] = baseline_metrics.get("f1")
                     interpretability_summary["comparison"] = comparison
         else:
             print("No samples available for SHAP analysis; skipping attribution generation.")
@@ -975,6 +1296,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
+    parser.add_argument("--run-baseline", action="store_true")
+    parser.add_argument("--no-run-baseline", dest="run_baseline", action="store_false")
+    parser.set_defaults(run_baseline=True)
     parser.add_argument("--shap-example-count", type=int, default=10)
     parser.add_argument("--shap-max-evals", type=int, default=200)
     parser.add_argument("--load-in-4bit", action="store_true")
