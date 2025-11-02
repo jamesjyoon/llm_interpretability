@@ -176,14 +176,31 @@ def _prepare_dataset(
 
     def _format_examples(examples):
         prompts = [formatter.build_prompt(sentence) for sentence in examples[config.text_field]]
-        full_sequences = [f"{prompt} {label}" for prompt, label in zip(prompts, examples[config.label_field])]
+        full_sequences = [
+            f"{prompt} {label}" for prompt, label in zip(prompts, examples[config.label_field])
+        ]
         model_inputs = tokenizer(
             full_sequences,
             max_length=config.max_seq_length,
             truncation=True,
             padding="max_length",
         )
-        model_inputs["labels"] = model_inputs["input_ids"].copy()
+
+        # The causal-LM objective should only supervise the final label token. Mask the
+        # prompt portion of each sequence with ``-100`` so the cross-entropy loss
+        # focuses on the classification target instead of the copied instruction text.
+        attention = model_inputs["attention_mask"]
+        labels = []
+        for input_ids, mask in zip(model_inputs["input_ids"], attention):
+            masked = [-100] * len(input_ids)
+            # ``attention_mask`` marks non-padding tokens with 1s. The final
+            # non-padding position corresponds to the label token we appended.
+            seq_length = int(sum(mask))
+            if seq_length > 0:
+                label_index = seq_length - 1
+                masked[label_index] = input_ids[label_index]
+            labels.append(masked)
+        model_inputs["labels"] = labels
         return model_inputs
 
     remove_columns = sorted({
@@ -1205,8 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
         " environment variables when present.",
     )
     return parser
-
-
+    
 if __name__ == "__main__":
     parser = build_parser()
     run_experiment(parser.parse_args())
