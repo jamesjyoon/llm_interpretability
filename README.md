@@ -2,7 +2,7 @@
 
 ## Binary classification experiment (Colab-ready)
 
-The `experiments/collab_baseline.py` script operationalizes the study plan from
+The `experiments_llama_3.2_1B.py` script operationalizes the study plan from
 our last meeting: it compares zero-shot and LoRA fine-tuned variants of the
 `meta-llama/Llama-3.2-1B` base model on the
 [`mteb/tweet_sentiment_extraction`](https://huggingface.co/datasets/mteb/tweet_sentiment_extraction)
@@ -44,22 +44,30 @@ metrics for both approaches.
    adapter, and generates SHAP attributions for the first 10 test examples.
 
    ```python
-   !python experiments_llama_3.5_1B.py --finetune --run-shap --output-dir outputs/tweet_sentiment_extraction
+   !python experiments_llama_3.2_1B.py --finetune --run-shap --output-dir outputs/tweet_sentiment_extraction
    ```
 
 5. Inspect the outputs stored under `outputs/tweet_sentiment_extraction/`:
    - `zero_shot_metrics.json` and `fine_tuned_metrics.json` contain accuracy,
-     precision, recall, and F1 scores (averaged per task configuration), plus
-     helpful probability summaries such as the mean max-class confidence.
+     precision, recall, and F1 scores (averaged per task configuration), class-
+     specific precision/recall/F1/support rows, a confusion matrix, and helpful
+     probability summaries such as the mean max-class confidence.
    - `metrics_comparison.png` visualizes the zero-shot and fine-tuned metrics
      side by side. If you launch the script from within a notebook cell the
      chart is rendered inline; otherwise open the saved PNG (the script prints
      its absolute path) to review the visualization.
    - `zero_shot_shap.json` and `fine_tuned_shap.json` store serialized SHAP
      explanations for later analysis.
+   - `zero_shot_shap_summary.png` and `fine_tuned_shap_summary.png` visualize the
+     aggregated absolute SHAP contributions for the most influential tokens in
+     each setting. The charts render inline on Colab when possible and are saved
+     alongside the JSON artifacts for offline inspection.
    - `interpretability_metrics.json` compares SHAP-based statistics such as
-     average absolute token importance and mean cosine similarity between the
-     zero-shot and fine-tuned explanations.
+     average absolute token importance, sparsity (Gini coefficients), entropy,
+     top-5/top-10 overlaps, cosine and Spearman agreement, per-example mean-
+     importance deltas, and an approximate Cohen's *d* effect size between the
+     zero-shot and fine-tuned explanations. The file also records per-example
+     SHAP summaries so you can run your own statistical checks downstream.
    - `lora_adapter/` holds the trained adapter weights which can be reloaded via
      `PeftModel.from_pretrained`.
 
@@ -78,6 +86,9 @@ metrics for both approaches.
   every available example.
 - Use `--no-run-shap` to skip SHAP generation when you want a faster pass, or
   `--no-load-in-4bit` to load the model in full precision on high-memory GPUs.
+- Pass `--finetune` to train a task-specific LoRA adapter on the sampled
+  training split. The adapter weights are stored under `lora_adapter/` for
+  reuse in future sessions.
 - The CLI exposes `--train-split`, `--eval-split`, `--text-field`, and
   `--label-field` so you can adapt the experiment to datasets with different
   schemas while keeping the zero-shot vs. fine-tuned comparison intact. Use
