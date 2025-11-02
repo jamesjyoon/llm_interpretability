@@ -89,6 +89,10 @@ metrics for both approaches.
 - Pass `--finetune` to train a task-specific LoRA adapter on the sampled
   training split. The adapter weights are stored under `lora_adapter/` for
   reuse in future sessions.
+- During fine-tuning we mask the instruction tokens with `-100` so the
+  cross-entropy loss only supervises the appended label token. This keeps the
+  LoRA updates focused on the classification decision instead of simply
+  copying the prompt text.
 - The CLI exposes `--train-split`, `--eval-split`, `--text-field`, and
   `--label-field` so you can adapt the experiment to datasets with different
   schemas while keeping the zero-shot vs. fine-tuned comparison intact. Use
