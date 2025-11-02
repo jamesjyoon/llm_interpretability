@@ -19,16 +19,6 @@ import numpy as np
 import torch
 from datasets import DatasetDict, load_dataset
 from scipy.stats import spearmanr
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    accuracy_score,
-    confusion_matrix,
-    f1_score,
-    precision_recall_fscore_support,
-    precision_score,
-    recall_score,
-)
 
 try:
     import shap  # type: ignore
@@ -115,7 +105,7 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
 
 @dataclass
 class ExperimentConfig:
-    """Configuration for the baseline experiment."""
+    """Configuration for the classification experiment."""
 
     model_name: str = "meta-llama/Llama-3.2-1B"
     dataset_name: str = "mteb/tweet_sentiment_extraction"
@@ -142,10 +132,6 @@ class ExperimentConfig:
     shap_example_count: int = 10
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
-    run_baseline: bool = True
-    baseline_max_features: int = 5000
-    baseline_ngram_range: Tuple[int, int] = (1, 2)
-    baseline_max_iter: int = 1000
 
 
 class PromptFormatter:
@@ -232,23 +218,6 @@ def _prepare_zero_shot_texts(
         validation_split = validation_split.select(range(eval_count))
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
-    return texts, labels
-
-
-def _extract_split_texts(
-    dataset: DatasetDict,
-    split_name: str,
-    text_field: str,
-    label_field: str,
-    subset: Optional[int],
-    seed: int,
-) -> Tuple[List[str], List[int]]:
-    split = dataset[split_name]
-    if subset:
-        subset_size = min(subset, len(split))
-        split = split.shuffle(seed=seed).select(range(subset_size))
-    texts = [str(item) for item in split[text_field]]
-    labels = [int(label) for label in split[label_field]]
     return texts, labels
 
 
@@ -383,6 +352,89 @@ def _batched(iterator: Sequence[str], batch_size: int) -> Iterable[Sequence[str]
         yield iterator[i : i + batch_size]
 
 
+def _build_confusion_matrix(
+    labels: Sequence[int], predictions: Sequence[int], ordered_labels: Sequence[int]
+) -> torch.Tensor:
+    """Construct a confusion matrix aligned to ``ordered_labels``."""
+
+    label_to_index = {int(label): idx for idx, label in enumerate(ordered_labels)}
+    matrix = torch.zeros((len(ordered_labels), len(ordered_labels)), dtype=torch.long)
+    for true_label, pred_label in zip(labels, predictions):
+        if int(true_label) not in label_to_index or int(pred_label) not in label_to_index:
+            continue
+        row = label_to_index[int(true_label)]
+        col = label_to_index[int(pred_label)]
+        matrix[row, col] += 1
+    return matrix
+
+
+def _per_class_metrics(
+    confusion: torch.Tensor, ordered_labels: Sequence[int]
+) -> Dict[str, Dict[str, float]]:
+    """Compute precision/recall/F1/support for every class."""
+
+    per_class: Dict[str, Dict[str, float]] = {}
+    for idx, label in enumerate(ordered_labels):
+        tp = confusion[idx, idx].item()
+        predicted = confusion[:, idx].sum().item()
+        actual = confusion[idx, :].sum().item()
+        precision = tp / predicted if predicted > 0 else 0.0
+        recall = tp / actual if actual > 0 else 0.0
+        denom = precision + recall
+        f1 = (2 * precision * recall / denom) if denom > 0 else 0.0
+        per_class[str(int(label))] = {
+            "precision": float(precision),
+            "recall": float(recall),
+            "f1": float(f1),
+            "support": int(actual),
+        }
+    return per_class
+
+
+def _weighted_average(metric: torch.Tensor, weights: torch.Tensor) -> float:
+    total = float(weights.sum().item())
+    if total <= 0:
+        return 0.0
+    return float((metric * weights).sum().item() / total)
+
+
+def _aggregate_metrics(
+    confusion: torch.Tensor,
+    per_class: Dict[str, Dict[str, float]],
+    ordered_labels: Sequence[int],
+) -> Tuple[float, float, float, float]:
+    total = float(confusion.sum().item())
+    accuracy = float(confusion.diag().sum().item() / total) if total > 0 else 0.0
+
+    supports = torch.tensor(
+        [per_class[str(int(label))]["support"] for label in ordered_labels], dtype=torch.float32
+    )
+    precisions = torch.tensor(
+        [per_class[str(int(label))]["precision"] for label in ordered_labels], dtype=torch.float32
+    )
+    recalls = torch.tensor(
+        [per_class[str(int(label))]["recall"] for label in ordered_labels], dtype=torch.float32
+    )
+    f1_scores = torch.tensor(
+        [per_class[str(int(label))]["f1"] for label in ordered_labels], dtype=torch.float32
+    )
+
+    if len(ordered_labels) == 2:
+        if 1 in ordered_labels:
+            positive_idx = ordered_labels.index(1)
+        else:
+            positive_idx = len(ordered_labels) - 1
+        precision = float(precisions[positive_idx].item())
+        recall = float(recalls[positive_idx].item())
+        f1 = float(f1_scores[positive_idx].item())
+    else:
+        precision = _weighted_average(precisions, supports)
+        recall = _weighted_average(recalls, supports)
+        f1 = _weighted_average(f1_scores, supports)
+
+    return accuracy, precision, recall, f1
+
+
 def evaluate_zero_shot(
     model: AutoModelForCausalLM,
     tokenizer,
@@ -408,41 +460,18 @@ def evaluate_zero_shot(
         predictions.extend(preds)
         probability_rows.extend(probs.astype(float).tolist())
 
-    label_set = sorted(set(labels) | set(predictions))
-    average = "binary" if len(label_set) == 2 else "weighted"
+    confusion = _build_confusion_matrix(labels, predictions, ordered_labels)
+    per_class = _per_class_metrics(confusion, ordered_labels)
+    accuracy, precision, recall, f1 = _aggregate_metrics(confusion, per_class, ordered_labels)
 
     metrics = {
-        "accuracy": float(accuracy_score(labels, predictions)),
-        "precision": float(
-            precision_score(labels, predictions, average=average, zero_division=0)
-        ),
-        "recall": float(
-            recall_score(labels, predictions, average=average, zero_division=0)
-        ),
-        "f1": float(f1_score(labels, predictions, average=average, zero_division=0)),
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "per_class": per_class,
+        "confusion_matrix": confusion.tolist(),
     }
-
-    per_class_precision, per_class_recall, per_class_f1, per_class_support = (
-        precision_recall_fscore_support(
-            labels,
-            predictions,
-            labels=ordered_labels,
-            zero_division=0,
-        )
-    )
-
-    metrics["per_class"] = {
-        str(label): {
-            "precision": float(per_class_precision[idx]),
-            "recall": float(per_class_recall[idx]),
-            "f1": float(per_class_f1[idx]),
-            "support": int(per_class_support[idx]),
-        }
-        for idx, label in enumerate(ordered_labels)
-    }
-
-    cm = confusion_matrix(labels, predictions, labels=ordered_labels)
-    metrics["confusion_matrix"] = cm.astype(int).tolist()
 
     if probability_rows:
         probability_array = np.array(probability_rows, dtype=float)
@@ -971,107 +1000,6 @@ def compare_shap_explanations(
     return comparison
 
 
-def _summarize_logistic_coefficients(
-    classifier: LogisticRegression, vectorizer: TfidfVectorizer, top_k: int = 10
-) -> Dict[str, object]:
-    feature_names = vectorizer.get_feature_names_out()
-    coefficients = classifier.coef_
-    classes = classifier.classes_
-
-    summary: Dict[str, object] = {"top_features": {}}
-    if coefficients.ndim == 1:
-        coef = coefficients
-        ordering = np.argsort(np.abs(coef))[::-1][:top_k]
-        summary["top_features"][str(classes[0])] = [
-            {"feature": feature_names[idx], "weight": float(coef[idx])}
-            for idx in ordering
-        ]
-    else:
-        for class_index, class_label in enumerate(classes):
-            coef = coefficients[class_index]
-            ordering = np.argsort(np.abs(coef))[::-1][:top_k]
-            summary["top_features"][str(class_label)] = [
-                {"feature": feature_names[idx], "weight": float(coef[idx])}
-                for idx in ordering
-            ]
-    return summary
-
-
-def evaluate_tfidf_baseline(
-    config: ExperimentConfig,
-    train_texts: Sequence[str],
-    train_labels: Sequence[int],
-    eval_texts: Sequence[str],
-    eval_labels: Sequence[int],
-) -> Dict[str, object]:
-    """Train and evaluate the classical TF–IDF + logistic regression baseline.
-
-    David's and Brennen's notebooks both ground their analysis with this
-    transparent model before probing LLM behavior. Keeping the same reference
-    pipeline in the script ensures our interpretability metrics can be compared
-    against a simple, coefficient-driven classifier instead of only contrasting
-    two large-language-model variants.
-    """
-    vectorizer = TfidfVectorizer(
-        max_features=config.baseline_max_features,
-        ngram_range=config.baseline_ngram_range,
-    )
-    classifier = LogisticRegression(max_iter=config.baseline_max_iter)
-
-    start_time = time.perf_counter()
-    train_matrix = vectorizer.fit_transform(train_texts)
-    classifier.fit(train_matrix, train_labels)
-    training_elapsed = time.perf_counter() - start_time
-
-    eval_matrix = vectorizer.transform(eval_texts)
-    predictions = classifier.predict(eval_matrix)
-    probabilities = classifier.predict_proba(eval_matrix)
-
-    label_set = sorted(set(eval_labels) | set(predictions))
-    average = "binary" if len(label_set) == 2 else "weighted"
-    metrics: Dict[str, object] = {
-        "accuracy": float(accuracy_score(eval_labels, predictions)),
-        "precision": float(
-            precision_score(eval_labels, predictions, average=average, zero_division=0)
-        ),
-        "recall": float(
-            recall_score(eval_labels, predictions, average=average, zero_division=0)
-        ),
-        "f1": float(f1_score(eval_labels, predictions, average=average, zero_division=0)),
-        "training_time_seconds": float(training_elapsed),
-    }
-
-    per_class_precision, per_class_recall, per_class_f1, per_class_support = (
-        precision_recall_fscore_support(
-            eval_labels,
-            predictions,
-            labels=label_set,
-            zero_division=0,
-        )
-    )
-    metrics["per_class"] = {
-        str(label): {
-            "precision": float(per_class_precision[idx]),
-            "recall": float(per_class_recall[idx]),
-            "f1": float(per_class_f1[idx]),
-            "support": int(per_class_support[idx]),
-        }
-        for idx, label in enumerate(label_set)
-    }
-
-    cm = confusion_matrix(eval_labels, predictions, labels=label_set)
-    metrics["confusion_matrix"] = cm.astype(int).tolist()
-
-    if probabilities.size:
-        metrics["mean_max_probability"] = float(np.max(probabilities, axis=1).mean())
-        if len(label_set) == 2 and 1 in label_set:
-            positive_index = label_set.index(1)
-            metrics["positive_probability_mean"] = float(probabilities[:, positive_index].mean())
-
-    metrics.update(_summarize_logistic_coefficients(classifier, vectorizer))
-    return metrics
-
-
 def run_experiment(args: argparse.Namespace) -> None:
     provided_token = args.huggingface_token or os.environ.get("HF_TOKEN") or os.environ.get(
         "HUGGINGFACE_TOKEN"
@@ -1089,7 +1017,6 @@ def run_experiment(args: argparse.Namespace) -> None:
         train_subset=args.train_subset,
         eval_subset=args.eval_subset,
         run_shap=args.run_shap,
-        run_baseline=args.run_baseline,
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
         load_in_4bit=args.load_in_4bit,
@@ -1134,36 +1061,6 @@ def run_experiment(args: argparse.Namespace) -> None:
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
-
-    baseline_metrics: Optional[Dict[str, object]] = None
-    if config.run_baseline:
-        train_texts, train_labels = _extract_split_texts(
-            raw_dataset,
-            config.train_split,
-            config.text_field,
-            config.label_field,
-            config.train_subset,
-            config.random_seed,
-        )
-        eval_texts, eval_labels = _extract_split_texts(
-            raw_dataset,
-            config.eval_split,
-            config.text_field,
-            config.label_field,
-            config.eval_subset,
-            config.random_seed,
-        )
-        baseline_metrics = evaluate_tfidf_baseline(
-            config,
-            train_texts,
-            train_labels,
-            eval_texts,
-            eval_labels,
-        )
-        print("TF-IDF baseline metrics:")
-        print(json.dumps(_ensure_json_serializable(baseline_metrics), indent=2))
-        with open(os.path.join(config.output_dir, "baseline_metrics.json"), "w", encoding="utf-8") as handle:
-            json.dump(_ensure_json_serializable(baseline_metrics), handle, indent=2)
 
     zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
     zero_shot_metrics = evaluate_zero_shot(
@@ -1262,9 +1159,6 @@ def run_experiment(args: argparse.Namespace) -> None:
                     union = zero_top | tuned_top
                     if union:
                         comparison["top_token_jaccard_overall"] = len(zero_top & tuned_top) / len(union)
-                    if baseline_metrics is not None:
-                        comparison["baseline_accuracy"] = baseline_metrics.get("accuracy")
-                        comparison["baseline_f1"] = baseline_metrics.get("f1")
                     interpretability_summary["comparison"] = comparison
         else:
             print("No samples available for SHAP analysis; skipping attribution generation.")
@@ -1296,9 +1190,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
-    parser.add_argument("--run-baseline", action="store_true")
-    parser.add_argument("--no-run-baseline", dest="run_baseline", action="store_false")
-    parser.set_defaults(run_baseline=True)
     parser.add_argument("--shap-example-count", type=int, default=10)
     parser.add_argument("--shap-max-evals", type=int, default=200)
     parser.add_argument("--load-in-4bit", action="store_true")
