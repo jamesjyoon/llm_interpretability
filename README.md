@@ -1,5 +1,17 @@
 # LLM Interpretability
 
+![Quantum Pass badge](assets/badges/quantum_identity_badge.svg)
+
+## Quantum Pass badge
+
+The Quantum Pass badge (`QNTM-42A9`) is bundled with the repository so you can
+brand experiment outputs. Running `experiments_llama_3.2_1B.py` now copies the
+badge SVG into the output directory (or a custom path provided via
+`--project-badge-dir`) and writes a `project_badge.json` manifest referencing
+the identifier and copy timestamp. Disable the behavior with `--no-project-badge`
+when you need a leaner run, or reuse the SVG directly in notebooks by linking to
+`assets/badges/quantum_identity_badge.svg`.
+
 ## Binary classification experiment (Colab-ready)
 
 The `experiments_llama_3.2_1B.py` script operationalizes the study plan from
