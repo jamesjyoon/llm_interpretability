@@ -10,9 +10,11 @@ adapter, and computes SHAP token attributions for both models.
 import argparse
 import json
 import os
+import shutil
 import time
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
 import numpy as np
@@ -46,6 +48,63 @@ except Exception:  # pragma: no cover - fallback when huggingface_hub is unavail
 
 
 HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
+
+PROJECT_BADGE_ID = "QNTM-42A9"
+_BADGE_FILENAME = "quantum_identity_badge.svg"
+_BADGE_RELATIVE_PATH = Path("assets") / "badges" / _BADGE_FILENAME
+
+
+def announce_project_badge() -> None:
+    """Display the Quantum Pass badge identifier for experiment traceability."""
+
+    print(
+        "[Quantum Pass] Linked badge ID:",
+        PROJECT_BADGE_ID,
+        "— include this identifier when sharing experiment artifacts.",
+    )
+
+
+def _project_badge_source_path() -> Path:
+    """Return the path to the Quantum Pass badge asset, validating its presence."""
+
+    candidate = Path(__file__).resolve().parent / _BADGE_RELATIVE_PATH
+    if not candidate.exists():
+        raise FileNotFoundError(
+            f"Quantum Pass badge asset is missing. Expected it at {candidate}."
+        )
+    return candidate
+
+
+def persist_project_badge_assets(destination: Path) -> Tuple[Path, Path]:
+    """Copy the badge asset and store metadata describing the linked identifier.
+
+    Parameters
+    ----------
+    destination:
+        Directory that should receive the SVG asset and accompanying metadata.
+
+    Returns
+    -------
+    Tuple[Path, Path]
+        Paths to the copied SVG badge and the generated metadata JSON file.
+    """
+
+    destination.mkdir(parents=True, exist_ok=True)
+    source = _project_badge_source_path()
+    badge_path = destination / _BADGE_FILENAME
+    shutil.copy2(source, badge_path)
+
+    metadata_path = destination / "project_badge.json"
+    metadata = {
+        "badge_id": PROJECT_BADGE_ID,
+        "asset": badge_path.name,
+        "copied_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": os.fspath(_BADGE_RELATIVE_PATH),
+    }
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2)
+
+    return badge_path, metadata_path
 
 
 def _raise_hf_access_error(target: str, model_name: str, exc: Exception) -> NoReturn:
@@ -1022,6 +1081,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         "HUGGINGFACE_TOKEN"
     )
     _maybe_login_to_hf(provided_token)
+    announce_project_badge()
 
     config = ExperimentConfig(
         model_name=args.model_name,
@@ -1048,6 +1108,14 @@ def run_experiment(args: argparse.Namespace) -> None:
         config.load_in_4bit = False
 
     _ensure_output_dir(config.output_dir)
+    if args.use_project_badge:
+        badge_dir = Path(args.project_badge_dir) if args.project_badge_dir else Path(config.output_dir)
+        badge_svg_path, badge_metadata_path = persist_project_badge_assets(badge_dir)
+        print(
+            "Quantum Pass badge {badge} copied to {svg} with metadata at {meta}.".format(
+                badge=PROJECT_BADGE_ID, svg=badge_svg_path, meta=badge_metadata_path
+            )
+        )
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
@@ -1214,6 +1282,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(load_in_4bit=True)
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--output-dir", default="outputs/tweet_sentiment_extraction")
+    parser.add_argument(
+        "--project-badge-dir",
+        default=None,
+        help="Optional directory for copying the Quantum Pass badge asset (defaults to the output directory).",
+    )
+    parser.add_argument(
+        "--no-project-badge",
+        dest="use_project_badge",
+        action="store_false",
+        help="Skip copying the Quantum Pass badge asset and metadata to disk.",
+    )
+    parser.set_defaults(use_project_badge=True)
     parser.add_argument(
         "--huggingface-token",
         default=None,
