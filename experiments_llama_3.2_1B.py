@@ -49,63 +49,6 @@ except Exception:  # pragma: no cover - fallback when huggingface_hub is unavail
 
 HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
 
-PROJECT_BADGE_ID = "QNTM-42A9"
-_BADGE_FILENAME = "quantum_identity_badge.svg"
-_BADGE_RELATIVE_PATH = Path("assets") / "badges" / _BADGE_FILENAME
-
-
-def announce_project_badge() -> None:
-    """Display the Quantum Pass badge identifier for experiment traceability."""
-
-    print(
-        "[Quantum Pass] Linked badge ID:",
-        PROJECT_BADGE_ID,
-        "— include this identifier when sharing experiment artifacts.",
-    )
-
-
-def _project_badge_source_path() -> Path:
-    """Return the path to the Quantum Pass badge asset, validating its presence."""
-
-    candidate = Path(__file__).resolve().parent / _BADGE_RELATIVE_PATH
-    if not candidate.exists():
-        raise FileNotFoundError(
-            f"Quantum Pass badge asset is missing. Expected it at {candidate}."
-        )
-    return candidate
-
-
-def persist_project_badge_assets(destination: Path) -> Tuple[Path, Path]:
-    """Copy the badge asset and store metadata describing the linked identifier.
-
-    Parameters
-    ----------
-    destination:
-        Directory that should receive the SVG asset and accompanying metadata.
-
-    Returns
-    -------
-    Tuple[Path, Path]
-        Paths to the copied SVG badge and the generated metadata JSON file.
-    """
-
-    destination.mkdir(parents=True, exist_ok=True)
-    source = _project_badge_source_path()
-    badge_path = destination / _BADGE_FILENAME
-    shutil.copy2(source, badge_path)
-
-    metadata_path = destination / "project_badge.json"
-    metadata = {
-        "badge_id": PROJECT_BADGE_ID,
-        "asset": badge_path.name,
-        "copied_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "source": os.fspath(_BADGE_RELATIVE_PATH),
-    }
-    with open(metadata_path, "w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, indent=2)
-
-    return badge_path, metadata_path
-
 
 def _raise_hf_access_error(target: str, model_name: str, exc: Exception) -> NoReturn:
     """Surface actionable guidance when gated Hugging Face assets are requested."""
