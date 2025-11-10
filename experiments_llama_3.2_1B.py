@@ -1024,7 +1024,6 @@ def run_experiment(args: argparse.Namespace) -> None:
         "HUGGINGFACE_TOKEN"
     )
     _maybe_login_to_hf(provided_token)
-    announce_project_badge()
 
     config = ExperimentConfig(
         model_name=args.model_name,
