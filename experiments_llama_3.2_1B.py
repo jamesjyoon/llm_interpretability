@@ -10,11 +10,9 @@ adapter, and computes SHAP token attributions for both models.
 import argparse
 import json
 import os
-import shutil
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
 import numpy as np
@@ -1050,14 +1048,6 @@ def run_experiment(args: argparse.Namespace) -> None:
         config.load_in_4bit = False
 
     _ensure_output_dir(config.output_dir)
-    if args.use_project_badge:
-        badge_dir = Path(args.project_badge_dir) if args.project_badge_dir else Path(config.output_dir)
-        badge_svg_path, badge_metadata_path = persist_project_badge_assets(badge_dir)
-        print(
-            "Quantum Pass badge {badge} copied to {svg} with metadata at {meta}.".format(
-                badge=PROJECT_BADGE_ID, svg=badge_svg_path, meta=badge_metadata_path
-            )
-        )
 
     try:
         tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
@@ -1224,18 +1214,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(load_in_4bit=True)
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--output-dir", default="outputs/tweet_sentiment_extraction")
-    parser.add_argument(
-        "--project-badge-dir",
-        default=None,
-        help="Optional directory for copying the Quantum Pass badge asset (defaults to the output directory).",
-    )
-    parser.add_argument(
-        "--no-project-badge",
-        dest="use_project_badge",
-        action="store_false",
-        help="Skip copying the Quantum Pass badge asset and metadata to disk.",
-    )
-    parser.set_defaults(use_project_badge=True)
     parser.add_argument(
         "--huggingface-token",
         default=None,
