@@ -1308,6 +1308,9 @@ def _summarize_examples(
         )
         if visualization_path:
             summary["visualization_path"] = visualization_path
+def _summarize_examples(examples: List[TokenAttribution]) -> Dict[str, object]:
+    summary = summarize_token_attributions(examples)
+    summary["per_example_stats"] = collect_token_statistics(examples)
     return summary
 
 
@@ -1332,6 +1335,7 @@ def evaluate_interpretability_method(
             variant="zero_shot",
         )
     }
+    result: Dict[str, object] = {"zero_shot": _summarize_examples(zero_examples)}
 
     tuned_examples: Optional[List[TokenAttribution]] = None
     if tuned_model is not None:
@@ -1350,6 +1354,7 @@ def evaluate_interpretability_method(
             method=method,
             variant="fine_tuned",
         )
+        result["fine_tuned"] = _summarize_examples(tuned_examples)
     if tuned_examples is not None:
         result["comparison"] = compare_token_attributions(zero_examples, tuned_examples)
     return result
