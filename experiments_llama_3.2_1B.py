@@ -777,6 +777,82 @@ def _plot_shap_summary(
     return absolute_path
 
 
+def _aggregate_top_token_scores(
+    examples: Sequence[TokenAttribution],
+    top_k: int = 20,
+) -> Tuple[List[str], List[float]]:
+    token_scores = defaultdict(float)
+    for tokens, values in examples:
+        if not tokens:
+            continue
+        scores = np.abs(_normalize_token_scores(values, len(tokens)))
+        if scores.size == 0:
+            continue
+        for token, score in zip(tokens, scores):
+            token_scores[token] += float(score)
+
+    if not token_scores:
+        return [], []
+
+    top_items = sorted(token_scores.items(), key=lambda item: item[1], reverse=True)[:top_k]
+    tokens = [token for token, _ in top_items][::-1]
+    scores = [score for _, score in top_items][::-1]
+    return tokens, scores
+
+
+def _plot_generic_token_summary(
+    examples: Sequence[TokenAttribution],
+    output_dir: str,
+    prefix: str,
+    title: str,
+    top_k: int = 20,
+) -> Optional[str]:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print(f"matplotlib is not installed; skipping {title.lower()} visualization.")
+        return None
+
+    tokens, scores = _aggregate_top_token_scores(examples, top_k=top_k)
+    if not tokens:
+        print(f"No token scores available to visualize for {prefix}; skipping plot.")
+        return None
+
+    height = max(4.0, 0.35 * len(tokens) + 1.0)
+    fig, ax = plt.subplots(figsize=(9, height))
+    ax.barh(np.arange(len(tokens)), scores, color="#55a868")
+    ax.set_yticks(np.arange(len(tokens)))
+    ax.set_yticklabels(tokens)
+    ax.set_xlabel("Total |importance| score")
+    ax.set_title(title)
+    ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_token_summary.png")
+    fig.savefig(output_path, dpi=200)
+
+    inline_displayed = False
+    try:
+        from IPython import get_ipython  # type: ignore
+        from IPython.display import display  # type: ignore
+    except ImportError:
+        pass
+    else:
+        ipython = get_ipython()
+        if ipython is not None and getattr(ipython, "kernel", None) is not None:
+            display(fig)
+            inline_displayed = True
+
+    plt.close(fig)
+
+    absolute_path = os.path.abspath(output_path)
+    message = f"Saved interpretability visualization to {absolute_path}."
+    if not inline_displayed:
+        message += " Inline display is unavailable in this environment; open the PNG to review the summary."
+    print(message)
+    return absolute_path
+
+
 def _iter_object_container(container) -> Iterator:
     if isinstance(container, np.ndarray) and container.dtype == object:
         for item in container:
@@ -1215,6 +1291,23 @@ def _compute_method_examples(
     raise ValueError(f"Unsupported interpretability method: {method}")
 
 
+def _summarize_examples(
+    examples: List[TokenAttribution],
+    output_dir: Optional[str] = None,
+    method: Optional[str] = None,
+    variant: Optional[str] = None,
+) -> Dict[str, object]:
+    summary = summarize_token_attributions(examples)
+    summary["per_example_stats"] = collect_token_statistics(examples)
+    if output_dir and method and variant:
+        visualization_path = _plot_generic_token_summary(
+            examples,
+            output_dir,
+            f"{variant}_{method.lower()}",
+            title=f"{method.replace('_', ' ').title()} token contributions ({variant.replace('_', ' ')})",
+        )
+        if visualization_path:
+            summary["visualization_path"] = visualization_path
 def _summarize_examples(examples: List[TokenAttribution]) -> Dict[str, object]:
     summary = summarize_token_attributions(examples)
     summary["per_example_stats"] = collect_token_statistics(examples)
@@ -1234,6 +1327,14 @@ def evaluate_interpretability_method(
     zero_examples = _compute_method_examples(
         method, model, tokenizer, texts, label_token_map, device, config
     )
+    result: Dict[str, object] = {
+        "zero_shot": _summarize_examples(
+            zero_examples,
+            output_dir=config.output_dir,
+            method=method,
+            variant="zero_shot",
+        )
+    }
     result: Dict[str, object] = {"zero_shot": _summarize_examples(zero_examples)}
 
     tuned_examples: Optional[List[TokenAttribution]] = None
@@ -1246,6 +1347,12 @@ def evaluate_interpretability_method(
             label_token_map,
             device,
             config,
+        )
+        result["fine_tuned"] = _summarize_examples(
+            tuned_examples,
+            output_dir=config.output_dir,
+            method=method,
+            variant="fine_tuned",
         )
         result["fine_tuned"] = _summarize_examples(tuned_examples)
     if tuned_examples is not None:
