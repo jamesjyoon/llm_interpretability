@@ -11,6 +11,7 @@ Kernel SHAP, TreeSHAP surrogates, and LIME.
 """
 
 import argparse
+import copy
 import json
 import os
 import time
@@ -601,6 +602,37 @@ def compute_shap_values(
         predict_fn, masker, output_names=output_names, algorithm=algorithm
     )
     return explainer(texts, max_evals=max_evals)
+
+
+def compute_kernel_shap_attributions(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+    max_evals: int,
+) -> List[TokenAttribution]:
+    """Return token-level Kernel SHAP approximations.
+
+    ``shap.Explainer`` does not accept ``algorithm="kernel"`` when used with
+    ``maskers.Text`` (the combination needed for Hugging Face tokenizers).  The
+    permutation-based explainer shares the same Kernel SHAP sampling strategy,
+    so we explicitly request that algorithm here to emulate Kernel SHAP while
+    still receiving properly tokenized outputs.
+    """
+
+    explanation = compute_shap_values(
+        model,
+        tokenizer,
+        texts,
+        label_token_map,
+        device,
+        max_length,
+        max_evals,
+        algorithm="permutation",
+    )
+    return list(_iter_shap_examples(explanation))
 
 
 def _ensure_json_serializable(value):
@@ -1255,7 +1287,7 @@ def _compute_method_examples(
 ) -> List[TokenAttribution]:
     normalized = method.lower()
     if normalized == "kernel_shap":
-        explanation = compute_shap_values(
+        return compute_kernel_shap_attributions(
             model,
             tokenizer,
             texts,
@@ -1263,9 +1295,7 @@ def _compute_method_examples(
             device,
             config.max_seq_length,
             config.shap_max_evals,
-            algorithm="kernel",
         )
-        return list(_iter_shap_examples(explanation))
     if normalized == "tree_shap":
         return compute_tree_shap_attributions(
             model,
@@ -1308,9 +1338,6 @@ def _summarize_examples(
         )
         if visualization_path:
             summary["visualization_path"] = visualization_path
-def _summarize_examples(examples: List[TokenAttribution]) -> Dict[str, object]:
-    summary = summarize_token_attributions(examples)
-    summary["per_example_stats"] = collect_token_statistics(examples)
     return summary
 
 
@@ -1335,7 +1362,6 @@ def evaluate_interpretability_method(
             variant="zero_shot",
         )
     }
-    result: Dict[str, object] = {"zero_shot": _summarize_examples(zero_examples)}
 
     tuned_examples: Optional[List[TokenAttribution]] = None
     if tuned_model is not None:
@@ -1354,7 +1380,6 @@ def evaluate_interpretability_method(
             method=method,
             variant="fine_tuned",
         )
-        result["fine_tuned"] = _summarize_examples(tuned_examples)
     if tuned_examples is not None:
         result["comparison"] = compare_token_attributions(zero_examples, tuned_examples)
     return result
@@ -1443,9 +1468,13 @@ def run_experiment(args: argparse.Namespace) -> None:
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
         json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
 
+    zero_shot_model = model
     tuned_model: Optional[PeftModel] = None
     fine_tuned_metrics: Optional[Dict[str, float]] = None
     if args.finetune:
+        preserve_zero_shot_model = config.run_shap or bool(config.interpretability_methods)
+        if preserve_zero_shot_model:
+            zero_shot_model = copy.deepcopy(model)
         tuned_model = train_lora_classifier(config, model, processed_dataset)
         tuned_model.save_pretrained(os.path.join(config.output_dir, "lora_adapter"))
         fine_tuned_metrics = evaluate_zero_shot(
@@ -1470,7 +1499,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         shap_samples = zero_shot_texts[: config.shap_example_count]
         if shap_samples:
             zero_shot_shap = compute_shap_values(
-                model,
+                zero_shot_model,
                 tokenizer,
                 shap_samples,
                 label_token_map,
@@ -1535,7 +1564,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                     try:
                         method_result = evaluate_interpretability_method(
                             method,
-                            model,
+                            zero_shot_model,
                             tokenizer,
                             shap_samples,
                             label_token_map,
