@@ -4,7 +4,10 @@ __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style model
 
 This module is designed so it can be executed end-to-end on Google Colab. It
 loads a dataset, evaluates a zero-shot baseline, optionally fine-tunes a LoRA
-adapter, and computes SHAP token attributions for both models.
+adapter, and computes SHAP token attributions for both models. In addition to
+precision, recall, and F1 comparisons, the script now evaluates interpretability
+characteristics across multiple explanation techniques including standard SHAP,
+Kernel SHAP, TreeSHAP surrogates, and LIME.
 """
 
 import argparse
@@ -26,6 +29,17 @@ except ImportError as exc:  # pragma: no cover - optional dependency
     raise SystemExit(
         "The `shap` package is required for attribution analysis. Install it via `pip install shap`."
     ) from exc
+
+try:  # pragma: no cover - optional dependency
+    from lime.lime_text import LimeTextExplainer
+except Exception:  # pragma: no cover - environments without lime fall back gracefully later
+    LimeTextExplainer = None
+
+try:  # pragma: no cover - optional dependency for TreeSHAP surrogate training
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.tree import DecisionTreeRegressor
+except Exception:  # pragma: no cover - environments without sklearn fall back gracefully later
+    TfidfVectorizer = DecisionTreeRegressor = None
 
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -62,6 +76,7 @@ def _raise_hf_access_error(target: str, model_name: str, exc: Exception) -> NoRe
 
 
 LabelTokenMap = Dict[int, int]
+TokenAttribution = Tuple[List[str], np.ndarray]
 
 
 def _maybe_login_to_hf(token: Optional[str]) -> None:
@@ -130,6 +145,11 @@ class ExperimentConfig:
     run_shap: bool = True
     shap_max_evals: int = 200
     shap_example_count: int = 10
+    interpretability_methods: Sequence[str] = ("kernel_shap", "tree_shap", "lime")
+    lime_num_features: int = 10
+    lime_num_samples: int = 500
+    tree_shap_max_features: int = 200
+    tree_shap_max_depth: int = 6
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
 
@@ -562,6 +582,7 @@ def compute_shap_values(
     device: torch.device,
     max_length: int,
     max_evals: int,
+    algorithm: str = "auto",
 ) -> shap.Explanation:
     masker = _shap_masker(tokenizer)
 
@@ -576,8 +597,41 @@ def compute_shap_values(
         )
 
     output_names = [str(label) for label in sorted(label_token_map)]
-    explainer = shap.Explainer(predict_fn, masker, output_names=output_names)
+    explainer = shap.Explainer(
+        predict_fn, masker, output_names=output_names, algorithm=algorithm
+    )
     return explainer(texts, max_evals=max_evals)
+
+
+def compute_kernel_shap_attributions(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+    max_evals: int,
+) -> List[TokenAttribution]:
+    """Return token-level Kernel SHAP approximations.
+
+    ``shap.Explainer`` does not accept ``algorithm="kernel"`` when used with
+    ``maskers.Text`` (the combination needed for Hugging Face tokenizers).  The
+    permutation-based explainer shares the same Kernel SHAP sampling strategy,
+    so we explicitly request that algorithm here to emulate Kernel SHAP while
+    still receiving properly tokenized outputs.
+    """
+
+    explanation = compute_shap_values(
+        model,
+        tokenizer,
+        texts,
+        label_token_map,
+        device,
+        max_length,
+        max_evals,
+        algorithm="permutation",
+    )
+    return list(_iter_shap_examples(explanation))
 
 
 def _ensure_json_serializable(value):
@@ -754,6 +808,82 @@ def _plot_shap_summary(
     return absolute_path
 
 
+def _aggregate_top_token_scores(
+    examples: Sequence[TokenAttribution],
+    top_k: int = 20,
+) -> Tuple[List[str], List[float]]:
+    token_scores = defaultdict(float)
+    for tokens, values in examples:
+        if not tokens:
+            continue
+        scores = np.abs(_normalize_token_scores(values, len(tokens)))
+        if scores.size == 0:
+            continue
+        for token, score in zip(tokens, scores):
+            token_scores[token] += float(score)
+
+    if not token_scores:
+        return [], []
+
+    top_items = sorted(token_scores.items(), key=lambda item: item[1], reverse=True)[:top_k]
+    tokens = [token for token, _ in top_items][::-1]
+    scores = [score for _, score in top_items][::-1]
+    return tokens, scores
+
+
+def _plot_generic_token_summary(
+    examples: Sequence[TokenAttribution],
+    output_dir: str,
+    prefix: str,
+    title: str,
+    top_k: int = 20,
+) -> Optional[str]:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print(f"matplotlib is not installed; skipping {title.lower()} visualization.")
+        return None
+
+    tokens, scores = _aggregate_top_token_scores(examples, top_k=top_k)
+    if not tokens:
+        print(f"No token scores available to visualize for {prefix}; skipping plot.")
+        return None
+
+    height = max(4.0, 0.35 * len(tokens) + 1.0)
+    fig, ax = plt.subplots(figsize=(9, height))
+    ax.barh(np.arange(len(tokens)), scores, color="#55a868")
+    ax.set_yticks(np.arange(len(tokens)))
+    ax.set_yticklabels(tokens)
+    ax.set_xlabel("Total |importance| score")
+    ax.set_title(title)
+    ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_token_summary.png")
+    fig.savefig(output_path, dpi=200)
+
+    inline_displayed = False
+    try:
+        from IPython import get_ipython  # type: ignore
+        from IPython.display import display  # type: ignore
+    except ImportError:
+        pass
+    else:
+        ipython = get_ipython()
+        if ipython is not None and getattr(ipython, "kernel", None) is not None:
+            display(fig)
+            inline_displayed = True
+
+    plt.close(fig)
+
+    absolute_path = os.path.abspath(output_path)
+    message = f"Saved interpretability visualization to {absolute_path}."
+    if not inline_displayed:
+        message += " Inline display is unavailable in this environment; open the PNG to review the summary."
+    print(message)
+    return absolute_path
+
+
 def _iter_object_container(container) -> Iterator:
     if isinstance(container, np.ndarray) and container.dtype == object:
         for item in container:
@@ -837,14 +967,14 @@ def _iter_shap_examples(explanation: shap.Explanation) -> Iterator[Tuple[List[st
         yield token_list, value_array
 
 
-def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object]:
+def summarize_token_attributions(examples: Sequence[TokenAttribution]) -> Dict[str, object]:
     token_scores = defaultdict(float)
     example_means: List[float] = []
     example_stds: List[float] = []
     sparsity_values: List[float] = []
     entropy_values: List[float] = []
 
-    for tokens, values in _iter_shap_examples(explanation):
+    for tokens, values in examples:
         if not tokens:
             continue
         scores = np.abs(_normalize_token_scores(values, len(tokens)))
@@ -878,9 +1008,9 @@ def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object
     return summary
 
 
-def _collect_shap_statistics(explanation: shap.Explanation) -> List[Dict[str, object]]:
+def collect_token_statistics(examples: Sequence[TokenAttribution]) -> List[Dict[str, object]]:
     statistics: List[Dict[str, object]] = []
-    for index, (tokens, values) in enumerate(_iter_shap_examples(explanation)):
+    for index, (tokens, values) in enumerate(examples):
         if not tokens:
             continue
         scores = np.abs(_normalize_token_scores(values, len(tokens)))
@@ -915,8 +1045,16 @@ def _pooled_stddev(sample_a: Sequence[float], sample_b: Sequence[float]) -> floa
     return float(np.sqrt(max(pooled, 0.0)))
 
 
-def compare_shap_explanations(
-    zero_shot: shap.Explanation, fine_tuned: shap.Explanation
+def _tokens_to_dict(tokens: Sequence[str], scores: np.ndarray) -> Dict[str, float]:
+    mapping: Dict[str, float] = defaultdict(float)
+    for token, score in zip(tokens, scores):
+        mapping[token] += float(score)
+    return mapping
+
+
+def compare_token_attributions(
+    zero_examples: Sequence[TokenAttribution],
+    tuned_examples: Sequence[TokenAttribution],
 ) -> Dict[str, float]:
     cosine_similarities: List[float] = []
     jaccard_scores: List[float] = []
@@ -931,56 +1069,60 @@ def compare_shap_explanations(
     top5_overlap: List[float] = []
     top10_overlap: List[float] = []
 
-    for (zero_tokens, zero_values), (tuned_tokens, tuned_values) in zip(
-        _iter_shap_examples(zero_shot),
-        _iter_shap_examples(fine_tuned),
-    ):
-        if not zero_tokens or not tuned_tokens or len(zero_tokens) != len(tuned_tokens):
+    for (zero_tokens, zero_values), (tuned_tokens, tuned_values) in zip(zero_examples, tuned_examples):
+        if not zero_tokens and not tuned_tokens:
             continue
 
         zero_scores = np.abs(_normalize_token_scores(zero_values, len(zero_tokens)))
         tuned_scores = np.abs(_normalize_token_scores(tuned_values, len(tuned_tokens)))
-        if zero_scores.size == 0 or tuned_scores.size == 0:
+        zero_dict = _tokens_to_dict(zero_tokens, zero_scores)
+        tuned_dict = _tokens_to_dict(tuned_tokens, tuned_scores)
+        union = sorted(set(zero_dict) | set(tuned_dict))
+        if not union:
+            continue
+        zero_vector = np.array([zero_dict.get(token, 0.0) for token in union], dtype=float)
+        tuned_vector = np.array([tuned_dict.get(token, 0.0) for token in union], dtype=float)
+        if zero_vector.size == 0 or tuned_vector.size == 0:
             continue
 
-        denom = float(np.linalg.norm(zero_scores) * np.linalg.norm(tuned_scores))
+        denom = float(np.linalg.norm(zero_vector) * np.linalg.norm(tuned_vector))
         if denom > 0:
-            cosine_similarities.append(float(np.dot(zero_scores, tuned_scores) / denom))
+            cosine_similarities.append(float(np.dot(zero_vector, tuned_vector) / denom))
 
-        zero_means.append(float(zero_scores.mean()))
-        tuned_means.append(float(tuned_scores.mean()))
+        zero_means.append(float(zero_vector.mean()))
+        tuned_means.append(float(tuned_vector.mean()))
 
-        correlation_matrix = np.corrcoef(zero_scores, tuned_scores)
+        correlation_matrix = np.corrcoef(zero_vector, tuned_vector)
         corr_value = correlation_matrix[0, 1]
         if np.isfinite(corr_value):
             per_example_correlations.append(float(corr_value))
 
-        if zero_scores.size > 1 and tuned_scores.size > 1:
-            rho, _ = spearmanr(zero_scores, tuned_scores)
+        if zero_vector.size > 1 and tuned_vector.size > 1:
+            rho, _ = spearmanr(zero_vector, tuned_vector)
             if np.isfinite(rho):
                 spearman_scores.append(float(rho))
 
-        zero_dist = _normalize_distribution(zero_scores)
-        tuned_dist = _normalize_distribution(tuned_scores)
+        zero_dist = _normalize_distribution(zero_vector)
+        tuned_dist = _normalize_distribution(tuned_vector)
         zero_sparsity.append(_gini_coefficient(zero_dist))
         tuned_sparsity.append(_gini_coefficient(tuned_dist))
         zero_entropy.append(_entropy(zero_dist))
         tuned_entropy.append(_entropy(tuned_dist))
 
-        top_k = min(5, len(zero_scores), len(tuned_scores))
+        top_k = min(5, len(zero_dict), len(tuned_dict))
         if top_k == 0:
             continue
-        zero_top = set(np.argsort(zero_scores)[-top_k:])
-        tuned_top = set(np.argsort(tuned_scores)[-top_k:])
-        union = zero_top | tuned_top
-        if union:
-            jaccard_scores.append(len(zero_top & tuned_top) / len(union))
-            top5_overlap.append(len(zero_top & tuned_top) / top_k)
+        zero_top_tokens = set(sorted(zero_dict, key=zero_dict.get, reverse=True)[:top_k])
+        tuned_top_tokens = set(sorted(tuned_dict, key=tuned_dict.get, reverse=True)[:top_k])
+        union_top = zero_top_tokens | tuned_top_tokens
+        if union_top:
+            jaccard_scores.append(len(zero_top_tokens & tuned_top_tokens) / len(union_top))
+            top5_overlap.append(len(zero_top_tokens & tuned_top_tokens) / top_k)
 
-        top_k10 = min(10, len(zero_scores), len(tuned_scores))
+        top_k10 = min(10, len(zero_dict), len(tuned_dict))
         if top_k10:
-            zero_top10 = set(np.argsort(zero_scores)[-top_k10:])
-            tuned_top10 = set(np.argsort(tuned_scores)[-top_k10:])
+            zero_top10 = set(sorted(zero_dict, key=zero_dict.get, reverse=True)[:top_k10])
+            tuned_top10 = set(sorted(tuned_dict, key=tuned_dict.get, reverse=True)[:top_k10])
             top10_overlap.append(len(zero_top10 & tuned_top10) / top_k10)
 
     comparison: Dict[str, float] = {}
@@ -1017,6 +1159,231 @@ def compare_shap_explanations(
     return comparison
 
 
+def summarize_shap_importance(explanation: shap.Explanation) -> Dict[str, object]:
+    examples = list(_iter_shap_examples(explanation))
+    return summarize_token_attributions(examples)
+
+
+def _collect_shap_statistics(explanation: shap.Explanation) -> List[Dict[str, object]]:
+    examples = list(_iter_shap_examples(explanation))
+    return collect_token_statistics(examples)
+
+
+def compare_shap_explanations(
+    zero_shot: shap.Explanation, fine_tuned: shap.Explanation
+) -> Dict[str, float]:
+    zero_examples = list(_iter_shap_examples(zero_shot))
+    tuned_examples = list(_iter_shap_examples(fine_tuned))
+    return compare_token_attributions(zero_examples, tuned_examples)
+
+
+def _preferred_label_index(label_token_map: LabelTokenMap) -> int:
+    ordered_labels = sorted(label_token_map)
+    if not ordered_labels:
+        return 0
+    positive_label = ordered_labels[-1]
+    return ordered_labels.index(positive_label)
+
+
+def compute_lime_attributions(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+    num_features: int,
+    num_samples: int,
+) -> List[TokenAttribution]:
+    if LimeTextExplainer is None:  # pragma: no cover - optional dependency
+        raise RuntimeError(
+            "LIME is not installed. Install it via `pip install lime` to compute LIME metrics."
+        )
+
+    ordered_labels = [str(label) for label in sorted(label_token_map)]
+    explainer = LimeTextExplainer(class_names=ordered_labels)
+
+    def predict_fn(batch_texts: List[str]) -> np.ndarray:
+        return _classification_probabilities(
+            model,
+            tokenizer,
+            batch_texts,
+            label_token_map,
+            device,
+            max_length,
+        )
+
+    target_index = _preferred_label_index(label_token_map)
+    examples: List[TokenAttribution] = []
+    for text in texts:
+        explanation = explainer.explain_instance(
+            text,
+            predict_fn,
+            num_features=num_features,
+            labels=[target_index],
+            num_samples=num_samples,
+        )
+        feature_list = explanation.as_list(label=target_index)
+        tokens = [feature for feature, _ in feature_list]
+        values = np.array([score for _, score in feature_list], dtype=float)
+        examples.append((tokens, values))
+    return examples
+
+
+def compute_tree_shap_attributions(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+    max_features: int,
+    max_depth: int,
+) -> List[TokenAttribution]:
+    if TfidfVectorizer is None or DecisionTreeRegressor is None:  # pragma: no cover
+        raise RuntimeError(
+            "scikit-learn is required for TreeSHAP surrogate explanations. Install it via `pip install scikit-learn`."
+        )
+
+    vectorizer = TfidfVectorizer(max_features=max_features, ngram_range=(1, 2))
+    feature_matrix = vectorizer.fit_transform(texts)
+    feature_names = vectorizer.get_feature_names_out().tolist()
+    dense_matrix = feature_matrix.toarray()
+
+    def predict_fn(batch_texts: Sequence[str]) -> np.ndarray:
+        probs = _classification_probabilities(
+            model,
+            tokenizer,
+            batch_texts,
+            label_token_map,
+            device,
+            max_length,
+        )
+        return probs[:, _preferred_label_index(label_token_map)]
+
+    target_probs = predict_fn(texts)
+    regressor = DecisionTreeRegressor(max_depth=max_depth, random_state=0)
+    regressor.fit(dense_matrix, target_probs)
+    tree_explainer = shap.TreeExplainer(regressor, feature_perturbation="interventional")
+    values = tree_explainer.shap_values(dense_matrix)
+    if isinstance(values, list):  # pragma: no cover - TreeExplainer multi-output fallback
+        values = values[0]
+
+    examples: List[TokenAttribution] = []
+    for row in values:
+        examples.append((feature_names, np.array(row, dtype=float)))
+    return examples
+
+
+def _compute_method_examples(
+    method: str,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    config: ExperimentConfig,
+) -> List[TokenAttribution]:
+    normalized = method.lower()
+    if normalized == "kernel_shap":
+        return compute_kernel_shap_attributions(
+            model,
+            tokenizer,
+            texts,
+            label_token_map,
+            device,
+            config.max_seq_length,
+            config.shap_max_evals,
+        )
+    if normalized == "tree_shap":
+        return compute_tree_shap_attributions(
+            model,
+            tokenizer,
+            texts,
+            label_token_map,
+            device,
+            config.max_seq_length,
+            config.tree_shap_max_features,
+            config.tree_shap_max_depth,
+        )
+    if normalized == "lime":
+        return compute_lime_attributions(
+            model,
+            tokenizer,
+            texts,
+            label_token_map,
+            device,
+            config.max_seq_length,
+            config.lime_num_features,
+            config.lime_num_samples,
+        )
+    raise ValueError(f"Unsupported interpretability method: {method}")
+
+
+def _summarize_examples(
+    examples: List[TokenAttribution],
+    output_dir: Optional[str] = None,
+    method: Optional[str] = None,
+    variant: Optional[str] = None,
+) -> Dict[str, object]:
+    summary = summarize_token_attributions(examples)
+    summary["per_example_stats"] = collect_token_statistics(examples)
+    if output_dir and method and variant:
+        visualization_path = _plot_generic_token_summary(
+            examples,
+            output_dir,
+            f"{variant}_{method.lower()}",
+            title=f"{method.replace('_', ' ').title()} token contributions ({variant.replace('_', ' ')})",
+        )
+        if visualization_path:
+            summary["visualization_path"] = visualization_path
+    return summary
+
+
+def evaluate_interpretability_method(
+    method: str,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    config: ExperimentConfig,
+    tuned_model: Optional[PeftModel],
+) -> Dict[str, object]:
+    zero_examples = _compute_method_examples(
+        method, model, tokenizer, texts, label_token_map, device, config
+    )
+    result: Dict[str, object] = {
+        "zero_shot": _summarize_examples(
+            zero_examples,
+            output_dir=config.output_dir,
+            method=method,
+            variant="zero_shot",
+        )
+    }
+
+    tuned_examples: Optional[List[TokenAttribution]] = None
+    if tuned_model is not None:
+        tuned_examples = _compute_method_examples(
+            method,
+            tuned_model,
+            tokenizer,
+            texts,
+            label_token_map,
+            device,
+            config,
+        )
+        result["fine_tuned"] = _summarize_examples(
+            tuned_examples,
+            output_dir=config.output_dir,
+            method=method,
+            variant="fine_tuned",
+        )
+    if tuned_examples is not None:
+        result["comparison"] = compare_token_attributions(zero_examples, tuned_examples)
+    return result
+
+
 def run_experiment(args: argparse.Namespace) -> None:
     provided_token = args.huggingface_token or os.environ.get("HF_TOKEN") or os.environ.get(
         "HUGGINGFACE_TOKEN"
@@ -1036,6 +1403,11 @@ def run_experiment(args: argparse.Namespace) -> None:
         run_shap=args.run_shap,
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
+        interpretability_methods=args.interpretability_methods,
+        lime_num_features=args.lime_num_features,
+        lime_num_samples=args.lime_num_samples,
+        tree_shap_max_features=args.tree_shap_max_features,
+        tree_shap_max_depth=args.tree_shap_max_depth,
         load_in_4bit=args.load_in_4bit,
         output_dir=args.output_dir,
         label_space=args.label_space,
@@ -1117,6 +1489,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
 
     interpretability_summary: Optional[Dict[str, object]] = None
+    additional_method_results: Dict[str, object] = {}
     if config.run_shap:
         shap_samples = zero_shot_texts[: config.shap_example_count]
         if shap_samples:
@@ -1140,6 +1513,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                 zero_summary["visualization_path"] = zero_plot_path
             interpretability_summary = {"zero_shot": zero_summary}
 
+            tuned_shap: Optional[shap.Explanation] = None
             if tuned_model is not None:
                 tuned_shap = compute_shap_values(
                     tuned_model,
@@ -1150,7 +1524,9 @@ def run_experiment(args: argparse.Namespace) -> None:
                     config.max_seq_length,
                     config.shap_max_evals,
                 )
-                save_shap_values(tuned_shap, os.path.join(config.output_dir, "fine_tuned_shap.json"))
+                save_shap_values(
+                    tuned_shap, os.path.join(config.output_dir, "fine_tuned_shap.json")
+                )
                 print("Saved fine-tuned SHAP explanations.")
                 tuned_summary = summarize_shap_importance(tuned_shap)
                 tuned_summary["per_example_stats"] = _collect_shap_statistics(tuned_shap)
@@ -1159,26 +1535,48 @@ def run_experiment(args: argparse.Namespace) -> None:
                 )
                 if tuned_plot_path:
                     tuned_summary["visualization_path"] = tuned_plot_path
-                if interpretability_summary is None:
-                    interpretability_summary = {}
                 interpretability_summary["fine_tuned"] = tuned_summary
-                if "zero_shot" in interpretability_summary:
-                    comparison = compare_shap_explanations(zero_shot_shap, tuned_shap)
-                    zero_stats = interpretability_summary["zero_shot"].get("per_example_stats", [])
-                    tuned_stats = tuned_summary.get("per_example_stats", [])
-                    if len(zero_stats) == len(tuned_stats) and zero_stats:
-                        comparison["per_example_mean_abs_difference"] = [
-                            float(tuned_stats[idx]["mean_abs_importance"] - zero_stats[idx]["mean_abs_importance"])
-                            for idx in range(len(zero_stats))
-                        ]
-                    zero_top = set(interpretability_summary["zero_shot"].get("top_tokens", []))
-                    tuned_top = set(tuned_summary.get("top_tokens", []))
-                    union = zero_top | tuned_top
-                    if union:
-                        comparison["top_token_jaccard_overall"] = len(zero_top & tuned_top) / len(union)
-                    interpretability_summary["comparison"] = comparison
+                comparison = compare_shap_explanations(zero_shot_shap, tuned_shap)
+                zero_stats = interpretability_summary["zero_shot"].get("per_example_stats", [])
+                tuned_stats = tuned_summary.get("per_example_stats", [])
+                if len(zero_stats) == len(tuned_stats) and zero_stats:
+                    comparison["per_example_mean_abs_difference"] = [
+                        float(
+                            tuned_stats[idx]["mean_abs_importance"]
+                            - zero_stats[idx]["mean_abs_importance"]
+                        )
+                        for idx in range(len(zero_stats))
+                    ]
+                zero_top = set(interpretability_summary["zero_shot"].get("top_tokens", []))
+                tuned_top = set(tuned_summary.get("top_tokens", []))
+                union = zero_top | tuned_top
+                if union:
+                    comparison["top_token_jaccard_overall"] = len(zero_top & tuned_top) / len(union)
+                interpretability_summary["comparison"] = comparison
+
+            if config.interpretability_methods:
+                for method in config.interpretability_methods:
+                    try:
+                        method_result = evaluate_interpretability_method(
+                            method,
+                            model,
+                            tokenizer,
+                            shap_samples,
+                            label_token_map,
+                            device,
+                            config,
+                            tuned_model,
+                        )
+                    except Exception as exc:  # pragma: no cover - diagnostic aid
+                        method_result = {"error": str(exc)}
+                    additional_method_results[method] = method_result
         else:
             print("No samples available for SHAP analysis; skipping attribution generation.")
+
+    if additional_method_results:
+        if interpretability_summary is None:
+            interpretability_summary = {}
+        interpretability_summary["additional_methods"] = additional_method_results
 
     if interpretability_summary is not None:
         summary_path = os.path.join(config.output_dir, "interpretability_metrics.json")
@@ -1209,6 +1607,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(run_shap=True)
     parser.add_argument("--shap-example-count", type=int, default=10)
     parser.add_argument("--shap-max-evals", type=int, default=200)
+    parser.add_argument(
+        "--interpretability-methods",
+        nargs="*",
+        default=["kernel_shap", "tree_shap", "lime"],
+        help="Additional explanation techniques to compare (e.g., kernel_shap tree_shap lime).",
+    )
+    parser.add_argument("--lime-num-features", type=int, default=10)
+    parser.add_argument("--lime-num-samples", type=int, default=500)
+    parser.add_argument("--tree-shap-max-features", type=int, default=200)
+    parser.add_argument("--tree-shap-max-depth", type=int, default=6)
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.set_defaults(load_in_4bit=True)
