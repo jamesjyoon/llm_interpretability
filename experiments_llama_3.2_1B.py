@@ -603,6 +603,37 @@ def compute_shap_values(
     return explainer(texts, max_evals=max_evals)
 
 
+def compute_kernel_shap_attributions(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    texts: Sequence[str],
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+    max_evals: int,
+) -> List[TokenAttribution]:
+    """Return token-level Kernel SHAP approximations.
+
+    ``shap.Explainer`` does not accept ``algorithm="kernel"`` when used with
+    ``maskers.Text`` (the combination needed for Hugging Face tokenizers).  The
+    permutation-based explainer shares the same Kernel SHAP sampling strategy,
+    so we explicitly request that algorithm here to emulate Kernel SHAP while
+    still receiving properly tokenized outputs.
+    """
+
+    explanation = compute_shap_values(
+        model,
+        tokenizer,
+        texts,
+        label_token_map,
+        device,
+        max_length,
+        max_evals,
+        algorithm="permutation",
+    )
+    return list(_iter_shap_examples(explanation))
+
+
 def _ensure_json_serializable(value):
     """Recursively convert numpy/tensor objects into JSON-friendly Python types."""
 
@@ -1255,6 +1286,7 @@ def _compute_method_examples(
 ) -> List[TokenAttribution]:
     normalized = method.lower()
     if normalized == "kernel_shap":
+        return compute_kernel_shap_attributions(
         explanation = compute_shap_values(
             model,
             tokenizer,
@@ -1263,6 +1295,7 @@ def _compute_method_examples(
             device,
             config.max_seq_length,
             config.shap_max_evals,
+        )
             algorithm="kernel",
         )
         return list(_iter_shap_examples(explanation))
