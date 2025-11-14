@@ -4,8 +4,8 @@ __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style model
 
 This module is designed so it can be executed end-to-end on Google Colab. It
 loads a dataset, evaluates a zero-shot baseline, optionally fine-tunes a LoRA
-adapter, and computes SHAP token attributions for both models. In addition to
-precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisons, the script now evaluates interpretability
+adapter, and computes SHAP token attributions for both models. The script now evaluates interpretability
+precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisonscomparisons, the script now evaluates interpretability
 characteristics across multiple explanation techniques including standard SHAP,
 Kernel SHAP, TreeSHAP surrogates, and LIME.
 """
