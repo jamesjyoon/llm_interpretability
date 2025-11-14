@@ -4,8 +4,8 @@ __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style model
 
 This module is designed so it can be executed end-to-end on Google Colab. It
 loads a dataset, evaluates a zero-shot baseline, optionally fine-tunes a LoRA
-adapter, and computes SHAP token attributions for both models. In addition to
-precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisons, the script now evaluates interpretability
+adapter, and computes SHAP token attributions for both models. The script now evaluates interpretability
+precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisonscomparisons, the script now evaluates interpretability
 characteristics across multiple explanation techniques including standard SHAP,
 Kernel SHAP, TreeSHAP surrogates, and LIME.
 """
@@ -22,7 +22,7 @@ from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence,
 
 import numpy as np
 import torch
-from datasets import Dataset, DatasetDict, load_dataset
+from datasets import DatasetDict, load_dataset
 from scipy.stats import spearmanr
 
 try:
@@ -120,45 +120,6 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
     return label_token_map
 
 
-def _balanced_subset(
-    dataset_split: Dataset,
-    target_count: Optional[int],
-    label_field: str,
-    seed: int,
-) -> Dataset:
-    """Return a stratified subset that preserves label balance when downsampling."""
-
-    if target_count is None:
-        return dataset_split
-    available = dataset_split.num_rows
-    if target_count >= available:
-        return dataset_split
-
-    labels = [int(label) for label in dataset_split[label_field]]
-    label_to_indices: Dict[int, List[int]] = defaultdict(list)
-    for idx, label in enumerate(labels):
-        label_to_indices[label].append(idx)
-    rng = np.random.default_rng(seed)
-    for indices in label_to_indices.values():
-        rng.shuffle(indices)
-
-    selected: List[int] = []
-    ordered_labels = sorted(label_to_indices)
-    while len(selected) < target_count and ordered_labels:
-        for label in list(ordered_labels):
-            indices = label_to_indices[label]
-            if not indices:
-                ordered_labels.remove(label)
-                continue
-            selected.append(indices.pop())
-            if len(selected) >= target_count:
-                break
-            if not indices:
-                ordered_labels.remove(label)
-    selected.sort()
-    return dataset_split.select(selected)
-
-
 @dataclass
 class ExperimentConfig:
     """Configuration for the classification experiment."""
@@ -195,25 +156,6 @@ class ExperimentConfig:
     tree_shap_max_depth: int = 6
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
-    fast_mode: bool = False
-
-
-def _apply_fast_mode_overrides(config: ExperimentConfig) -> ExperimentConfig:
-    """Return a copy of the config with faster defaults when fast mode is enabled."""
-
-    if not config.fast_mode:
-        return config
-
-    fast_config = copy.deepcopy(config)
-    fast_config.train_subset = fast_config.train_subset or 8000
-    fast_config.eval_subset = fast_config.eval_subset or 2000
-    fast_config.num_train_epochs = min(fast_config.num_train_epochs, 2.0)
-    fast_config.shap_max_evals = min(fast_config.shap_max_evals, 120)
-    fast_config.shap_example_count = min(fast_config.shap_example_count, 6)
-    fast_config.lime_num_samples = min(fast_config.lime_num_samples, 300)
-    fast_config.tree_shap_max_features = min(fast_config.tree_shap_max_features, 150)
-    fast_config.eval_batch_size = max(fast_config.eval_batch_size, 32)
-    return fast_config
 
 
 class PromptFormatter:
@@ -256,22 +198,6 @@ def _prepare_dataset(
             )
         )
 
-    dataset = dataset.copy()
-    if config.train_subset:
-        dataset[config.train_split] = _balanced_subset(
-            dataset[config.train_split],
-            config.train_subset,
-            config.label_field,
-            config.random_seed,
-        )
-    if config.eval_subset:
-        dataset[config.eval_split] = _balanced_subset(
-            dataset[config.eval_split],
-            config.eval_subset,
-            config.label_field,
-            config.random_seed,
-        )
-
     def _format_examples(examples):
         prompts = [formatter.build_prompt(sentence) for sentence in examples[config.text_field]]
         full_sequences = [
@@ -312,6 +238,14 @@ def _prepare_dataset(
         remove_columns=remove_columns,
     )
 
+    if config.train_subset:
+        train_dataset = processed[config.train_split].shuffle(seed=config.random_seed)
+        train_count = min(config.train_subset, train_dataset.num_rows)
+        processed[config.train_split] = train_dataset.select(range(train_count))
+    if config.eval_subset:
+        validation_dataset = processed[config.eval_split].shuffle(seed=config.random_seed)
+        validation_count = min(config.eval_subset, validation_dataset.num_rows)
+        processed[config.eval_split] = validation_dataset.select(range(validation_count))
     return processed
 
 
@@ -319,12 +253,10 @@ def _prepare_zero_shot_texts(
     config: ExperimentConfig, original_dataset: DatasetDict, formatter: PromptFormatter
 ) -> Tuple[List[str], List[int]]:
     validation_split = original_dataset[config.eval_split]
-    validation_split = _balanced_subset(
-        validation_split,
-        config.eval_subset,
-        config.label_field,
-        config.random_seed,
-    )
+    if config.eval_subset:
+        eval_count = min(config.eval_subset, len(validation_split))
+        validation_split = validation_split.shuffle(seed=config.random_seed)
+        validation_split = validation_split.select(range(eval_count))
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
     return texts, labels
@@ -1528,18 +1460,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         eval_batch_size=args.eval_batch_size,
         output_dir=args.output_dir,
         label_space=args.label_space,
-        fast_mode=args.fast_mode,
     )
-
-    config = _apply_fast_mode_overrides(config)
-    if config.fast_mode:
-        print(
-            "Fast mode enabled: using up to "
-            f"{config.train_subset or 'all'} training samples, "
-            f"{config.eval_subset or 'all'} eval samples, "
-            f"{config.num_train_epochs} training epochs, and "
-            f"{config.shap_example_count} SHAP examples."
-        )
 
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1747,12 +1668,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--max-target-length", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=3)
-    parser.add_argument(
-        "--fast-mode",
-        action="store_true",
-        help="Apply throughput-oriented defaults (balanced subsampling, fewer epochs, and"
-        " lighter interpretability settings) to get quicker feedback.",
-    )
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
