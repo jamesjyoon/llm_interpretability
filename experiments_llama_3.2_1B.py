@@ -4,8 +4,8 @@ __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style model
 
 This module is designed so it can be executed end-to-end on Google Colab. It
 loads a dataset, evaluates a zero-shot baseline, optionally fine-tunes a LoRA
-adapter, and computes SHAP token attributions for both models. In addition to
-precision, recall, and F1 comparisons, the script now evaluates interpretability
+adapter, and computes SHAP token attributions for both models. The script now evaluates interpretability
+precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisonscomparisons, the script now evaluates interpretability
 characteristics across multiple explanation techniques including standard SHAP,
 Kernel SHAP, TreeSHAP surrogates, and LIME.
 """
@@ -13,6 +13,7 @@ Kernel SHAP, TreeSHAP surrogates, and LIME.
 import argparse
 import copy
 import json
+import math
 import os
 import time
 from collections import defaultdict
@@ -130,18 +131,20 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 2000
-    eval_subset: Optional[int] = 1000
+    train_subset: Optional[int] = None
+    eval_subset: Optional[int] = None
     random_seed: int = 42
-    learning_rate: float = 2e-4
-    num_train_epochs: float = 1.0
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 4
+    learning_rate: float = 3e-4
+    num_train_epochs: float = 3.0
+    per_device_train_batch_size: int = 8
+    gradient_accumulation_steps: int = 2
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
     max_seq_length: int = 512
     max_target_length: int = 4
+    max_new_tokens: int = 3
+    eval_batch_size: int = 16
     output_dir: str = "outputs/tweet_sentiment_extraction"
     run_shap: bool = True
     shap_max_evals: int = 200
@@ -337,6 +340,7 @@ def _generate_class_predictions(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    max_new_tokens: int,
 ) -> Tuple[List[int], np.ndarray]:
     inputs = tokenizer(
         list(prompts),
@@ -351,7 +355,7 @@ def _generate_class_predictions(
     with torch.no_grad():
         generation = model.generate(
             **inputs,
-            max_new_tokens=1,
+            max_new_tokens=max(1, int(max_new_tokens)),
             do_sample=False,
             temperature=0.0,
             top_p=1.0,
@@ -436,11 +440,39 @@ def _weighted_average(metric: torch.Tensor, weights: torch.Tensor) -> float:
     return float((metric * weights).sum().item() / total)
 
 
+def _matthews_correlation(confusion: torch.Tensor) -> float:
+    """Compute the Matthews Correlation Coefficient for any confusion matrix."""
+
+    if confusion.numel() == 0:
+        return 0.0
+
+    confusion = confusion.to(torch.double)
+    total = float(confusion.sum().item())
+    if total <= 0:
+        return 0.0
+
+    actual = confusion.sum(dim=1)
+    predicted = confusion.sum(dim=0)
+    diag_sum = float(confusion.diag().sum().item())
+    numerator = diag_sum * total - float((actual * predicted).sum().item())
+
+    denom_actual = total ** 2 - float(actual.pow(2).sum().item())
+    denom_predicted = total ** 2 - float(predicted.pow(2).sum().item())
+    if denom_actual <= 0.0 or denom_predicted <= 0.0:
+        return 0.0
+
+    denominator = math.sqrt(denom_actual * denom_predicted)
+    if denominator <= 0.0:
+        return 0.0
+
+    return float(numerator / denominator)
+
+
 def _aggregate_metrics(
     confusion: torch.Tensor,
     per_class: Dict[str, Dict[str, float]],
     ordered_labels: Sequence[int],
-) -> Tuple[float, float, float, float]:
+) -> Tuple[float, float, float, float, float]:
     total = float(confusion.sum().item())
     accuracy = float(confusion.diag().sum().item() / total) if total > 0 else 0.0
 
@@ -470,7 +502,9 @@ def _aggregate_metrics(
         recall = _weighted_average(recalls, supports)
         f1 = _weighted_average(f1_scores, supports)
 
-    return accuracy, precision, recall, f1
+    mcc = _matthews_correlation(confusion)
+
+    return accuracy, precision, recall, f1, mcc
 
 
 def evaluate_zero_shot(
@@ -481,6 +515,7 @@ def evaluate_zero_shot(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    max_new_tokens: int = 1,
     batch_size: int = 8,
 ) -> Dict[str, float]:
     predictions: List[int] = []
@@ -494,19 +529,23 @@ def evaluate_zero_shot(
             label_token_map,
             device,
             max_length,
+            max_new_tokens,
         )
         predictions.extend(preds)
         probability_rows.extend(probs.astype(float).tolist())
 
     confusion = _build_confusion_matrix(labels, predictions, ordered_labels)
     per_class = _per_class_metrics(confusion, ordered_labels)
-    accuracy, precision, recall, f1 = _aggregate_metrics(confusion, per_class, ordered_labels)
+    accuracy, precision, recall, f1, mcc = _aggregate_metrics(
+        confusion, per_class, ordered_labels
+    )
 
     metrics = {
         "accuracy": accuracy,
         "precision": precision,
         "recall": recall,
         "f1": f1,
+        "mcc": mcc,
         "per_class": per_class,
         "confusion_matrix": confusion.tolist(),
     }
@@ -691,7 +730,7 @@ def _plot_metric_bars(
         print("matplotlib is not installed; skipping metric visualization.")
         return
 
-    metrics = ["accuracy", "precision", "recall", "f1"]
+    metrics = ["accuracy", "precision", "recall", "f1", "mcc"]
     zero_values = [zero_shot_metrics.get(metric, float("nan")) for metric in metrics]
     tuned_values: Optional[List[float]] = None
     if fine_tuned_metrics is not None:
@@ -707,7 +746,7 @@ def _plot_metric_bars(
 
     ax.set_xticks(x)
     ax.set_xticklabels([metric.upper() for metric in metrics])
-    ax.set_ylim(0.0, 1.05)
+    ax.set_ylim(-1.05, 1.05)
     ax.set_ylabel("Score")
     ax.set_title("Classification Metrics")
     ax.legend()
@@ -1401,6 +1440,11 @@ def run_experiment(args: argparse.Namespace) -> None:
         label_field=args.label_field,
         train_subset=args.train_subset,
         eval_subset=args.eval_subset,
+        random_seed=args.random_seed,
+        learning_rate=args.learning_rate,
+        num_train_epochs=args.num_train_epochs,
+        per_device_train_batch_size=args.per_device_train_batch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
         run_shap=args.run_shap,
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
@@ -1410,6 +1454,10 @@ def run_experiment(args: argparse.Namespace) -> None:
         tree_shap_max_features=args.tree_shap_max_features,
         tree_shap_max_depth=args.tree_shap_max_depth,
         load_in_4bit=args.load_in_4bit,
+        max_seq_length=args.max_seq_length,
+        max_target_length=args.max_target_length,
+        max_new_tokens=args.max_new_tokens,
+        eval_batch_size=args.eval_batch_size,
         output_dir=args.output_dir,
         label_space=args.label_space,
     )
@@ -1461,6 +1509,8 @@ def run_experiment(args: argparse.Namespace) -> None:
         label_token_map,
         device,
         config.max_seq_length,
+        config.max_new_tokens,
+        batch_size=config.eval_batch_size,
     )
     print("Zero-shot evaluation metrics:")
     print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
@@ -1485,6 +1535,8 @@ def run_experiment(args: argparse.Namespace) -> None:
             label_token_map,
             device,
             config.max_seq_length,
+            config.max_new_tokens,
+            batch_size=config.eval_batch_size,
         )
         print("Fine-tuned evaluation metrics:")
         print(json.dumps(_ensure_json_serializable(fine_tuned_metrics), indent=2))
@@ -1605,8 +1657,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Explicit list of label ids to model (defaults to inferring from the dataset)",
     )
-    parser.add_argument("--train-subset", type=int, default=2000)
-    parser.add_argument("--eval-subset", type=int, default=1000)
+    parser.add_argument("--train-subset", type=int, default=None)
+    parser.add_argument("--eval-subset", type=int, default=None)
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--num-train-epochs", type=float, default=3.0)
+    parser.add_argument("--per-device-train-batch-size", type=int, default=8)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=2)
+    parser.add_argument("--eval-batch-size", type=int, default=16)
+    parser.add_argument("--max-seq-length", type=int, default=512)
+    parser.add_argument("--max-target-length", type=int, default=4)
+    parser.add_argument("--max-new-tokens", type=int, default=3)
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
