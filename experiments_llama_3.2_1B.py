@@ -17,6 +17,7 @@ import math
 import os
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
@@ -24,6 +25,18 @@ import numpy as np
 import torch
 from datasets import Dataset, DatasetDict, load_dataset
 from scipy.stats import spearmanr
+
+try:  # pragma: no cover - PyTorch 2.0+ exposes this helper
+    torch.set_float32_matmul_precision("high")
+except AttributeError:
+    pass
+
+if torch.cuda.is_available():  # pragma: no cover - depends on runtime
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
 
 try:
     import shap  # type: ignore
@@ -196,6 +209,10 @@ class ExperimentConfig:
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
     fast_mode: bool = False
+    dataloader_num_workers: Optional[int] = None
+    auto_adjust_max_seq_length: bool = True
+    length_sample_size: int = 2000
+    max_length_percentile: float = 99.5
 
 
 def _apply_fast_mode_overrides(config: ExperimentConfig) -> ExperimentConfig:
@@ -213,6 +230,9 @@ def _apply_fast_mode_overrides(config: ExperimentConfig) -> ExperimentConfig:
     fast_config.lime_num_samples = min(fast_config.lime_num_samples, 300)
     fast_config.tree_shap_max_features = min(fast_config.tree_shap_max_features, 150)
     fast_config.eval_batch_size = max(fast_config.eval_batch_size, 32)
+    fast_config.length_sample_size = min(fast_config.length_sample_size, 1000)
+    if fast_config.dataloader_num_workers is None:
+        fast_config.dataloader_num_workers = max(1, os.cpu_count() or 1)
     return fast_config
 
 
@@ -241,6 +261,61 @@ class PromptFormatter:
 
     def build_prompt(self, sentence: str) -> str:
         return self.template.format(sentence=sentence)
+
+
+def _maybe_auto_adjust_sequence_length(
+    config: ExperimentConfig,
+    dataset: DatasetDict,
+    tokenizer,
+    formatter: PromptFormatter,
+) -> ExperimentConfig:
+    """Shrink ``max_seq_length`` when the dataset's prompts are already short."""
+
+    if not config.auto_adjust_max_seq_length:
+        return config
+    if config.train_split not in dataset:
+        return config
+
+    split = dataset[config.train_split]
+    sample_size = min(config.length_sample_size, split.num_rows)
+    if sample_size <= 0:
+        return config
+
+    rng = np.random.default_rng(config.random_seed)
+    if sample_size >= split.num_rows:
+        indices = list(range(split.num_rows))
+    else:
+        indices = rng.choice(split.num_rows, size=sample_size, replace=False)
+
+    prompt_lengths: List[int] = []
+    for raw_index in indices:
+        record = split[int(raw_index)]
+        sentence = record[config.text_field]
+        prompt = formatter.build_prompt(sentence)
+        tokenized = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )
+        prompt_lengths.append(len(tokenized["input_ids"]) + config.max_target_length)
+
+    if not prompt_lengths:
+        return config
+
+    target_percentile = max(90.0, min(100.0, float(config.max_length_percentile)))
+    percentile_length = float(np.percentile(prompt_lengths, target_percentile))
+    safety_margin = 4
+    trimmed_length = int(math.ceil(percentile_length + safety_margin))
+    min_reasonable = max(config.max_target_length + 8, 32)
+    adjusted = min(config.max_seq_length, max(trimmed_length, min_reasonable))
+    if adjusted < config.max_seq_length:
+        print(
+            "Auto-adjusted max_seq_length from "
+            f"{config.max_seq_length} to {adjusted} based on the {target_percentile}th percentile "
+            "of prompt lengths."
+        )
+        config.max_seq_length = adjusted
+    return config
 
 
 def _prepare_dataset(
@@ -364,6 +439,15 @@ def _filter_dataset_by_labels(
     return dataset.filter(predicate)
 
 
+def _autocast_context(model: AutoModelForCausalLM, device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+    model_dtype = getattr(model, "dtype", torch.float32)
+    if model_dtype in {torch.float16, torch.bfloat16}:
+        return torch.cuda.amp.autocast(dtype=model_dtype)
+    return torch.cuda.amp.autocast()
+
+
 def _classification_probabilities(
     model: AutoModelForCausalLM,
     tokenizer,
@@ -381,8 +465,9 @@ def _classification_probabilities(
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
     model.eval()
-    with torch.no_grad():
-        outputs = model(**inputs)
+    with torch.inference_mode():
+        with _autocast_context(model, device):
+            outputs = model(**inputs)
     logits = outputs.logits
     sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
     final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
@@ -424,6 +509,19 @@ def _generate_class_predictions(
     inputs = {k: v.to(device) for k, v in inputs.items()}
     eos_token_id = _generation_eos_ids(tokenizer, label_token_map)
     model.eval()
+    with torch.inference_mode():
+        with _autocast_context(model, device):
+            generation = model.generate(
+                **inputs,
+                max_new_tokens=max(1, int(max_new_tokens)),
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
+                eos_token_id=eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
     with torch.no_grad():
         generation = model.generate(
             **inputs,
@@ -667,6 +765,8 @@ def train_lora_classifier(
         report_to=[],
         bf16=model_gradient_dtype == torch.bfloat16,
         fp16=model_gradient_dtype == torch.float16,
+        dataloader_num_workers=config.dataloader_num_workers or 0,
+        tf32=torch.cuda.is_available(),
     )
 
     trainer = Trainer(
@@ -1533,6 +1633,10 @@ def run_experiment(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         label_space=args.label_space,
         fast_mode=args.fast_mode,
+        dataloader_num_workers=args.dataloader_num_workers,
+        auto_adjust_max_seq_length=args.auto_adjust_max_seq_length,
+        length_sample_size=args.length_sample_size,
+        max_length_percentile=args.max_length_percentile,
     )
 
     config = _apply_fast_mode_overrides(config)
@@ -1581,6 +1685,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         raw_dataset = _filter_dataset_by_labels(raw_dataset, config, label_space)
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
+    config = _maybe_auto_adjust_sequence_length(config, raw_dataset, tokenizer, formatter)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
 
     zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
@@ -1751,6 +1856,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--max-target-length", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=3)
+    parser.add_argument("--dataloader-num-workers", type=int, default=None)
+    parser.add_argument(
+        "--auto-adjust-max-seq-length",
+        dest="auto_adjust_max_seq_length",
+        action="store_true",
+        help="Estimate prompt lengths and shrink max_seq_length automatically when safe.",
+    )
+    parser.add_argument(
+        "--no-auto-adjust-max-seq-length",
+        dest="auto_adjust_max_seq_length",
+        action="store_false",
+    )
+    parser.set_defaults(auto_adjust_max_seq_length=True)
+    parser.add_argument(
+        "--length-sample-size",
+        type=int,
+        default=2000,
+        help="Number of training prompts to sample when auto-adjusting the sequence length.",
+    )
+    parser.add_argument(
+        "--max-length-percentile",
+        type=float,
+        default=99.5,
+        help="Percentile of sampled prompt lengths to cover before trimming max_seq_length.",
+    )
     parser.add_argument(
         "--fast-mode",
         action="store_true",
