@@ -17,13 +17,26 @@ import math
 import os
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
-from datasets import DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from scipy.stats import spearmanr
+
+try:  # pragma: no cover - PyTorch 2.0+ exposes this helper
+    torch.set_float32_matmul_precision("high")
+except AttributeError:
+    pass
+
+if torch.cuda.is_available():  # pragma: no cover - depends on runtime
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
 
 try:
     import shap  # type: ignore
@@ -120,6 +133,45 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
     return label_token_map
 
 
+def _balanced_subset(
+    dataset_split: Dataset,
+    target_count: Optional[int],
+    label_field: str,
+    seed: int,
+) -> Dataset:
+    """Return a stratified subset that preserves label balance when downsampling."""
+
+    if target_count is None:
+        return dataset_split
+    available = dataset_split.num_rows
+    if target_count >= available:
+        return dataset_split
+
+    labels = [int(label) for label in dataset_split[label_field]]
+    label_to_indices: Dict[int, List[int]] = defaultdict(list)
+    for idx, label in enumerate(labels):
+        label_to_indices[label].append(idx)
+    rng = np.random.default_rng(seed)
+    for indices in label_to_indices.values():
+        rng.shuffle(indices)
+
+    selected: List[int] = []
+    ordered_labels = sorted(label_to_indices)
+    while len(selected) < target_count and ordered_labels:
+        for label in list(ordered_labels):
+            indices = label_to_indices[label]
+            if not indices:
+                ordered_labels.remove(label)
+                continue
+            selected.append(indices.pop())
+            if len(selected) >= target_count:
+                break
+            if not indices:
+                ordered_labels.remove(label)
+    selected.sort()
+    return dataset_split.select(selected)
+
+
 @dataclass
 class ExperimentConfig:
     """Configuration for the classification experiment."""
@@ -156,6 +208,32 @@ class ExperimentConfig:
     tree_shap_max_depth: int = 6
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
+    fast_mode: bool = False
+    dataloader_num_workers: Optional[int] = None
+    auto_adjust_max_seq_length: bool = True
+    length_sample_size: int = 2000
+    max_length_percentile: float = 99.5
+
+
+def _apply_fast_mode_overrides(config: ExperimentConfig) -> ExperimentConfig:
+    """Return a copy of the config with faster defaults when fast mode is enabled."""
+
+    if not config.fast_mode:
+        return config
+
+    fast_config = copy.deepcopy(config)
+    fast_config.train_subset = fast_config.train_subset or 8000
+    fast_config.eval_subset = fast_config.eval_subset or 2000
+    fast_config.num_train_epochs = min(fast_config.num_train_epochs, 2.0)
+    fast_config.shap_max_evals = min(fast_config.shap_max_evals, 120)
+    fast_config.shap_example_count = min(fast_config.shap_example_count, 6)
+    fast_config.lime_num_samples = min(fast_config.lime_num_samples, 300)
+    fast_config.tree_shap_max_features = min(fast_config.tree_shap_max_features, 150)
+    fast_config.eval_batch_size = max(fast_config.eval_batch_size, 32)
+    fast_config.length_sample_size = min(fast_config.length_sample_size, 1000)
+    if fast_config.dataloader_num_workers is None:
+        fast_config.dataloader_num_workers = max(1, os.cpu_count() or 1)
+    return fast_config
 
 
 class PromptFormatter:
@@ -185,6 +263,61 @@ class PromptFormatter:
         return self.template.format(sentence=sentence)
 
 
+def _maybe_auto_adjust_sequence_length(
+    config: ExperimentConfig,
+    dataset: DatasetDict,
+    tokenizer,
+    formatter: PromptFormatter,
+) -> ExperimentConfig:
+    """Shrink ``max_seq_length`` when the dataset's prompts are already short."""
+
+    if not config.auto_adjust_max_seq_length:
+        return config
+    if config.train_split not in dataset:
+        return config
+
+    split = dataset[config.train_split]
+    sample_size = min(config.length_sample_size, split.num_rows)
+    if sample_size <= 0:
+        return config
+
+    rng = np.random.default_rng(config.random_seed)
+    if sample_size >= split.num_rows:
+        indices = list(range(split.num_rows))
+    else:
+        indices = rng.choice(split.num_rows, size=sample_size, replace=False)
+
+    prompt_lengths: List[int] = []
+    for raw_index in indices:
+        record = split[int(raw_index)]
+        sentence = record[config.text_field]
+        prompt = formatter.build_prompt(sentence)
+        tokenized = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )
+        prompt_lengths.append(len(tokenized["input_ids"]) + config.max_target_length)
+
+    if not prompt_lengths:
+        return config
+
+    target_percentile = max(90.0, min(100.0, float(config.max_length_percentile)))
+    percentile_length = float(np.percentile(prompt_lengths, target_percentile))
+    safety_margin = 4
+    trimmed_length = int(math.ceil(percentile_length + safety_margin))
+    min_reasonable = max(config.max_target_length + 8, 32)
+    adjusted = min(config.max_seq_length, max(trimmed_length, min_reasonable))
+    if adjusted < config.max_seq_length:
+        print(
+            "Auto-adjusted max_seq_length from "
+            f"{config.max_seq_length} to {adjusted} based on the {target_percentile}th percentile "
+            "of prompt lengths."
+        )
+        config.max_seq_length = adjusted
+    return config
+
+
 def _prepare_dataset(
     dataset: DatasetDict, config: ExperimentConfig, tokenizer, formatter: PromptFormatter
 ) -> DatasetDict:
@@ -196,6 +329,26 @@ def _prepare_dataset(
                 + (f" with config `{config.dataset_config}`" if config.dataset_config else "")
                 + f" must contain the splits {sorted(required_splits)}."
             )
+        )
+
+    # ``DatasetDict`` inherits from ``dict`` but ``dict.copy`` returns a plain
+    # ``dict`` without dataset helper methods such as ``map``.  Re-wrap the
+    # object explicitly to keep the DatasetDict behavior while avoiding
+    # in-place mutation of the caller's dataset.
+    dataset = DatasetDict(dataset)
+    if config.train_subset:
+        dataset[config.train_split] = _balanced_subset(
+            dataset[config.train_split],
+            config.train_subset,
+            config.label_field,
+            config.random_seed,
+        )
+    if config.eval_subset:
+        dataset[config.eval_split] = _balanced_subset(
+            dataset[config.eval_split],
+            config.eval_subset,
+            config.label_field,
+            config.random_seed,
         )
 
     def _format_examples(examples):
@@ -238,14 +391,6 @@ def _prepare_dataset(
         remove_columns=remove_columns,
     )
 
-    if config.train_subset:
-        train_dataset = processed[config.train_split].shuffle(seed=config.random_seed)
-        train_count = min(config.train_subset, train_dataset.num_rows)
-        processed[config.train_split] = train_dataset.select(range(train_count))
-    if config.eval_subset:
-        validation_dataset = processed[config.eval_split].shuffle(seed=config.random_seed)
-        validation_count = min(config.eval_subset, validation_dataset.num_rows)
-        processed[config.eval_split] = validation_dataset.select(range(validation_count))
     return processed
 
 
@@ -253,10 +398,12 @@ def _prepare_zero_shot_texts(
     config: ExperimentConfig, original_dataset: DatasetDict, formatter: PromptFormatter
 ) -> Tuple[List[str], List[int]]:
     validation_split = original_dataset[config.eval_split]
-    if config.eval_subset:
-        eval_count = min(config.eval_subset, len(validation_split))
-        validation_split = validation_split.shuffle(seed=config.random_seed)
-        validation_split = validation_split.select(range(eval_count))
+    validation_split = _balanced_subset(
+        validation_split,
+        config.eval_subset,
+        config.label_field,
+        config.random_seed,
+    )
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
     return texts, labels
@@ -292,6 +439,15 @@ def _filter_dataset_by_labels(
     return dataset.filter(predicate)
 
 
+def _autocast_context(model: AutoModelForCausalLM, device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+    model_dtype = getattr(model, "dtype", torch.float32)
+    if model_dtype in {torch.float16, torch.bfloat16}:
+        return torch.cuda.amp.autocast(dtype=model_dtype)
+    return torch.cuda.amp.autocast()
+
+
 def _classification_probabilities(
     model: AutoModelForCausalLM,
     tokenizer,
@@ -309,8 +465,9 @@ def _classification_probabilities(
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
     model.eval()
-    with torch.no_grad():
-        outputs = model(**inputs)
+    with torch.inference_mode():
+        with _autocast_context(model, device):
+            outputs = model(**inputs)
     logits = outputs.logits
     sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
     final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
@@ -352,6 +509,19 @@ def _generate_class_predictions(
     inputs = {k: v.to(device) for k, v in inputs.items()}
     eos_token_id = _generation_eos_ids(tokenizer, label_token_map)
     model.eval()
+    with torch.inference_mode():
+        with _autocast_context(model, device):
+            generation = model.generate(
+                **inputs,
+                max_new_tokens=max(1, int(max_new_tokens)),
+                do_sample=False,
+                temperature=0.0,
+                top_p=1.0,
+                eos_token_id=eos_token_id,
+                pad_token_id=tokenizer.pad_token_id,
+                return_dict_in_generate=True,
+                output_scores=True,
+            )
     with torch.no_grad():
         generation = model.generate(
             **inputs,
@@ -595,6 +765,8 @@ def train_lora_classifier(
         report_to=[],
         bf16=model_gradient_dtype == torch.bfloat16,
         fp16=model_gradient_dtype == torch.float16,
+        dataloader_num_workers=config.dataloader_num_workers or 0,
+        tf32=torch.cuda.is_available(),
     )
 
     trainer = Trainer(
@@ -1460,7 +1632,22 @@ def run_experiment(args: argparse.Namespace) -> None:
         eval_batch_size=args.eval_batch_size,
         output_dir=args.output_dir,
         label_space=args.label_space,
+        fast_mode=args.fast_mode,
+        dataloader_num_workers=args.dataloader_num_workers,
+        auto_adjust_max_seq_length=args.auto_adjust_max_seq_length,
+        length_sample_size=args.length_sample_size,
+        max_length_percentile=args.max_length_percentile,
     )
+
+    config = _apply_fast_mode_overrides(config)
+    if config.fast_mode:
+        print(
+            "Fast mode enabled: using up to "
+            f"{config.train_subset or 'all'} training samples, "
+            f"{config.eval_subset or 'all'} eval samples, "
+            f"{config.num_train_epochs} training epochs, and "
+            f"{config.shap_example_count} SHAP examples."
+        )
 
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1498,6 +1685,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         raw_dataset = _filter_dataset_by_labels(raw_dataset, config, label_space)
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
+    config = _maybe_auto_adjust_sequence_length(config, raw_dataset, tokenizer, formatter)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
 
     zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
