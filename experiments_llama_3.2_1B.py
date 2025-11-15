@@ -4,8 +4,8 @@ __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style model
 
 This module is designed so it can be executed end-to-end on Google Colab. It
 loads a dataset, evaluates a zero-shot baseline, optionally fine-tunes a LoRA
-adapter, and computes SHAP token attributions for both models. In addition to
-precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisons, the script now evaluates interpretability
+adapter, and computes SHAP token attributions for both models. The script now evaluates interpretability
+precision, recall, F1, and Matthews Correlation Coefficient (MCC) comparisonscomparisons, the script now evaluates interpretability
 characteristics across multiple explanation techniques including standard SHAP,
 Kernel SHAP, TreeSHAP surrogates, and LIME.
 """
@@ -1856,37 +1856,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--max-target-length", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=3)
-    parser.add_argument("--dataloader-num-workers", type=int, default=None)
-    parser.add_argument(
-        "--auto-adjust-max-seq-length",
-        dest="auto_adjust_max_seq_length",
-        action="store_true",
-        help="Estimate prompt lengths and shrink max_seq_length automatically when safe.",
-    )
-    parser.add_argument(
-        "--no-auto-adjust-max-seq-length",
-        dest="auto_adjust_max_seq_length",
-        action="store_false",
-    )
-    parser.set_defaults(auto_adjust_max_seq_length=True)
-    parser.add_argument(
-        "--length-sample-size",
-        type=int,
-        default=2000,
-        help="Number of training prompts to sample when auto-adjusting the sequence length.",
-    )
-    parser.add_argument(
-        "--max-length-percentile",
-        type=float,
-        default=99.5,
-        help="Percentile of sampled prompt lengths to cover before trimming max_seq_length.",
-    )
-    parser.add_argument(
-        "--fast-mode",
-        action="store_true",
-        help="Apply throughput-oriented defaults (balanced subsampling, fewer epochs, and"
-        " lighter interpretability settings) to get quicker feedback.",
-    )
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
