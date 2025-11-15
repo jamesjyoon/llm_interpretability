@@ -209,31 +209,39 @@ class ExperimentConfig:
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
     fast_mode: bool = False
-    dataloader_num_workers: Optional[int] = None
-    auto_adjust_max_seq_length: bool = True
-    length_sample_size: int = 2000
-    max_length_percentile: float = 99.5
 
 
-def _apply_fast_mode_overrides(config: ExperimentConfig) -> ExperimentConfig:
-    """Return a copy of the config with faster defaults when fast mode is enabled."""
+def _apply_fast_mode_overrides(config: ExperimentConfig) -> None:
+    """Shrink expensive workloads when fast mode is requested."""
 
     if not config.fast_mode:
-        return config
+        return
 
-    fast_config = copy.deepcopy(config)
-    fast_config.train_subset = fast_config.train_subset or 8000
-    fast_config.eval_subset = fast_config.eval_subset or 2000
-    fast_config.num_train_epochs = min(fast_config.num_train_epochs, 2.0)
-    fast_config.shap_max_evals = min(fast_config.shap_max_evals, 120)
-    fast_config.shap_example_count = min(fast_config.shap_example_count, 6)
-    fast_config.lime_num_samples = min(fast_config.lime_num_samples, 300)
-    fast_config.tree_shap_max_features = min(fast_config.tree_shap_max_features, 150)
-    fast_config.eval_batch_size = max(fast_config.eval_batch_size, 32)
-    fast_config.length_sample_size = min(fast_config.length_sample_size, 1000)
-    if fast_config.dataloader_num_workers is None:
-        fast_config.dataloader_num_workers = max(1, os.cpu_count() or 1)
-    return fast_config
+    overrides: Dict[str, object] = {}
+
+    def _cap(field: str, limit: int) -> None:
+        current = getattr(config, field)
+        if current is None or current > limit:
+            setattr(config, field, limit)
+            overrides[field] = limit
+
+    _cap("train_subset", 1000)
+    _cap("eval_subset", 500)
+    _cap("shap_example_count", 5)
+    _cap("shap_max_evals", 100)
+
+    if config.num_train_epochs > 1.0:
+        config.num_train_epochs = 1.0
+        overrides["num_train_epochs"] = 1.0
+
+    if config.eval_batch_size < 32:
+        config.eval_batch_size = 32
+        overrides["eval_batch_size"] = 32
+
+    if overrides:
+        print("Fast mode enabled; applying the following overrides for quicker runs:")
+        for key, value in sorted(overrides.items()):
+            print(f"  - {key}: {value}")
 
 
 class PromptFormatter:
@@ -1874,6 +1882,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.set_defaults(load_in_4bit=True)
+    parser.add_argument("--fast-mode", action="store_true", help="Apply faster but less thorough defaults.")
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--output-dir", default="outputs/tweet_sentiment_extraction")
     parser.add_argument(
