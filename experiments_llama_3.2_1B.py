@@ -522,6 +522,18 @@ def _generate_class_predictions(
                 return_dict_in_generate=True,
                 output_scores=True,
             )
+    with torch.no_grad():
+        generation = model.generate(
+            **inputs,
+            max_new_tokens=max(1, int(max_new_tokens)),
+            do_sample=False,
+            temperature=0.0,
+            top_p=1.0,
+            eos_token_id=eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
+            return_dict_in_generate=True,
+            output_scores=True,
+        )
 
     scores = generation.scores[0]
     ordered_labels = list(sorted(label_token_map))
