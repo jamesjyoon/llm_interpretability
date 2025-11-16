@@ -225,10 +225,10 @@ def _apply_fast_mode_overrides(config: ExperimentConfig) -> None:
             setattr(config, field, limit)
             overrides[field] = limit
 
-    _cap("train_subset", 1000)
-    _cap("eval_subset", 500)
-    _cap("shap_example_count", 5)
-    _cap("shap_max_evals", 100)
+    _cap("train_subset", 1500)
+    _cap("eval_subset", 750)
+    _cap("shap_example_count", 8)
+    _cap("shap_max_evals", 150)
 
     if config.num_train_epochs > 1.0:
         config.num_train_epochs = 1.0
@@ -1641,21 +1641,9 @@ def run_experiment(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         label_space=args.label_space,
         fast_mode=args.fast_mode,
-        dataloader_num_workers=args.dataloader_num_workers,
-        auto_adjust_max_seq_length=args.auto_adjust_max_seq_length,
-        length_sample_size=args.length_sample_size,
-        max_length_percentile=args.max_length_percentile,
     )
 
-    config = _apply_fast_mode_overrides(config)
-    if config.fast_mode:
-        print(
-            "Fast mode enabled: using up to "
-            f"{config.train_subset or 'all'} training samples, "
-            f"{config.eval_subset or 'all'} eval samples, "
-            f"{config.num_train_epochs} training epochs, and "
-            f"{config.shap_example_count} SHAP examples."
-        )
+    _apply_fast_mode_overrides(config)
 
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
