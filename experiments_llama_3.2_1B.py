@@ -17,7 +17,7 @@ import math
 import os
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
@@ -209,6 +209,11 @@ class ExperimentConfig:
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
     fast_mode: bool = False
+    auto_adjust_max_seq_length: bool = True
+    auto_adjust_percentile: float = 0.95
+    auto_adjust_sample_size: int = 512
+    dataloader_num_workers: int = 0
+    enable_tf32: bool = True
 
 
 def _apply_fast_mode_overrides(config: ExperimentConfig) -> None:
@@ -225,8 +230,6 @@ def _apply_fast_mode_overrides(config: ExperimentConfig) -> None:
             setattr(config, field, limit)
             overrides[field] = limit
 
-    _cap("train_subset", 1500)
-    _cap("eval_subset", 750)
     _cap("shap_example_count", 8)
     _cap("shap_max_evals", 150)
 
@@ -242,6 +245,94 @@ def _apply_fast_mode_overrides(config: ExperimentConfig) -> None:
         print("Fast mode enabled; applying the following overrides for quicker runs:")
         for key, value in sorted(overrides.items()):
             print(f"  - {key}: {value}")
+
+
+@contextmanager
+def _autocast_context(device: torch.device):
+    if device.type == "cuda":
+        try:
+            with torch.autocast(device_type="cuda"):
+                yield
+        except TypeError:  # pragma: no cover - older torch versions
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                yield
+    else:
+        yield
+
+
+def _maybe_enable_tf32(enable: bool) -> None:
+    if not enable or not torch.cuda.is_available():
+        return
+
+    torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+    torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+    torch.backends.cudnn.benchmark = True  # type: ignore[attr-defined]
+    try:  # pragma: no cover - torch 2.0+
+        torch.set_float32_matmul_precision("high")
+    except AttributeError:
+        pass
+
+
+def _maybe_auto_adjust_sequence_length(
+    config: ExperimentConfig,
+    dataset: DatasetDict,
+    tokenizer,
+    formatter: PromptFormatter,
+) -> ExperimentConfig:
+    if (
+        not config.auto_adjust_max_seq_length
+        or config.auto_adjust_sample_size <= 0
+        or config.max_seq_length <= 0
+    ):
+        return config
+
+    available_splits = [
+        split for split in (config.train_split, config.eval_split) if split in dataset
+    ]
+    if not available_splits:
+        return config
+
+    sample_budget = config.auto_adjust_sample_size
+    sequences: List[str] = []
+    rng_seed = config.random_seed
+    for split in available_splits:
+        if len(sequences) >= sample_budget:
+            break
+        split_dataset = dataset[split]
+        take = min(sample_budget - len(sequences), len(split_dataset))
+        if take <= 0:
+            continue
+        subset = split_dataset.shuffle(seed=rng_seed).select(range(take))
+        prompts = [formatter.build_prompt(text) for text in subset[config.text_field]]
+        combined = [
+            f"{prompt} {label}"
+            for prompt, label in zip(prompts, subset[config.label_field])
+        ]
+        sequences.extend(combined)
+
+    if not sequences:
+        return config
+
+    tokenized = tokenizer(sequences, add_special_tokens=False)
+    lengths = [len(ids) for ids in tokenized["input_ids"]]
+    if not lengths:
+        return config
+
+    percentile_value = config.auto_adjust_percentile
+    if percentile_value <= 1.0:
+        percentile_value *= 100.0
+    percentile_value = float(min(100.0, max(0.0, percentile_value)))
+    candidate = int(math.ceil(np.percentile(lengths, percentile_value)))
+    candidate = min(candidate, config.max_seq_length)
+    min_length = max(8, config.max_target_length + 2)
+    candidate = max(candidate, min_length)
+    if candidate < config.max_seq_length:
+        print(
+            "Auto-adjusted max sequence length from"
+            f" {config.max_seq_length} to {candidate} tokens (percentile {percentile_value:.1f})."
+        )
+        config.max_seq_length = candidate
+    return config
 
 
 class PromptFormatter:
@@ -474,7 +565,7 @@ def _classification_probabilities(
     inputs = {k: v.to(device) for k, v in inputs.items()}
     model.eval()
     with torch.inference_mode():
-        with _autocast_context(model, device):
+        with _autocast_context(device):
             outputs = model(**inputs)
     logits = outputs.logits
     sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
@@ -518,7 +609,7 @@ def _generate_class_predictions(
     eos_token_id = _generation_eos_ids(tokenizer, label_token_map)
     model.eval()
     with torch.inference_mode():
-        with _autocast_context(model, device):
+        with _autocast_context(device):
             generation = model.generate(
                 **inputs,
                 max_new_tokens=max(1, int(max_new_tokens)),
@@ -530,18 +621,6 @@ def _generate_class_predictions(
                 return_dict_in_generate=True,
                 output_scores=True,
             )
-    with torch.no_grad():
-        generation = model.generate(
-            **inputs,
-            max_new_tokens=max(1, int(max_new_tokens)),
-            do_sample=False,
-            temperature=0.0,
-            top_p=1.0,
-            eos_token_id=eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
-            return_dict_in_generate=True,
-            output_scores=True,
-        )
 
     scores = generation.scores[0]
     ordered_labels = list(sorted(label_token_map))
@@ -773,8 +852,7 @@ def train_lora_classifier(
         report_to=[],
         bf16=model_gradient_dtype == torch.bfloat16,
         fp16=model_gradient_dtype == torch.float16,
-        dataloader_num_workers=config.dataloader_num_workers or 0,
-        tf32=torch.cuda.is_available(),
+        dataloader_num_workers=config.dataloader_num_workers,
     )
 
     trainer = Trainer(
@@ -1641,12 +1719,18 @@ def run_experiment(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         label_space=args.label_space,
         fast_mode=args.fast_mode,
+        auto_adjust_max_seq_length=args.auto_adjust_max_seq_length,
+        auto_adjust_percentile=args.auto_adjust_percentile,
+        auto_adjust_sample_size=args.auto_adjust_sample_size,
+        dataloader_num_workers=args.dataloader_num_workers,
+        enable_tf32=args.enable_tf32,
     )
 
     _apply_fast_mode_overrides(config)
 
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    _maybe_enable_tf32(config.enable_tf32)
     if config.load_in_4bit and device.type != "cuda":
         print("4-bit quantization requested but CUDA is unavailable; falling back to full precision.")
         config.load_in_4bit = False
@@ -1852,6 +1936,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-seq-length", type=int, default=512)
     parser.add_argument("--max-target-length", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=3)
+    parser.add_argument("--auto-adjust-max-seq-length", action="store_true")
+    parser.add_argument("--no-auto-adjust-max-seq-length", dest="auto_adjust_max_seq_length", action="store_false")
+    parser.set_defaults(auto_adjust_max_seq_length=True)
+    parser.add_argument("--auto-adjust-percentile", type=float, default=0.95)
+    parser.add_argument("--auto-adjust-sample-size", type=int, default=512)
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
@@ -1870,6 +1959,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.set_defaults(load_in_4bit=True)
+    parser.add_argument("--enable-tf32", action="store_true")
+    parser.add_argument("--no-enable-tf32", dest="enable_tf32", action="store_false")
+    parser.set_defaults(enable_tf32=True)
+    parser.add_argument("--dataloader-num-workers", type=int, default=0)
     parser.add_argument("--fast-mode", action="store_true", help="Apply faster but less thorough defaults.")
     parser.add_argument("--finetune", action="store_true")
     parser.add_argument("--output-dir", default="outputs/tweet_sentiment_extraction")
