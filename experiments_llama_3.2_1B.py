@@ -23,8 +23,20 @@ from typing import Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence,
 
 import numpy as np
 import torch
-from datasets import DatasetDict, load_dataset
+from datasets import Dataset, DatasetDict, load_dataset
 from scipy.stats import spearmanr
+
+try:  # pragma: no cover - PyTorch 2.0+ exposes this helper
+    torch.set_float32_matmul_precision("high")
+except AttributeError:
+    pass
+
+if torch.cuda.is_available():  # pragma: no cover - depends on runtime
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
 
 try:
     import shap  # type: ignore
@@ -119,6 +131,45 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
             raise ValueError(f"Tokenizer could not encode label {label}.")
         label_token_map[int(label)] = token_ids[-1]
     return label_token_map
+
+
+def _balanced_subset(
+    dataset_split: Dataset,
+    target_count: Optional[int],
+    label_field: str,
+    seed: int,
+) -> Dataset:
+    """Return a stratified subset that preserves label balance when downsampling."""
+
+    if target_count is None:
+        return dataset_split
+    available = dataset_split.num_rows
+    if target_count >= available:
+        return dataset_split
+
+    labels = [int(label) for label in dataset_split[label_field]]
+    label_to_indices: Dict[int, List[int]] = defaultdict(list)
+    for idx, label in enumerate(labels):
+        label_to_indices[label].append(idx)
+    rng = np.random.default_rng(seed)
+    for indices in label_to_indices.values():
+        rng.shuffle(indices)
+
+    selected: List[int] = []
+    ordered_labels = sorted(label_to_indices)
+    while len(selected) < target_count and ordered_labels:
+        for label in list(ordered_labels):
+            indices = label_to_indices[label]
+            if not indices:
+                ordered_labels.remove(label)
+                continue
+            selected.append(indices.pop())
+            if len(selected) >= target_count:
+                break
+            if not indices:
+                ordered_labels.remove(label)
+    selected.sort()
+    return dataset_split.select(selected)
 
 
 @dataclass
@@ -311,6 +362,61 @@ class PromptFormatter:
         return self.template.format(sentence=sentence)
 
 
+def _maybe_auto_adjust_sequence_length(
+    config: ExperimentConfig,
+    dataset: DatasetDict,
+    tokenizer,
+    formatter: PromptFormatter,
+) -> ExperimentConfig:
+    """Shrink ``max_seq_length`` when the dataset's prompts are already short."""
+
+    if not config.auto_adjust_max_seq_length:
+        return config
+    if config.train_split not in dataset:
+        return config
+
+    split = dataset[config.train_split]
+    sample_size = min(config.length_sample_size, split.num_rows)
+    if sample_size <= 0:
+        return config
+
+    rng = np.random.default_rng(config.random_seed)
+    if sample_size >= split.num_rows:
+        indices = list(range(split.num_rows))
+    else:
+        indices = rng.choice(split.num_rows, size=sample_size, replace=False)
+
+    prompt_lengths: List[int] = []
+    for raw_index in indices:
+        record = split[int(raw_index)]
+        sentence = record[config.text_field]
+        prompt = formatter.build_prompt(sentence)
+        tokenized = tokenizer(
+            prompt,
+            add_special_tokens=False,
+            return_attention_mask=False,
+        )
+        prompt_lengths.append(len(tokenized["input_ids"]) + config.max_target_length)
+
+    if not prompt_lengths:
+        return config
+
+    target_percentile = max(90.0, min(100.0, float(config.max_length_percentile)))
+    percentile_length = float(np.percentile(prompt_lengths, target_percentile))
+    safety_margin = 4
+    trimmed_length = int(math.ceil(percentile_length + safety_margin))
+    min_reasonable = max(config.max_target_length + 8, 32)
+    adjusted = min(config.max_seq_length, max(trimmed_length, min_reasonable))
+    if adjusted < config.max_seq_length:
+        print(
+            "Auto-adjusted max_seq_length from "
+            f"{config.max_seq_length} to {adjusted} based on the {target_percentile}th percentile "
+            "of prompt lengths."
+        )
+        config.max_seq_length = adjusted
+    return config
+
+
 def _prepare_dataset(
     dataset: DatasetDict, config: ExperimentConfig, tokenizer, formatter: PromptFormatter
 ) -> DatasetDict:
@@ -322,6 +428,26 @@ def _prepare_dataset(
                 + (f" with config `{config.dataset_config}`" if config.dataset_config else "")
                 + f" must contain the splits {sorted(required_splits)}."
             )
+        )
+
+    # ``DatasetDict`` inherits from ``dict`` but ``dict.copy`` returns a plain
+    # ``dict`` without dataset helper methods such as ``map``.  Re-wrap the
+    # object explicitly to keep the DatasetDict behavior while avoiding
+    # in-place mutation of the caller's dataset.
+    dataset = DatasetDict(dataset)
+    if config.train_subset:
+        dataset[config.train_split] = _balanced_subset(
+            dataset[config.train_split],
+            config.train_subset,
+            config.label_field,
+            config.random_seed,
+        )
+    if config.eval_subset:
+        dataset[config.eval_split] = _balanced_subset(
+            dataset[config.eval_split],
+            config.eval_subset,
+            config.label_field,
+            config.random_seed,
         )
 
     def _format_examples(examples):
@@ -364,14 +490,6 @@ def _prepare_dataset(
         remove_columns=remove_columns,
     )
 
-    if config.train_subset:
-        train_dataset = processed[config.train_split].shuffle(seed=config.random_seed)
-        train_count = min(config.train_subset, train_dataset.num_rows)
-        processed[config.train_split] = train_dataset.select(range(train_count))
-    if config.eval_subset:
-        validation_dataset = processed[config.eval_split].shuffle(seed=config.random_seed)
-        validation_count = min(config.eval_subset, validation_dataset.num_rows)
-        processed[config.eval_split] = validation_dataset.select(range(validation_count))
     return processed
 
 
@@ -379,10 +497,12 @@ def _prepare_zero_shot_texts(
     config: ExperimentConfig, original_dataset: DatasetDict, formatter: PromptFormatter
 ) -> Tuple[List[str], List[int]]:
     validation_split = original_dataset[config.eval_split]
-    if config.eval_subset:
-        eval_count = min(config.eval_subset, len(validation_split))
-        validation_split = validation_split.shuffle(seed=config.random_seed)
-        validation_split = validation_split.select(range(eval_count))
+    validation_split = _balanced_subset(
+        validation_split,
+        config.eval_subset,
+        config.label_field,
+        config.random_seed,
+    )
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
     return texts, labels
@@ -416,6 +536,15 @@ def _filter_dataset_by_labels(
         return int(example[config.label_field]) in allowed_labels
 
     return dataset.filter(predicate)
+
+
+def _autocast_context(model: AutoModelForCausalLM, device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+    model_dtype = getattr(model, "dtype", torch.float32)
+    if model_dtype in {torch.float16, torch.bfloat16}:
+        return torch.cuda.amp.autocast(dtype=model_dtype)
+    return torch.cuda.amp.autocast()
 
 
 def _classification_probabilities(
