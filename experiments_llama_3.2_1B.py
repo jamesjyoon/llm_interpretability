@@ -133,43 +133,67 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
     return label_token_map
 
 
-def _balanced_subset(
-    dataset_split: Dataset,
-    target_count: Optional[int],
-    label_field: str,
-    seed: int,
-) -> Dataset:
-    """Return a stratified subset that preserves label balance when downsampling."""
+def _attempt_model_load(
+    model_name: str,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> Tuple[Optional[AutoTokenizer], Optional[AutoModelForCausalLM], Optional[Tuple[str, Exception]]]:
+    base_model_kwargs = {}
+    if config.load_in_4bit:
+        base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
+    elif device.type == "cuda":
+        base_model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 
-    if target_count is None:
-        return dataset_split
-    available = dataset_split.num_rows
-    if target_count >= available:
-        return dataset_split
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    except Exception as exc:
+        return None, None, ("tokenizer", exc)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
-    labels = [int(label) for label in dataset_split[label_field]]
-    label_to_indices: Dict[int, List[int]] = defaultdict(list)
-    for idx, label in enumerate(labels):
-        label_to_indices[label].append(idx)
-    rng = np.random.default_rng(seed)
-    for indices in label_to_indices.values():
-        rng.shuffle(indices)
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **base_model_kwargs)
+    except Exception as exc:
+        return None, None, ("model", exc)
 
-    selected: List[int] = []
-    ordered_labels = sorted(label_to_indices)
-    while len(selected) < target_count and ordered_labels:
-        for label in list(ordered_labels):
-            indices = label_to_indices[label]
-            if not indices:
-                ordered_labels.remove(label)
-                continue
-            selected.append(indices.pop())
-            if len(selected) >= target_count:
-                break
-            if not indices:
-                ordered_labels.remove(label)
-    selected.sort()
-    return dataset_split.select(selected)
+    if not config.load_in_4bit:
+        model = model.to(device)
+    return tokenizer, model, None
+
+
+def _load_model_or_fallback(
+    config: ExperimentConfig,
+    device: torch.device,
+) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+    errors: List[Tuple[str, Tuple[str, Exception]]] = []
+    attempted: List[str] = []
+    for candidate in [config.model_name, config.fallback_model_name]:
+        if not candidate or candidate in attempted:
+            continue
+        attempted.append(candidate)
+        tokenizer, model, failure = _attempt_model_load(candidate, config, device)
+        if failure is not None:
+            target, exc = failure
+            descriptor = "primary" if candidate == config.model_name else "fallback"
+            print(
+                f"Failed to load {descriptor} {target} for `{candidate}`; reason: {exc}."
+            )
+            errors.append((candidate, failure))
+            continue
+        if candidate != config.model_name:
+            print(
+                f"Falling back to `{candidate}` after failing to load `{config.model_name}`. "
+                "Provide `--model-name` and, if needed, a Hugging Face token to force the primary checkpoint."
+            )
+            config.model_name = candidate
+        return tokenizer, model
+
+    if errors:
+        last_name, (target, exc) = errors[-1]
+        _raise_hf_access_error(target, last_name, exc)
+    raise SystemExit(
+        "Unable to resolve a model checkpoint. Supply --model-name to point at a local or accessible repository."
+    )
 
 
 @dataclass
@@ -177,6 +201,7 @@ class ExperimentConfig:
     """Configuration for the classification experiment."""
 
     model_name: str = "meta-llama/Llama-3.2-1B"
+    fallback_model_name: Optional[str] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     dataset_name: str = "mteb/tweet_sentiment_extraction"
     dataset_config: Optional[str] = None
     train_split: str = "train"
@@ -214,6 +239,13 @@ class ExperimentConfig:
     auto_adjust_sample_size: int = 512
     dataloader_num_workers: int = 0
     enable_tf32: bool = True
+    length_sample_size: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if self.length_sample_size is None:
+            self.length_sample_size = self.auto_adjust_sample_size
+        else:
+            self.auto_adjust_sample_size = self.length_sample_size
 
 
 def _apply_fast_mode_overrides(config: ExperimentConfig) -> None:
@@ -279,9 +311,13 @@ def _maybe_auto_adjust_sequence_length(
     tokenizer,
     formatter: PromptFormatter,
 ) -> ExperimentConfig:
+    sample_budget = config.auto_adjust_sample_size
+    if sample_budget <= 0 and getattr(config, "length_sample_size", 0):
+        sample_budget = int(getattr(config, "length_sample_size"))
+
     if (
         not config.auto_adjust_max_seq_length
-        or config.auto_adjust_sample_size <= 0
+        or sample_budget <= 0
         or config.max_seq_length <= 0
     ):
         return config
@@ -292,7 +328,6 @@ def _maybe_auto_adjust_sequence_length(
     if not available_splits:
         return config
 
-    sample_budget = config.auto_adjust_sample_size
     sequences: List[str] = []
     rng_seed = config.random_seed
     for split in available_splits:
@@ -332,6 +367,8 @@ def _maybe_auto_adjust_sequence_length(
             f" {config.max_seq_length} to {candidate} tokens (percentile {percentile_value:.1f})."
         )
         config.max_seq_length = candidate
+    config.length_sample_size = sample_budget
+    config.auto_adjust_sample_size = sample_budget
     return config
 
 
@@ -1691,6 +1728,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     config = ExperimentConfig(
         model_name=args.model_name,
         dataset_name=args.dataset_name,
+        fallback_model_name=args.fallback_model_name,
         dataset_config=args.dataset_config,
         train_split=args.train_split,
         eval_split=args.eval_split,
@@ -1722,6 +1760,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         auto_adjust_max_seq_length=args.auto_adjust_max_seq_length,
         auto_adjust_percentile=args.auto_adjust_percentile,
         auto_adjust_sample_size=args.auto_adjust_sample_size,
+        length_sample_size=args.length_sample_size,
         dataloader_num_workers=args.dataloader_num_workers,
         enable_tf32=args.enable_tf32,
     )
@@ -1737,23 +1776,7 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     _ensure_output_dir(config.output_dir)
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
-    except HF_ACCESS_ERRORS as exc:
-        _raise_hf_access_error("tokenizer", config.model_name, exc)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    base_model_kwargs = {}
-    if config.load_in_4bit:
-        base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
-
-    try:
-        model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
-    except HF_ACCESS_ERRORS as exc:
-        _raise_hf_access_error("model", config.model_name, exc)
-    if not config.load_in_4bit:
-        model.to(device)
+    tokenizer, model = _load_model_or_fallback(config, device)
 
     if config.dataset_config:
         raw_dataset = load_dataset(config.dataset_name, config.dataset_config)
@@ -1913,6 +1936,11 @@ def run_experiment(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument(
+        "--fallback-model-name",
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help="Secondary checkpoint to try if the primary model cannot be downloaded (e.g., gated repos).",
+    )
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--train-split", default="train")
@@ -1941,6 +1969,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(auto_adjust_max_seq_length=True)
     parser.add_argument("--auto-adjust-percentile", type=float, default=0.95)
     parser.add_argument("--auto-adjust-sample-size", type=int, default=512)
+    parser.add_argument(
+        "--length-sample-size",
+        type=int,
+        default=None,
+        help="Deprecated alias for --auto-adjust-sample-size.",
+    )
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
