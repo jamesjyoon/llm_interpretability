@@ -121,11 +121,75 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
     return label_token_map
 
 
+def _attempt_model_load(
+    model_name: str,
+    config: ExperimentConfig,
+    device: torch.device,
+) -> Tuple[Optional[AutoTokenizer], Optional[AutoModelForCausalLM], Optional[Tuple[str, Exception]]]:
+    base_model_kwargs = {}
+    if config.load_in_4bit:
+        base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
+    elif device.type == "cuda":
+        base_model_kwargs["torch_dtype"] = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    except Exception as exc:
+        return None, None, ("tokenizer", exc)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(model_name, **base_model_kwargs)
+    except Exception as exc:
+        return None, None, ("model", exc)
+
+    if not config.load_in_4bit:
+        model = model.to(device)
+    return tokenizer, model, None
+
+
+def _load_model_or_fallback(
+    config: ExperimentConfig,
+    device: torch.device,
+) -> Tuple[AutoTokenizer, AutoModelForCausalLM]:
+    errors: List[Tuple[str, Tuple[str, Exception]]] = []
+    attempted: List[str] = []
+    for candidate in [config.model_name, config.fallback_model_name]:
+        if not candidate or candidate in attempted:
+            continue
+        attempted.append(candidate)
+        tokenizer, model, failure = _attempt_model_load(candidate, config, device)
+        if failure is not None:
+            target, exc = failure
+            descriptor = "primary" if candidate == config.model_name else "fallback"
+            print(
+                f"Failed to load {descriptor} {target} for `{candidate}`; reason: {exc}."
+            )
+            errors.append((candidate, failure))
+            continue
+        if candidate != config.model_name:
+            print(
+                f"Falling back to `{candidate}` after failing to load `{config.model_name}`. "
+                "Provide `--model-name` and, if needed, a Hugging Face token to force the primary checkpoint."
+            )
+            config.model_name = candidate
+        return tokenizer, model
+
+    if errors:
+        last_name, (target, exc) = errors[-1]
+        _raise_hf_access_error(target, last_name, exc)
+    raise SystemExit(
+        "Unable to resolve a model checkpoint. Supply --model-name to point at a local or accessible repository."
+    )
+
+
 @dataclass
 class ExperimentConfig:
     """Configuration for the classification experiment."""
 
     model_name: str = "meta-llama/Llama-3.2-1B"
+    fallback_model_name: Optional[str] = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     dataset_name: str = "mteb/tweet_sentiment_extraction"
     dataset_config: Optional[str] = None
     train_split: str = "train"
@@ -1574,6 +1638,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     config = ExperimentConfig(
         model_name=args.model_name,
         dataset_name=args.dataset_name,
+        fallback_model_name=args.fallback_model_name,
         dataset_config=args.dataset_config,
         train_split=args.train_split,
         eval_split=args.eval_split,
@@ -1621,23 +1686,7 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     _ensure_output_dir(config.output_dir)
 
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
-    except HF_ACCESS_ERRORS as exc:
-        _raise_hf_access_error("tokenizer", config.model_name, exc)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    base_model_kwargs = {}
-    if config.load_in_4bit:
-        base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
-
-    try:
-        model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
-    except HF_ACCESS_ERRORS as exc:
-        _raise_hf_access_error("model", config.model_name, exc)
-    if not config.load_in_4bit:
-        model.to(device)
+    tokenizer, model = _load_model_or_fallback(config, device)
 
     if config.dataset_config:
         raw_dataset = load_dataset(config.dataset_name, config.dataset_config)
@@ -1797,6 +1846,11 @@ def run_experiment(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument(
+        "--fallback-model-name",
+        default="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        help="Secondary checkpoint to try if the primary model cannot be downloaded (e.g., gated repos).",
+    )
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--train-split", default="train")
