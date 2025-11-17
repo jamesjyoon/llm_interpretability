@@ -1,15 +1,19 @@
 #!/bin/bash
-#SBATCH --job-name=myjob
+#SBATCH --job-name=llama-1B
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=8
+#SBATCH --ntasks-per-node=12
 #SBATCH --gres=gpu:V100:1
-#SBATCH --time=02:00:00
-#SBATCH --output=logs/%x-%j.out
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/llama-1B-%j.out
 
-# Load modules
 module purge
 module load anaconda3
-conda activate $SLURM_SUBMIT_DIR/envs/myenv
+conda activate $SLURM_SUBMIT_DIR/envs/llm-1B
 
-# Run your script from this repo
-python experiments_llama_3.2_1B.py --arg1 value
+cd $SLURM_SUBMIT_DIR
+
+python experiments_llama_3.2_1B.py \
+    --output-dir outputs/sentiment_1B \
+    --run-shap \
+    --finetune
+
