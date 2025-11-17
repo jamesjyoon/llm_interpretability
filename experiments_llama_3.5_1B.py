@@ -127,7 +127,7 @@ class ExperimentConfig:
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 1.0
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
     lora_r: int = 16
     lora_alpha: int = 32
@@ -592,9 +592,23 @@ def train_lora_classifier(
         data_collator=default_data_collator,
     )
 
-    trainer.train()
+    try:
+        trainer.train()
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        raise SystemExit(
+            "CUDA OOM during LoRA training. Lower `--per-device-train-batch-size` or "
+            "`--gradient-accumulation-steps`, or rerun on CPU by disabling 4-bit loading."
+        ) from exc
     peft_model.eval()
     return peft_model
+
+
+def _configure_cuda_allocator() -> None:
+    """Set a fragmentation-resistant CUDA allocator when none is configured."""
+
+    if torch.cuda.is_available() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 def _shap_masker(tokenizer):
@@ -1275,6 +1289,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         label_space=args.label_space,
     )
 
+    _configure_cuda_allocator()
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config.load_in_4bit and device.type != "cuda":
@@ -1296,10 +1311,25 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     try:
         model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        print(
+            "Encountered CUDA OOM while loading the model; retrying on CPU without 4-bit quantization.",
+        )
+        config.load_in_4bit = False
+        device = torch.device("cpu")
+        base_model_kwargs.pop("load_in_4bit", None)
+        model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
     except HF_ACCESS_ERRORS as exc:
         _raise_hf_access_error("model", config.model_name, exc)
     if not config.load_in_4bit:
-        model.to(device)
+        try:
+            model.to(device)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print("CUDA OOM moving the model to GPU; keeping the model on CPU instead.")
+            device = torch.device("cpu")
+            model.to(device)
 
     if config.dataset_config:
         raw_dataset = load_dataset(config.dataset_name, config.dataset_config)
