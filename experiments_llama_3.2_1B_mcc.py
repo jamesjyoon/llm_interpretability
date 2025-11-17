@@ -154,7 +154,7 @@ class ExperimentConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 2048
+    max_seq_length: int = 1024
     max_target_length: int = 4
     output_dir: str = "outputs/imdb"
     run_shap: bool = True
@@ -1528,6 +1528,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         shap_surrogate_samples=args.shap_surrogate_samples,
         shap_top_features=args.shap_top_features,
         shap_vectorizer_max_features=args.shap_vectorizer_max_features,
+        max_seq_length=args.max_seq_length,
         load_in_4bit=args.load_in_4bit,
         output_dir=args.output_dir,
         label_space=args.label_space,
@@ -1693,6 +1694,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shap-surrogate-samples", type=int, default=200)
     parser.add_argument("--shap-top-features", type=int, default=12)
     parser.add_argument("--shap-vectorizer-max-features", type=int, default=5000)
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=1024,
+        help="Maximum sequence length for tokenization; reduce to lower GPU memory usage.",
+    )
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.set_defaults(load_in_4bit=True)
