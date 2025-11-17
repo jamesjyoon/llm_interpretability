@@ -154,7 +154,7 @@ class ExperimentConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 512
+    max_seq_length: int = 1024
     max_target_length: int = 4
     output_dir: str = "outputs/imdb"
     run_shap: bool = True
