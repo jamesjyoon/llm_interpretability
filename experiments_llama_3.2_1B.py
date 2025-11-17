@@ -144,8 +144,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 500
-    eval_subset: Optional[int] = 200
+    train_subset: Optional[int] = 5000
+    eval_subset: Optional[int] = 2000
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 2.0
@@ -154,7 +154,7 @@ class ExperimentConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 1024
+    max_seq_length: int = 2048
     max_target_length: int = 4
     output_dir: str = "outputs/imdb"
     run_shap: bool = True
@@ -852,6 +852,65 @@ def collect_text_interpretability_outputs(
             f"example{'s' if len(lrp_summaries) != 1 else ''}."
         )
 
+    attention_rollouts: List[Dict[str, object]] = []
+    attention_flows: List[Dict[str, object]] = []
+    self_explanations: List[Dict[str, str]] = []
+    for text in shap_texts[: config.interpretability_example_count]:
+        rollout = _attention_rollout_attributions(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        if rollout:
+            attention_rollouts.append(rollout)
+        flow = _attention_flow_attributions(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        if flow:
+            attention_flows.append(flow)
+        explanation = _generate_self_explanation(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        self_explanations.append(explanation)
+
+    if attention_rollouts:
+        rollout_path = os.path.join(config.output_dir, f"{output_prefix}_attention_rollout.json")
+        with open(rollout_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(attention_rollouts), handle, indent=2)
+        summary["attention_rollout"] = {"output_path": rollout_path, "examples": attention_rollouts}
+        print(
+            f"Saved {output_prefix} attention rollout explanations for {len(attention_rollouts)} "
+            f"example{'s' if len(attention_rollouts) != 1 else ''}."
+        )
+    if attention_flows:
+        flow_path = os.path.join(config.output_dir, f"{output_prefix}_attention_flow.json")
+        with open(flow_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(attention_flows), handle, indent=2)
+        summary["attention_flow"] = {"output_path": flow_path, "examples": attention_flows}
+        print(
+            f"Saved {output_prefix} attention flow explanations for {len(attention_flows)} "
+            f"example{'s' if len(attention_flows) != 1 else ''}."
+        )
+    if self_explanations:
+        self_exp_path = os.path.join(config.output_dir, f"{output_prefix}_self_explanations.json")
+        with open(self_exp_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(self_explanations), handle, indent=2)
+        summary["self_explanations"] = {"output_path": self_exp_path, "examples": self_explanations}
+        print(
+            f"Saved {output_prefix} self explanations for {len(self_explanations)} "
+            f"example{'s' if len(self_explanations) != 1 else ''}."
+        )
+
     shap_subset = tree_texts[: config.shap_surrogate_samples]
     shap_summary = run_shap_surrogate(
         shap_subset,
@@ -1084,6 +1143,118 @@ def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) 
     return output_path
 
 
+def _decode_tokens(tokenizer, input_ids: torch.Tensor, seq_length: int) -> List[str]:
+    return tokenizer.convert_ids_to_tokens(input_ids[:seq_length].tolist())
+
+
+def _attention_rollout_attributions(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> Optional[Dict[str, object]]:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True)
+
+    attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        return None
+
+    seq_length = int(inputs["attention_mask"].sum().item())
+    layer_attn = torch.stack([layer[0] for layer in attentions], dim=0)
+    mean_attn = layer_attn.mean(dim=1)
+    eye = torch.eye(mean_attn.size(-1), device=mean_attn.device)
+    augmented = mean_attn + eye
+    normalized = augmented / augmented.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    rollout = normalized[0]
+    for layer in normalized[1:]:
+        rollout = rollout @ layer
+
+    target_index = seq_length - 1
+    token_scores = rollout[target_index, :seq_length].detach().cpu().tolist()
+    tokens = _decode_tokens(tokenizer, inputs["input_ids"][0], seq_length)
+
+    return {
+        "text": text,
+        "tokens": tokens,
+        "target_index": int(target_index),
+        "importance": token_scores,
+        "method": "attention_rollout",
+    }
+
+
+def _attention_flow_attributions(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> Optional[Dict[str, object]]:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True)
+
+    attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        return None
+
+    seq_length = int(inputs["attention_mask"].sum().item())
+    layer_attn = torch.stack([layer[0] for layer in attentions], dim=0)
+    mean_attn = layer_attn.mean(dim=1)
+    eye = torch.eye(mean_attn.size(-1), device=mean_attn.device)
+    normalized = (mean_attn + eye) / (mean_attn + eye).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    flow = torch.zeros(normalized.size(-1), device=device)
+    flow[seq_length - 1] = 1.0
+    for layer in reversed(normalized):
+        flow = layer.transpose(0, 1) @ flow
+    token_scores = flow[:seq_length].detach().cpu().tolist()
+    tokens = _decode_tokens(tokenizer, inputs["input_ids"][0], seq_length)
+
+    return {
+        "text": text,
+        "tokens": tokens,
+        "target_index": int(seq_length - 1),
+        "importance": token_scores,
+        "method": "attention_flow",
+    }
+
+
+def _generate_self_explanation(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> Dict[str, str]:
+    prompt = f"{text}\n\nExplain why this review is positive. Highlight key phrases."
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=False,
+            temperature=0.0,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+    new_tokens = generated[0, inputs["input_ids"].shape[-1] :]
+    explanation = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    return {"text": text, "prompt": prompt, "explanation": explanation}
+
+
 def _serialize_shap(explanation: shap.Explanation) -> Dict[str, object]:
     return {
         "values": _ensure_json_serializable(explanation.values),
@@ -1167,6 +1338,51 @@ def _plot_metric_bars(
     if not inline_displayed:
         message += " Inline display is unavailable in this environment; open the PNG to view the chart."
     print(message)
+
+
+def _plot_confusion_matrix(
+    confusion: np.ndarray, labels: Sequence[int], output_dir: str, prefix: str
+) -> None:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print("matplotlib is not installed; skipping confusion matrix visualization.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(confusion, interpolation="nearest", cmap="Blues")
+    ax.figure.colorbar(im, ax=ax)
+
+    tick_labels = [str(label) for label in labels]
+    ax.set(
+        xticks=np.arange(confusion.shape[1]),
+        yticks=np.arange(confusion.shape[0]),
+        xticklabels=tick_labels,
+        yticklabels=tick_labels,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title=f"{prefix.replace('_', ' ').title()} Confusion Matrix",
+    )
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    thresh = confusion.max() / 2.0 if confusion.size else 0.0
+    for i in range(confusion.shape[0]):
+        for j in range(confusion.shape[1]):
+            ax.text(
+                j,
+                i,
+                format(int(confusion[i, j])),
+                ha="center",
+                va="center",
+                color="white" if confusion[i, j] > thresh else "black",
+            )
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.png")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved confusion matrix visualization to {os.path.abspath(output_path)}.")
 
 
 def _plot_shap_summary(
@@ -1608,6 +1824,15 @@ def run_experiment(args: argparse.Namespace) -> None:
             json.dump(_ensure_json_serializable(fine_tuned_metrics), handle, indent=2)
 
     _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
+    label_order = list(sorted(label_token_map))
+    if zero_shot_metrics.get("confusion_matrix"):
+        _plot_confusion_matrix(
+            np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
+        )
+    if fine_tuned_metrics and fine_tuned_metrics.get("confusion_matrix"):
+        _plot_confusion_matrix(
+            np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
+        )
 
     interpretability_summary: Optional[Dict[str, object]] = None
     if config.run_shap:
@@ -1682,8 +1907,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Explicit list of label ids to model (defaults to inferring from the dataset)",
     )
-    parser.add_argument("--train-subset", type=int, default=500)
-    parser.add_argument("--eval-subset", type=int, default=200)
+    parser.add_argument("--train-subset", type=int, default=5000)
+    parser.add_argument("--eval-subset", type=int, default=2000)
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
@@ -1697,7 +1922,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=512,
+        default=2048,
         help="Maximum sequence length for tokenization; reduce to lower GPU memory usage.",
     )
     parser.add_argument("--load-in-4bit", action="store_true")
