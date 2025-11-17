@@ -86,6 +86,28 @@ def _maybe_login_to_hf(token: Optional[str]) -> None:
     hf_login(token, add_to_git_credential=False)
 
 
+def _configure_cuda_allocator() -> None:
+    """Set a fragmentation-friendly CUDA allocator configuration when available."""
+
+    if not torch.cuda.is_available():
+        return
+
+    env_key = "PYTORCH_CUDA_ALLOC_CONF"
+    recommended = "expandable_segments:True"
+    current = os.environ.get(env_key)
+
+    if current is None:
+        os.environ[env_key] = recommended
+        print(
+            "Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to reduce CUDA memory fragmentation."
+        )
+    elif recommended not in current:
+        os.environ[env_key] = f"{current},{recommended}"
+        print(
+            "Appended expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF to reduce CUDA memory fragmentation."
+        )
+
+
 def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
     """Return a mapping from dataset labels to their token ids.
 
@@ -1486,6 +1508,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         "HUGGINGFACE_TOKEN"
     )
     _maybe_login_to_hf(provided_token)
+    _configure_cuda_allocator()
 
     config = ExperimentConfig(
         model_name=args.model_name,
