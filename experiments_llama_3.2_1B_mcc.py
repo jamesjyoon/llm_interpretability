@@ -1697,7 +1697,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=1024,
+        default=512,
         help="Maximum sequence length for tokenization; reduce to lower GPU memory usage.",
     )
     parser.add_argument("--load-in-4bit", action="store_true")
