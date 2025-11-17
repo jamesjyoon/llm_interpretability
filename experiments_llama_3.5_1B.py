@@ -19,8 +19,8 @@ import numpy as np
 import torch
 from datasets import DatasetDict, load_dataset
 from scipy.stats import spearmanr
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import matthews_corrcoef
 
 try:
@@ -32,10 +32,8 @@ except ImportError as exc:  # pragma: no cover - optional dependency
 
 try:
     from lime.lime_text import LimeTextExplainer  # type: ignore
-except Exception as exc:  # pragma: no cover - optional dependency
-    raise SystemExit(
-        "The `lime` package is required for interpretability. Install it via `pip install lime`."
-    ) from exc
+except ImportError as exc:  # pragma: no cover - optional dependency
+    raise SystemExit("The `lime` package is required for interpretability. Install it via `pip install lime`.") from exc
 
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
@@ -129,7 +127,7 @@ class ExperimentConfig:
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 1.0
-    per_device_train_batch_size: int = 4
+    per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
     lora_r: int = 16
     lora_alpha: int = 32
@@ -314,6 +312,33 @@ def _classification_probabilities(
     return probs.detach().cpu().numpy()
 
 
+def _build_probability_fn(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+) -> Callable[[Sequence[str]], np.ndarray]:
+    """Return a callable that exposes class probabilities for raw prompts."""
+
+    def _predict(batch_texts: Sequence[str]) -> np.ndarray:
+        normalized: List[str]
+        if isinstance(batch_texts, np.ndarray):
+            normalized = [str(item) for item in batch_texts.tolist()]
+        else:
+            normalized = [str(item) for item in batch_texts]
+        return _classification_probabilities(
+            model,
+            tokenizer,
+            normalized,
+            label_token_map,
+            device,
+            max_length,
+        )
+
+    return _predict
+
+
 def _generation_eos_ids(tokenizer, label_token_map: LabelTokenMap) -> List[int]:
     eos_ids: List[int] = []
     if tokenizer.eos_token_id is not None:
@@ -377,33 +402,6 @@ def _generate_class_predictions(
         )
 
     return predictions, probs.detach().cpu().numpy()
-
-
-def _build_probability_fn(
-    model: AutoModelForCausalLM,
-    tokenizer,
-    label_token_map: LabelTokenMap,
-    device: torch.device,
-    max_length: int,
-) -> Callable[[Sequence[str]], np.ndarray]:
-    """Return a callable that maps text to class probabilities."""
-
-    ordered_labels = list(sorted(label_token_map))
-
-    def predict_proba(batch: Sequence[str]) -> np.ndarray:
-        labels, probs = _generate_class_predictions(
-            model,
-            tokenizer,
-            batch,
-            label_token_map,
-            device,
-            max_length,
-        )
-        del labels
-        return probs
-
-    predict_proba.output_names = [str(label) for label in ordered_labels]  # type: ignore[attr-defined]
-    return predict_proba
 
 
 def _batched(iterator: Sequence[str], batch_size: int) -> Iterable[Sequence[str]]:
@@ -594,9 +592,23 @@ def train_lora_classifier(
         data_collator=default_data_collator,
     )
 
-    trainer.train()
+    try:
+        trainer.train()
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        raise SystemExit(
+            "CUDA OOM during LoRA training. Lower `--per-device-train-batch-size` or "
+            "`--gradient-accumulation-steps`, or rerun on CPU by disabling 4-bit loading."
+        ) from exc
     peft_model.eval()
     return peft_model
+
+
+def _configure_cuda_allocator() -> None:
+    """Set a fragmentation-resistant CUDA allocator when none is configured."""
+
+    if torch.cuda.is_available() and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 
 def _shap_masker(tokenizer):
@@ -611,6 +623,7 @@ def compute_shap_values(
     device: torch.device,
     max_length: int,
     max_evals: int,
+    algorithm: Optional[str] = None,
 ) -> shap.Explanation:
     masker = _shap_masker(tokenizer)
 
@@ -625,7 +638,10 @@ def compute_shap_values(
         )
 
     output_names = [str(label) for label in sorted(label_token_map)]
-    explainer = shap.Explainer(predict_fn, masker, output_names=output_names)
+    explainer_kwargs = {"output_names": output_names}
+    if algorithm is not None:
+        explainer_kwargs["algorithm"] = algorithm
+    explainer = shap.Explainer(predict_fn, masker, **explainer_kwargs)
     return explainer(texts, max_evals=max_evals)
 
 
@@ -1273,6 +1289,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         label_space=args.label_space,
     )
 
+    _configure_cuda_allocator()
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config.load_in_4bit and device.type != "cuda":
@@ -1294,10 +1311,25 @@ def run_experiment(args: argparse.Namespace) -> None:
 
     try:
         model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
+    except torch.cuda.OutOfMemoryError as exc:
+        torch.cuda.empty_cache()
+        print(
+            "Encountered CUDA OOM while loading the model; retrying on CPU without 4-bit quantization.",
+        )
+        config.load_in_4bit = False
+        device = torch.device("cpu")
+        base_model_kwargs.pop("load_in_4bit", None)
+        model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
     except HF_ACCESS_ERRORS as exc:
         _raise_hf_access_error("model", config.model_name, exc)
     if not config.load_in_4bit:
-        model.to(device)
+        try:
+            model.to(device)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print("CUDA OOM moving the model to GPU; keeping the model on CPU instead.")
+            device = torch.device("cpu")
+            model.to(device)
 
     if config.dataset_config:
         raw_dataset = load_dataset(config.dataset_name, config.dataset_config)
@@ -1351,6 +1383,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     interpretability_summary: Optional[Dict[str, object]] = None
     if config.run_shap:
         shap_samples = zero_shot_texts[: config.shap_example_count]
+        tree_samples = zero_shot_texts[: config.tree_shap_surrogate_samples]
         if shap_samples:
             zero_kernel, zero_summary = collect_text_interpretability_outputs(
                 model=model,
@@ -1359,11 +1392,13 @@ def run_experiment(args: argparse.Namespace) -> None:
                 device=device,
                 config=config,
                 shap_texts=shap_samples,
-                tree_texts=zero_shot_texts,
+                tree_texts=tree_samples,
                 output_prefix="zero_shot",
             )
-            interpretability_summary = {"zero_shot": zero_summary}
+            if zero_summary:
+                interpretability_summary = {"zero_shot": zero_summary}
 
+            tuned_kernel: Optional[shap.Explanation] = None
             if tuned_model is not None:
                 tuned_kernel, tuned_summary = collect_text_interpretability_outputs(
                     model=tuned_model,
@@ -1372,17 +1407,25 @@ def run_experiment(args: argparse.Namespace) -> None:
                     device=device,
                     config=config,
                     shap_texts=shap_samples,
-                    tree_texts=zero_shot_texts,
+                    tree_texts=tree_samples,
                     output_prefix="fine_tuned",
                 )
-                if interpretability_summary is None:
-                    interpretability_summary = {}
-                interpretability_summary["fine_tuned"] = tuned_summary
-                if zero_kernel is not None and tuned_kernel is not None:
-                    comparison = compare_shap_explanations(zero_kernel, tuned_kernel)
-                    interpretability_summary.setdefault("comparison", {})["kernel_shap"] = comparison
+                if tuned_summary:
+                    if interpretability_summary is None:
+                        interpretability_summary = {}
+                    interpretability_summary["fine_tuned"] = tuned_summary
+
+            if (
+                interpretability_summary is not None
+                and zero_kernel is not None
+                and tuned_kernel is not None
+            ):
+                comparison = compare_shap_explanations(zero_kernel, tuned_kernel)
+                interpretability_summary.setdefault("comparison", {})["kernel_shap"] = comparison
         else:
-            print("No samples available for interpretability analysis; skipping LIME/SHAP generation.")
+            print(
+                "No samples available for interpretability analysis; skipping LIME/SHAP generation."
+            )
 
     if interpretability_summary is not None:
         summary_path = os.path.join(config.output_dir, "interpretability_metrics.json")
