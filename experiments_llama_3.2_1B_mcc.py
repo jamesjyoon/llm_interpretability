@@ -827,6 +827,40 @@ def _ensure_json_serializable(value):
     return value
 
 
+def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) -> Optional[str]:
+    """Persist the generated interpretability artifacts to disk.
+
+    The interpretability summary can contain comparison statistics and
+    intermediate metadata.  This helper extracts the per-model outputs for LIME,
+    KernelSHAP, and TreeSHAP and writes them to a single JSON file so they can
+    be consumed after the experiment run.
+    """
+
+    outputs: Dict[str, Dict[str, object]] = {}
+    for model_key in ("zero_shot", "fine_tuned"):
+        model_summary = summary.get(model_key)
+        if not isinstance(model_summary, dict):
+            continue
+
+        method_outputs: Dict[str, object] = {}
+        for method in ("lime", "kernel_shap", "tree_shap"):
+            method_summary = model_summary.get(method)
+            if method_summary:
+                method_outputs[method] = method_summary
+
+        if method_outputs:
+            outputs[model_key] = method_outputs
+
+    if not outputs:
+        return None
+
+    output_path = os.path.join(output_dir, "interpretability_outputs.json")
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(_ensure_json_serializable(outputs), handle, indent=2)
+
+    return output_path
+
+
 def _serialize_shap(explanation: shap.Explanation) -> Dict[str, object]:
     return {
         "values": _ensure_json_serializable(explanation.values),
@@ -1402,6 +1436,10 @@ def run_experiment(args: argparse.Namespace) -> None:
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(interpretability_summary), handle, indent=2)
         print(f"Saved interpretability comparison metrics to {summary_path}.")
+
+        outputs_path = _save_interpretability_outputs(interpretability_summary, config.output_dir)
+        if outputs_path:
+            print(f"Saved interpretability outputs to {outputs_path}.")
 
 
 def build_parser() -> argparse.ArgumentParser:
