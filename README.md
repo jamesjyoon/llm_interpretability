@@ -9,6 +9,32 @@ our last meeting: it compares zero-shot and LoRA fine-tuned variants of the
 dataset, then extracts token-level SHAP explanations and interpretability
 metrics for both approaches.
 
+### Interpretability and evaluation concepts
+
+Understanding the major interpretability techniques referenced in the scripts
+helps contextualize their outputs and trade-offs:
+
+- **LIME (Local Interpretable Model-agnostic Explanations)** perturbs an input
+  example, trains a simple surrogate model (often a sparse linear regressor),
+  and interprets the surrogate's weights as local feature importance scores. It
+  is model-agnostic and easy to apply to text, but can be sensitive to the
+  sampling strategy used to create perturbations.
+- **KernelSHAP** approximates Shapley values with a specially chosen weighting
+  kernel that emphasizes coalitions close to the original example. It inherits
+  Shapley's desirable properties (local accuracy, missingness, consistency)
+  while remaining practical for deep networks through sampling.
+- **TreeSHAP** provides an exact and efficient way to compute Shapley values for
+  decision tree ensembles by exploiting their structure. It is the preferred
+  method when interpreting gradient-boosted trees or random forests because it
+  offers deterministic attributions with polynomial runtime.
+
+For classification diagnostics we often complement accuracy-like metrics with
+the **Matthews correlation coefficient (MCC)**, which summarizes the confusion
+matrix into a single score in −1–+1 that remains informative even under
+class imbalance. An MCC of +1 indicates perfect predictions, 0 matches random
+guessing, and −1 reflects total disagreement between predictions and
+labels.
+
 ### Running on Google Colab
 
 1. Start a new Colab notebook (a GPU runtime is strongly recommended).
