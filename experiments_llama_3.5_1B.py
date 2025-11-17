@@ -115,24 +115,24 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
 class ExperimentConfig:
     """Configuration for the classification experiment."""
 
-    model_name: str = "meta-llama/Llama-3.2-1B"
+    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
     dataset_name: str = "mteb/tweet_sentiment_extraction"
     dataset_config: Optional[str] = None
     train_split: str = "train"
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 2000
-    eval_subset: Optional[int] = 1000
+    train_sample_size: Optional[int] = 500
+    test_sample_size: Optional[int] = 200
     random_seed: int = 42
     learning_rate: float = 2e-4
-    num_train_epochs: float = 1.0
+    num_train_epochs: float = 2.0
     per_device_train_batch_size: int = 1
     gradient_accumulation_steps: int = 4
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 512
+    max_seq_length: int = 2048
     max_target_length: int = 4
     output_dir: str = "outputs/tweet_sentiment_extraction"
     run_shap: bool = True
@@ -145,6 +145,7 @@ class ExperimentConfig:
     tree_vectorizer_max_features: int = 5000
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
+    llama_test_samples: int = 50
 
 
 class PromptFormatter:
@@ -227,13 +228,13 @@ def _prepare_dataset(
         remove_columns=remove_columns,
     )
 
-    if config.train_subset:
+    if config.train_sample_size:
         train_dataset = processed[config.train_split].shuffle(seed=config.random_seed)
-        train_count = min(config.train_subset, train_dataset.num_rows)
+        train_count = min(config.train_sample_size, train_dataset.num_rows)
         processed[config.train_split] = train_dataset.select(range(train_count))
-    if config.eval_subset:
+    if config.test_sample_size:
         validation_dataset = processed[config.eval_split].shuffle(seed=config.random_seed)
-        validation_count = min(config.eval_subset, validation_dataset.num_rows)
+        validation_count = min(config.test_sample_size, validation_dataset.num_rows)
         processed[config.eval_split] = validation_dataset.select(range(validation_count))
     return processed
 
@@ -242,12 +243,16 @@ def _prepare_zero_shot_texts(
     config: ExperimentConfig, original_dataset: DatasetDict, formatter: PromptFormatter
 ) -> Tuple[List[str], List[int]]:
     validation_split = original_dataset[config.eval_split]
-    if config.eval_subset:
-        eval_count = min(config.eval_subset, len(validation_split))
+    if config.test_sample_size:
+        eval_count = min(config.test_sample_size, len(validation_split))
         validation_split = validation_split.shuffle(seed=config.random_seed)
         validation_split = validation_split.select(range(eval_count))
     texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
     labels = list(validation_split[config.label_field])
+    if config.llama_test_samples:
+        max_samples = min(config.llama_test_samples, len(texts))
+        texts = texts[:max_samples]
+        labels = labels[:max_samples]
     return texts, labels
 
 
@@ -1274,8 +1279,9 @@ def run_experiment(args: argparse.Namespace) -> None:
         eval_split=args.eval_split,
         text_field=args.text_field,
         label_field=args.label_field,
-        train_subset=args.train_subset,
-        eval_subset=args.eval_subset,
+        train_sample_size=args.train_sample_size,
+        test_sample_size=args.test_sample_size,
+        llama_test_samples=args.llama_test_samples,
         run_shap=args.run_shap,
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
@@ -1436,7 +1442,7 @@ def run_experiment(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
-    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--model-name", default="unsloth/Llama-3.2-1B-Instruct")
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--train-split", default="train")
@@ -1449,8 +1455,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Explicit list of label ids to model (defaults to inferring from the dataset)",
     )
-    parser.add_argument("--train-subset", type=int, default=2000)
-    parser.add_argument("--eval-subset", type=int, default=1000)
+    parser.add_argument("--train-sample-size", type=int, default=500)
+    parser.add_argument("--test-sample-size", type=int, default=200)
+    parser.add_argument("--llama-test-samples", type=int, default=50)
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
