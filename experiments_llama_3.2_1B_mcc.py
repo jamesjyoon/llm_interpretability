@@ -115,34 +115,34 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
 class ExperimentConfig:
     """Configuration for the classification experiment."""
 
-    model_name: str = "meta-llama/Llama-3.2-1B"
-    dataset_name: str = "mteb/tweet_sentiment_extraction"
+    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
+    dataset_name: str = "imdb"
     dataset_config: Optional[str] = None
     train_split: str = "train"
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 2000
-    eval_subset: Optional[int] = 1000
+    train_subset: Optional[int] = 500
+    eval_subset: Optional[int] = 200
     random_seed: int = 42
     learning_rate: float = 2e-4
-    num_train_epochs: float = 1.0
+    num_train_epochs: float = 2.0
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 512
+    max_seq_length: int = 2048
     max_target_length: int = 4
-    output_dir: str = "outputs/tweet_sentiment_extraction"
+    output_dir: str = "outputs/imdb"
     run_shap: bool = True
     shap_max_evals: int = 200
-    shap_example_count: int = 10
+    shap_example_count: int = 50
     interpretability_example_count: int = 5
     lime_num_features: int = 10
-    tree_shap_surrogate_samples: int = 200
-    tree_shap_top_features: int = 12
-    tree_vectorizer_max_features: int = 5000
+    shap_surrogate_samples: int = 200
+    shap_top_features: int = 12
+    shap_vectorizer_max_features: int = 5000
     load_in_4bit: bool = True
     label_space: Optional[Sequence[int]] = None
 
@@ -658,7 +658,7 @@ def run_lime_text_explanations(
     return results
 
 
-def run_tree_shap_surrogate(
+def run_shap_surrogate(
     texts: Sequence[str],
     predict_fn: Callable[[Sequence[str]], np.ndarray],
     class_names: Sequence[str],
@@ -667,7 +667,7 @@ def run_tree_shap_surrogate(
     vectorizer_max_features: int,
     random_seed: int,
 ) -> Optional[Dict[str, object]]:
-    """Train a tree surrogate model and explain it with TreeSHAP."""
+    """Train a tree surrogate model and explain it with SHAP."""
 
     if not texts:
         return None
@@ -742,7 +742,7 @@ def collect_text_interpretability_outputs(
     tree_texts: Sequence[str],
     output_prefix: str,
 ) -> Tuple[Optional[shap.Explanation], Dict[str, object]]:
-    """Run LIME, KernelSHAP, and TreeSHAP for a given model."""
+    """Run interpretability suites for a given model."""
 
     class_names = [str(label) for label in sorted(label_token_map)]
     predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length)
@@ -786,24 +786,82 @@ def collect_text_interpretability_outputs(
             f"example{'s' if len(shap_texts) != 1 else ''}."
         )
 
-    tree_subset = tree_texts[: config.tree_shap_surrogate_samples]
-    tree_summary = run_tree_shap_surrogate(
-        tree_subset,
+    ig_summaries: List[Dict[str, object]] = []
+    for text in shap_texts[: config.interpretability_example_count]:
+        ig_summary = _integrated_gradients_attributions(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            label_token_map=label_token_map,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        if ig_summary:
+            ig_summaries.append(ig_summary)
+    if ig_summaries:
+        ig_path = os.path.join(config.output_dir, f"{output_prefix}_integrated_gradients.json")
+        with open(ig_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(ig_summaries), handle, indent=2)
+        summary["integrated_gradients"] = {"output_path": ig_path, "examples": ig_summaries}
+        print(
+            f"Saved {output_prefix} Integrated Gradients attributions for {len(ig_summaries)} "
+            f"example{'s' if len(ig_summaries) != 1 else ''}."
+        )
+
+    lrp_summaries: List[Dict[str, object]] = []
+    for text in shap_texts[: config.interpretability_example_count]:
+        lrp_summary = _lrp_token_attributions(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            label_token_map=label_token_map,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        if lrp_summary:
+            lrp_summaries.append(lrp_summary)
+    if lrp_summaries:
+        lrp_path = os.path.join(config.output_dir, f"{output_prefix}_lrp.json")
+        with open(lrp_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(lrp_summaries), handle, indent=2)
+        summary["lrp"] = {"output_path": lrp_path, "examples": lrp_summaries}
+        print(
+            f"Saved {output_prefix} Layer-wise Relevance Propagation scores for {len(lrp_summaries)} "
+            f"example{'s' if len(lrp_summaries) != 1 else ''}."
+        )
+
+    shap_subset = tree_texts[: config.shap_surrogate_samples]
+    shap_summary = run_shap_surrogate(
+        shap_subset,
         predict_fn,
         class_names,
-        top_features=config.tree_shap_top_features,
-        vectorizer_max_features=config.tree_vectorizer_max_features,
+        top_features=config.shap_top_features,
+        vectorizer_max_features=config.shap_vectorizer_max_features,
         random_seed=config.random_seed,
     )
-    if tree_summary:
-        tree_path = os.path.join(config.output_dir, f"{output_prefix}_tree_shap.json")
+    if shap_summary:
+        tree_path = os.path.join(config.output_dir, f"{output_prefix}_shap.json")
         with open(tree_path, "w", encoding="utf-8") as handle:
-            json.dump(_ensure_json_serializable(tree_summary), handle, indent=2)
-        tree_summary["output_path"] = tree_path
-        summary["tree_shap"] = tree_summary
+            json.dump(_ensure_json_serializable(shap_summary), handle, indent=2)
+        shap_summary["output_path"] = tree_path
+        summary["shap"] = shap_summary
         print(
-            f"Saved {output_prefix} TreeSHAP surrogate explanations using {len(tree_subset)} "
-            f"example{'s' if len(tree_subset) != 1 else ''}."
+            f"Saved {output_prefix} SHAP surrogate explanations using {len(shap_subset)} "
+            f"example{'s' if len(shap_subset) != 1 else ''}."
+        )
+
+    representer = compute_representer_points(
+        target_texts=shap_texts[: config.interpretability_example_count],
+        reference_texts=shap_subset,
+    )
+    if representer:
+        rep_path = os.path.join(config.output_dir, f"{output_prefix}_representer_points.json")
+        with open(rep_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(representer), handle, indent=2)
+        summary["representer_points"] = {"output_path": rep_path, "examples": representer}
+        print(
+            f"Saved {output_prefix} representer points for {len(representer)} "
+            f"example{'s' if len(representer) != 1 else ''}."
         )
 
     return kernel_explanation, summary
@@ -827,13 +885,149 @@ def _ensure_json_serializable(value):
     return value
 
 
+def _token_attribution_template(
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+) -> Tuple[Optional[List[str]], Optional[torch.Tensor], Optional[int]]:
+    inputs = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    label_token_ids = torch.tensor([label_token_map[label] for label in sorted(label_token_map)], device=device)
+
+    embedding_layer = model.get_input_embeddings()
+    input_embeddings = embedding_layer(inputs["input_ids"])
+    attention_mask = inputs["attention_mask"]
+    model.zero_grad()
+    input_embeddings.requires_grad_(True)
+
+    outputs = model(inputs_embeds=input_embeddings, attention_mask=attention_mask)
+    seq_length = int(attention_mask.sum().item())
+    logits = outputs.logits[0, seq_length - 1, label_token_ids]
+    target_index = int(torch.argmax(logits).item())
+    logits[target_index].backward()
+
+    grad = input_embeddings.grad
+    tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"].squeeze(0)) if input_embeddings.grad is not None else None
+    return tokens, grad, target_index
+
+
+def _integrated_gradients_attributions(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+    steps: int = 20,
+) -> Optional[Dict[str, object]]:
+    tokens, _, target_index = _token_attribution_template(
+        model, tokenizer, text, label_token_map, device, max_length
+    )
+    if tokens is None:
+        return None
+
+    inputs = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    attention_mask = inputs["attention_mask"]
+    label_token_ids = torch.tensor([label_token_map[label] for label in sorted(label_token_map)], device=device)
+    embedding_layer = model.get_input_embeddings()
+    input_embeddings = embedding_layer(inputs["input_ids"])
+    baseline = torch.zeros_like(input_embeddings)
+    delta = input_embeddings - baseline
+    total_grads = torch.zeros_like(input_embeddings)
+
+    for alpha in torch.linspace(0, 1, steps, device=device):
+        scaled = baseline + alpha * delta
+        scaled.requires_grad_(True)
+        model.zero_grad()
+        outputs = model(inputs_embeds=scaled, attention_mask=attention_mask)
+        seq_length = int(attention_mask.sum().item())
+        logits = outputs.logits[0, seq_length - 1, label_token_ids]
+        logits[target_index].backward()
+        if scaled.grad is not None:
+            total_grads += scaled.grad.detach()
+
+    attributions = (delta * total_grads / float(steps)).squeeze(0)
+    token_scores = attributions.norm(dim=-1).detach().cpu().numpy().tolist()
+    return {
+        "text": text,
+        "target_label": int(sorted(label_token_map)[target_index]),
+        "tokens": tokens,
+        "attribution_scores": token_scores,
+    }
+
+
+def _lrp_token_attributions(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    max_length: int,
+) -> Optional[Dict[str, object]]:
+    tokens, grad, target_index = _token_attribution_template(
+        model, tokenizer, text, label_token_map, device, max_length
+    )
+    if tokens is None or grad is None:
+        return None
+
+    embedding_layer = model.get_input_embeddings()
+    inputs = tokenizer(text, truncation=True, max_length=max_length, return_tensors="pt")
+    input_embeddings = embedding_layer(inputs["input_ids"].to(device))
+    relevance = (input_embeddings * grad).squeeze(0).sum(dim=-1)
+    scores = relevance.detach().cpu().numpy().tolist()
+
+    return {
+        "text": text,
+        "target_label": int(sorted(label_token_map)[target_index]),
+        "tokens": tokens,
+        "relevance_scores": scores,
+    }
+
+
+def compute_representer_points(
+    *, target_texts: Sequence[str], reference_texts: Sequence[str], top_k: int = 3
+) -> List[Dict[str, object]]:
+    if not target_texts or not reference_texts:
+        return []
+
+    vectorizer = TfidfVectorizer(max_features=5000)
+    reference_matrix = vectorizer.fit_transform(reference_texts)
+    target_matrix = vectorizer.transform(target_texts)
+    similarity = target_matrix @ reference_matrix.T
+
+    summaries: List[Dict[str, object]] = []
+    for row_index, text in enumerate(target_texts):
+        row = similarity.getrow(row_index)
+        if row.nnz == 0:
+            continue
+        top_indices = np.argsort(-row.toarray().ravel())[:top_k]
+        neighbors = []
+        for idx in top_indices:
+            neighbors.append(
+                {
+                    "reference_text": reference_texts[idx],
+                    "similarity": float(row[0, idx]),
+                }
+            )
+        summaries.append({"text": text, "representer_points": neighbors})
+
+    return summaries
+
+
 def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) -> Optional[str]:
     """Persist the generated interpretability artifacts to disk.
 
     The interpretability summary can contain comparison statistics and
     intermediate metadata.  This helper extracts the per-model outputs for LIME,
-    KernelSHAP, and TreeSHAP and writes them to a single JSON file so they can
-    be consumed after the experiment run.
+    KernelSHAP, SHAP, Integrated Gradients, LRP, and representer point methods
+    and writes them to a single JSON file so they can be consumed after the
+    experiment run.
     """
 
     outputs: Dict[str, Dict[str, object]] = {}
@@ -843,7 +1037,14 @@ def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) 
             continue
 
         method_outputs: Dict[str, object] = {}
-        for method in ("lime", "kernel_shap", "tree_shap"):
+        for method in (
+            "lime",
+            "kernel_shap",
+            "shap",
+            "integrated_gradients",
+            "lrp",
+            "representer_points",
+        ):
             method_summary = model_summary.get(method)
             if method_summary:
                 method_outputs[method] = method_summary
@@ -1301,9 +1502,9 @@ def run_experiment(args: argparse.Namespace) -> None:
         shap_max_evals=args.shap_max_evals,
         interpretability_example_count=args.interpretability_example_count,
         lime_num_features=args.lime_num_features,
-        tree_shap_surrogate_samples=args.tree_shap_surrogate_samples,
-        tree_shap_top_features=args.tree_shap_top_features,
-        tree_vectorizer_max_features=args.tree_vectorizer_max_features,
+        shap_surrogate_samples=args.shap_surrogate_samples,
+        shap_top_features=args.shap_top_features,
+        shap_vectorizer_max_features=args.shap_vectorizer_max_features,
         load_in_4bit=args.load_in_4bit,
         output_dir=args.output_dir,
         label_space=args.label_space,
@@ -1387,7 +1588,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     interpretability_summary: Optional[Dict[str, object]] = None
     if config.run_shap:
         shap_samples = zero_shot_texts[: config.shap_example_count]
-        tree_samples = zero_shot_texts[: config.tree_shap_surrogate_samples]
+        shap_surrogate_samples = zero_shot_texts[: config.shap_surrogate_samples]
         if shap_samples:
             zero_kernel, zero_summary = collect_text_interpretability_outputs(
                 model=model,
@@ -1396,7 +1597,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                 device=device,
                 config=config,
                 shap_texts=shap_samples,
-                tree_texts=tree_samples,
+                tree_texts=shap_surrogate_samples,
                 output_prefix="zero_shot",
             )
             if zero_summary:
@@ -1411,7 +1612,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                     device=device,
                     config=config,
                     shap_texts=shap_samples,
-                    tree_texts=tree_samples,
+                    tree_texts=shap_surrogate_samples,
                     output_prefix="fine_tuned",
                 )
                 if tuned_summary:
@@ -1444,8 +1645,8 @@ def run_experiment(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
-    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
+    parser.add_argument("--model-name", default="unsloth/Llama-3.2-1B-Instruct")
+    parser.add_argument("--dataset-name", default="imdb")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--eval-split", default="test")
@@ -1457,23 +1658,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Explicit list of label ids to model (defaults to inferring from the dataset)",
     )
-    parser.add_argument("--train-subset", type=int, default=2000)
-    parser.add_argument("--eval-subset", type=int, default=1000)
+    parser.add_argument("--train-subset", type=int, default=500)
+    parser.add_argument("--eval-subset", type=int, default=200)
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
-    parser.add_argument("--shap-example-count", type=int, default=10)
+    parser.add_argument("--shap-example-count", type=int, default=50)
     parser.add_argument("--shap-max-evals", type=int, default=200)
     parser.add_argument("--interpretability-example-count", type=int, default=5)
     parser.add_argument("--lime-num-features", type=int, default=10)
-    parser.add_argument("--tree-shap-surrogate-samples", type=int, default=200)
-    parser.add_argument("--tree-shap-top-features", type=int, default=12)
-    parser.add_argument("--tree-vectorizer-max-features", type=int, default=5000)
+    parser.add_argument("--shap-surrogate-samples", type=int, default=200)
+    parser.add_argument("--shap-top-features", type=int, default=12)
+    parser.add_argument("--shap-vectorizer-max-features", type=int, default=5000)
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.set_defaults(load_in_4bit=True)
     parser.add_argument("--finetune", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/tweet_sentiment_extraction")
+    parser.add_argument("--output-dir", default="outputs/imdb")
     parser.add_argument(
         "--huggingface-token",
         default=None,
