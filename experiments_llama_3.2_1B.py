@@ -268,6 +268,19 @@ def _prepare_dataset(
     return processed
 
 
+def _truncate_tokenized_dataset(dataset: DatasetDict, max_length: int) -> DatasetDict:
+    """Trim tokenized columns to a smaller maximum length to reduce GPU memory usage."""
+
+    def _truncate(example):
+        for key in ("input_ids", "attention_mask", "labels"):
+            if key in example:
+                example[key] = example[key][:max_length]
+        return example
+
+    print(f"Truncating tokenized dataset to max_seq_length={max_length} to mitigate OOM.")
+    return dataset.map(_truncate, load_from_cache_file=False)
+
+
 def _prepare_zero_shot_texts(
     config: ExperimentConfig, original_dataset: DatasetDict, formatter: PromptFormatter
 ) -> Tuple[List[str], List[int]]:
@@ -600,7 +613,7 @@ def train_lora_classifier(
     peft_model.print_trainable_parameters()
     peft_model.gradient_checkpointing_enable()
 
-    def _build_trainer(batch_size: int) -> Trainer:
+    def _build_trainer(batch_size: int, dataset: DatasetDict) -> Trainer:
         training_args = TrainingArguments(
             output_dir=config.output_dir,
             num_train_epochs=config.num_train_epochs,
@@ -620,24 +633,39 @@ def train_lora_classifier(
         return Trainer(
             model=peft_model,
             args=training_args,
-            train_dataset=processed_dataset[config.train_split],
-            eval_dataset=processed_dataset[config.eval_split],
+            train_dataset=dataset[config.train_split],
+            eval_dataset=dataset[config.eval_split],
             data_collator=default_data_collator,
         )
 
     current_batch_size = max(1, config.per_device_train_batch_size)
+    current_dataset = processed_dataset
+    current_max_seq_length = config.max_seq_length
     trainer: Optional[Trainer] = None
     while True:
-        trainer = _build_trainer(current_batch_size)
+        trainer = _build_trainer(current_batch_size, current_dataset)
         try:
             trainer.train()
             break
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             if current_batch_size == 1:
+                if current_max_seq_length > 256:
+                    next_max_seq_length = max(256, current_max_seq_length // 2)
+                    print(
+                        "CUDA OOM at batch size 1; lowering max_seq_length from "
+                        f"{current_max_seq_length} to {next_max_seq_length} and retrying."
+                    )
+                    current_max_seq_length = next_max_seq_length
+                    config.max_seq_length = next_max_seq_length
+                    current_dataset = _truncate_tokenized_dataset(
+                        current_dataset, next_max_seq_length
+                    )
+                    del trainer
+                    continue
                 print(
-                    "CUDA OOM occurred even at batch size 1; consider lowering `max_seq_length` or "
-                    "using a smaller model checkpoint."
+                    "CUDA OOM occurred even at batch size 1 and minimum sequence length; "
+                    "consider lowering `max_seq_length` or using a smaller model checkpoint."
                 )
                 raise
             next_batch_size = max(1, current_batch_size // 2)
