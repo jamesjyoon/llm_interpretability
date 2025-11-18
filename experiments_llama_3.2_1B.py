@@ -209,6 +209,8 @@ def _prepare_dataset(
             )
         )
 
+    mask_notice = {"emitted": False}
+
     def _format_examples(examples):
         prompts = [formatter.build_prompt(sentence) for sentence in examples[config.text_field]]
         full_sequences = [
@@ -235,6 +237,11 @@ def _prepare_dataset(
                 label_index = seq_length - 1
                 masked[label_index] = input_ids[label_index]
             labels.append(masked)
+            if not mask_notice["emitted"]:
+                print(
+                    "Masking prompt tokens with -100 so the fine-tuning loss only supervises the appended label token."
+                )
+                mask_notice["emitted"] = True
         model_inputs["labels"] = labels
         return model_inputs
 
@@ -1296,7 +1303,9 @@ def _plot_attention_importances(
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError:  # pragma: no cover - optional dependency in Colab
-        print("matplotlib is not installed; skipping attention attribution plots.")
+        print(
+            "matplotlib is not installed; skipping attention attribution plots. Install it with `pip install matplotlib` to generate the figures."
+        )
         return []
 
     saved_paths: List[str] = []
@@ -1394,7 +1403,9 @@ def _plot_metric_bars(
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError:  # pragma: no cover - optional dependency in Colab
-        print("matplotlib is not installed; skipping metric visualization.")
+        print(
+            "matplotlib is not installed; skipping metric visualization. Install it with `pip install matplotlib` to view the bar chart."
+        )
         return
 
     metrics = ["accuracy", "precision", "recall", "f1", "mcc"]
@@ -1402,6 +1413,8 @@ def _plot_metric_bars(
     tuned_values: Optional[List[float]] = None
     if fine_tuned_metrics is not None:
         tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
+    else:
+        print("Fine-tuned metrics were not provided; plotting zero-shot scores only.")
 
     x = np.arange(len(metrics))
     width = 0.35 if tuned_values is not None else 0.6
