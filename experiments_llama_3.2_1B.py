@@ -92,20 +92,21 @@ def _configure_cuda_allocator() -> None:
     if not torch.cuda.is_available():
         return
 
-    env_key = "PYTORCH_CUDA_ALLOC_CONF"
+    env_keys = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
     recommended = "expandable_segments:True"
-    current = os.environ.get(env_key)
 
-    if current is None:
-        os.environ[env_key] = recommended
-        print(
-            "Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to reduce CUDA memory fragmentation."
-        )
-    elif recommended not in current:
-        os.environ[env_key] = f"{current},{recommended}"
-        print(
-            "Appended expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF to reduce CUDA memory fragmentation."
-        )
+    for env_key in env_keys:
+        current = os.environ.get(env_key)
+        if current is None:
+            os.environ[env_key] = recommended
+            print(
+                f"Set {env_key}=expandable_segments:True to reduce CUDA memory fragmentation."
+            )
+        elif recommended not in current:
+            os.environ[env_key] = f"{current},{recommended}"
+            print(
+                f"Appended expandable_segments:True to {env_key} to reduce CUDA memory fragmentation."
+            )
 
 
 def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
@@ -144,8 +145,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 500
-    eval_subset: Optional[int] = 200
+    train_subset: Optional[int] = 5000
+    eval_subset: Optional[int] = 2000
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 2.0
@@ -154,14 +155,16 @@ class ExperimentConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 1024
+    max_seq_length: int = 2048
     max_target_length: int = 4
     output_dir: str = "outputs/imdb"
     run_shap: bool = True
     shap_max_evals: int = 200
     shap_example_count: int = 50
     interpretability_example_count: int = 5
+    interpretability_batch_size: int = 8
     lime_num_features: int = 10
+    lime_num_samples: int = 512
     shap_surrogate_samples: int = 200
     shap_top_features: int = 12
     shap_vectorizer_max_features: int = 5000
@@ -209,6 +212,8 @@ def _prepare_dataset(
             )
         )
 
+    mask_notice = {"emitted": False}
+
     def _format_examples(examples):
         prompts = [formatter.build_prompt(sentence) for sentence in examples[config.text_field]]
         full_sequences = [
@@ -235,6 +240,11 @@ def _prepare_dataset(
                 label_index = seq_length - 1
                 masked[label_index] = input_ids[label_index]
             labels.append(masked)
+            if not mask_notice["emitted"]:
+                print(
+                    "Masking prompt tokens with -100 so the fine-tuning loss only supervises the appended label token."
+                )
+                mask_notice["emitted"] = True
         model_inputs["labels"] = labels
         return model_inputs
 
@@ -258,6 +268,57 @@ def _prepare_dataset(
         validation_count = min(config.eval_subset, validation_dataset.num_rows)
         processed[config.eval_split] = validation_dataset.select(range(validation_count))
     return processed
+
+
+def _autoscale_for_device_capacity(config: ExperimentConfig) -> None:
+    """Lower max sequence length and subsets on small GPUs to mitigate OOM."""
+
+    if not torch.cuda.is_available():
+        return
+
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    # Prefer keeping the user-requested configuration when ample memory exists.
+    if total_gb >= 22:
+        return
+
+    # Tighten sequence length and dataset sizes when running on ~16 GB cards.
+    recommended_max_seq_length = min(config.max_seq_length, 1024)
+    recommended_train_subset = None if config.train_subset is None else min(config.train_subset, 3500)
+    recommended_eval_subset = None if config.eval_subset is None else min(config.eval_subset, 1400)
+
+    if recommended_max_seq_length < config.max_seq_length:
+        print(
+            "Detected <22 GB GPU; lowering max_seq_length from "
+            f"{config.max_seq_length} to {recommended_max_seq_length} to reduce activation memory."
+        )
+        config.max_seq_length = recommended_max_seq_length
+
+    if recommended_train_subset is not None and recommended_train_subset < config.train_subset:
+        print(
+            f"Reducing train_subset from {config.train_subset} to {recommended_train_subset} "
+            "to shorten fine-tuning batches on constrained GPUs."
+        )
+        config.train_subset = recommended_train_subset
+
+    if recommended_eval_subset is not None and recommended_eval_subset < config.eval_subset:
+        print(
+            f"Reducing eval_subset from {config.eval_subset} to {recommended_eval_subset} "
+            "to keep evaluation memory usage lower."
+        )
+        config.eval_subset = recommended_eval_subset
+
+
+def _truncate_tokenized_dataset(dataset: DatasetDict, max_length: int) -> DatasetDict:
+    """Trim tokenized columns to a smaller maximum length to reduce GPU memory usage."""
+
+    def _truncate(example):
+        for key in ("input_ids", "attention_mask", "labels"):
+            if key in example:
+                example[key] = example[key][:max_length]
+        return example
+
+    print(f"Truncating tokenized dataset to max_seq_length={max_length} to mitigate OOM.")
+    return dataset.map(_truncate, load_from_cache_file=False)
 
 
 def _prepare_zero_shot_texts(
@@ -310,28 +371,39 @@ def _classification_probabilities(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    *,
+    max_batch_size: Optional[int] = None,
 ) -> np.ndarray:
-    inputs = tokenizer(
-        list(prompts),
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    model.eval()
-    with torch.no_grad():
-        outputs = model(**inputs)
-    logits = outputs.logits
-    sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
-    final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
-    ordered_labels = list(sorted(label_token_map))
-    label_token_ids = torch.tensor(
-        [label_token_map[label] for label in ordered_labels], device=device
-    )
-    label_logits = final_logits[:, label_token_ids]
-    probs = torch.softmax(label_logits, dim=-1)
-    return probs.detach().cpu().numpy()
+    # Lime can request thousands of perturbed samples at once. Microbatch the
+    # probability computation to avoid a single oversized forward pass on the GPU.
+    batch_size = max_batch_size or len(prompts)
+    probabilities: List[np.ndarray] = []
+
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = list(prompts[start : start + batch_size])
+        inputs = tokenizer(
+            batch_prompts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        model.eval()
+        with torch.no_grad():
+            outputs = model(**inputs)
+        logits = outputs.logits
+        sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
+        final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
+        ordered_labels = list(sorted(label_token_map))
+        label_token_ids = torch.tensor(
+            [label_token_map[label] for label in ordered_labels], device=device
+        )
+        label_logits = final_logits[:, label_token_ids]
+        probs = torch.softmax(label_logits, dim=-1)
+        probabilities.append(probs.detach().cpu().numpy())
+
+    return np.concatenate(probabilities, axis=0)
 
 
 def _build_probability_fn(
@@ -340,6 +412,8 @@ def _build_probability_fn(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    *,
+    max_batch_size: Optional[int] = None,
 ) -> Callable[[Sequence[str]], np.ndarray]:
     """Return a callable that exposes class probabilities for raw prompts."""
 
@@ -356,6 +430,7 @@ def _build_probability_fn(
             label_token_map,
             device,
             max_length,
+            max_batch_size=max_batch_size,
         )
 
     return _predict
@@ -574,7 +649,7 @@ def train_lora_classifier(
     config: ExperimentConfig,
     model: AutoModelForCausalLM,
     processed_dataset: DatasetDict,
-) -> PeftModel:
+) -> Tuple[PeftModel, bool]:
     model_gradient_dtype = getattr(model, "dtype", torch.float32)
     if config.load_in_4bit:
         model = prepare_model_for_kbit_training(model)
@@ -590,33 +665,75 @@ def train_lora_classifier(
         model.config.use_cache = False
     peft_model = get_peft_model(model, lora_config)
     peft_model.print_trainable_parameters()
+    peft_model.gradient_checkpointing_enable()
 
-    training_args = TrainingArguments(
-        output_dir=config.output_dir,
-        num_train_epochs=config.num_train_epochs,
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        learning_rate=config.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        logging_steps=10,
-        save_strategy="no",
-        report_to=[],
-        bf16=model_gradient_dtype == torch.bfloat16,
-        fp16=model_gradient_dtype == torch.float16,
-    )
+    def _build_trainer(batch_size: int, dataset: DatasetDict) -> Trainer:
+        training_args = TrainingArguments(
+            output_dir=config.output_dir,
+            num_train_epochs=config.num_train_epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            learning_rate=config.learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.03,
+            logging_steps=10,
+            save_strategy="no",
+            report_to=[],
+            bf16=model_gradient_dtype == torch.bfloat16,
+            fp16=model_gradient_dtype == torch.float16,
+            gradient_checkpointing=True,
+        )
 
-    trainer = Trainer(
-        model=peft_model,
-        args=training_args,
-        train_dataset=processed_dataset[config.train_split],
-        eval_dataset=processed_dataset[config.eval_split],
-        data_collator=default_data_collator,
-    )
+        return Trainer(
+            model=peft_model,
+            args=training_args,
+            train_dataset=dataset[config.train_split],
+            eval_dataset=dataset[config.eval_split],
+            data_collator=default_data_collator,
+        )
 
-    trainer.train()
+    current_batch_size = max(1, config.per_device_train_batch_size)
+    current_dataset = processed_dataset
+    current_max_seq_length = config.max_seq_length
+    trainer: Optional[Trainer] = None
+    sequence_length_reduced = False
+    while True:
+        trainer = _build_trainer(current_batch_size, current_dataset)
+        try:
+            trainer.train()
+            break
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if current_batch_size == 1:
+                if current_max_seq_length > 256:
+                    next_max_seq_length = max(256, current_max_seq_length // 2)
+                    print(
+                        "CUDA OOM at batch size 1; lowering max_seq_length from "
+                        f"{current_max_seq_length} to {next_max_seq_length} and retrying."
+                    )
+                    current_max_seq_length = next_max_seq_length
+                    config.max_seq_length = next_max_seq_length
+                    current_dataset = _truncate_tokenized_dataset(
+                        current_dataset, next_max_seq_length
+                    )
+                    sequence_length_reduced = True
+                    del trainer
+                    continue
+                print(
+                    "CUDA OOM occurred even at batch size 1 and minimum sequence length; "
+                    "consider lowering `max_seq_length` or using a smaller model checkpoint."
+                )
+                raise
+            next_batch_size = max(1, current_batch_size // 2)
+            print(
+                f"CUDA OOM at batch size {current_batch_size}; retrying with batch size {next_batch_size}."
+            )
+            current_batch_size = next_batch_size
+            del trainer
+            continue
+
     peft_model.eval()
-    return peft_model
+    return peft_model, sequence_length_reduced
 
 
 def _shap_masker(tokenizer):
@@ -658,6 +775,8 @@ def run_lime_text_explanations(
     predict_fn: Callable[[Sequence[str]], np.ndarray],
     class_names: Sequence[str],
     num_features: int,
+    *,
+    num_samples: int,
 ) -> List[Dict[str, object]]:
     """Generate LIME explanations for a handful of prompts."""
 
@@ -667,7 +786,9 @@ def run_lime_text_explanations(
     explainer = LimeTextExplainer(class_names=list(class_names))
     results: List[Dict[str, object]] = []
     for text in texts:
-        explanation = explainer.explain_instance(text, predict_fn, num_features=num_features)
+        explanation = explainer.explain_instance(
+            text, predict_fn, num_features=num_features, num_samples=num_samples
+        )
         probabilities = predict_fn([text])[0]
         results.append(
             {
@@ -767,11 +888,24 @@ def collect_text_interpretability_outputs(
     """Run interpretability suites for a given model."""
 
     class_names = [str(label) for label in sorted(label_token_map)]
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length)
+    predict_fn = _build_probability_fn(
+        model,
+        tokenizer,
+        label_token_map,
+        device,
+        config.max_seq_length,
+        max_batch_size=config.interpretability_batch_size,
+    )
     summary: Dict[str, object] = {}
 
     lime_samples = shap_texts[: config.interpretability_example_count]
-    lime_outputs = run_lime_text_explanations(lime_samples, predict_fn, class_names, config.lime_num_features)
+    lime_outputs = run_lime_text_explanations(
+        lime_samples,
+        predict_fn,
+        class_names,
+        config.lime_num_features,
+        num_samples=config.lime_num_samples,
+    )
     if lime_outputs:
         lime_path = os.path.join(config.output_dir, f"{output_prefix}_lime.json")
         with open(lime_path, "w", encoding="utf-8") as handle:
@@ -850,6 +984,92 @@ def collect_text_interpretability_outputs(
         print(
             f"Saved {output_prefix} Layer-wise Relevance Propagation scores for {len(lrp_summaries)} "
             f"example{'s' if len(lrp_summaries) != 1 else ''}."
+        )
+
+    attention_rollouts: List[Dict[str, object]] = []
+    attention_flows: List[Dict[str, object]] = []
+    self_explanations: List[Dict[str, str]] = []
+    for text in shap_texts[: config.interpretability_example_count]:
+        rollout = _attention_rollout_attributions(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        if rollout:
+            attention_rollouts.append(rollout)
+        flow = _attention_flow_attributions(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        if flow:
+            attention_flows.append(flow)
+        explanation = _generate_self_explanation(
+            model=model,
+            tokenizer=tokenizer,
+            text=text,
+            device=device,
+            max_length=config.max_seq_length,
+        )
+        self_explanations.append(explanation)
+
+    if attention_rollouts:
+        rollout_path = os.path.join(config.output_dir, f"{output_prefix}_attention_rollout.json")
+        with open(rollout_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(attention_rollouts), handle, indent=2)
+        rollout_plots = _plot_attention_importances(
+            examples=attention_rollouts,
+            output_dir=config.output_dir,
+            prefix=output_prefix,
+            method="attention_rollout",
+        )
+        summary["attention_rollout"] = {
+            "output_path": rollout_path,
+            "examples": attention_rollouts,
+            "plots": rollout_plots,
+        }
+        print(
+            f"Saved {output_prefix} attention rollout explanations for {len(attention_rollouts)} "
+            f"example{'s' if len(attention_rollouts) != 1 else ''}."
+        )
+    if attention_flows:
+        flow_path = os.path.join(config.output_dir, f"{output_prefix}_attention_flow.json")
+        with open(flow_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(attention_flows), handle, indent=2)
+        flow_plots = _plot_attention_importances(
+            examples=attention_flows,
+            output_dir=config.output_dir,
+            prefix=output_prefix,
+            method="attention_flow",
+        )
+        summary["attention_flow"] = {
+            "output_path": flow_path,
+            "examples": attention_flows,
+            "plots": flow_plots,
+        }
+        print(
+            f"Saved {output_prefix} attention flow explanations for {len(attention_flows)} "
+            f"example{'s' if len(attention_flows) != 1 else ''}."
+        )
+    if self_explanations:
+        self_exp_path = os.path.join(config.output_dir, f"{output_prefix}_self_explanations.json")
+        with open(self_exp_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(self_explanations), handle, indent=2)
+        self_exp_text = _save_self_explanations_text(
+            examples=self_explanations, output_dir=config.output_dir, prefix=output_prefix
+        )
+        summary["self_explanations"] = {
+            "output_path": self_exp_path,
+            "text_dump": self_exp_text,
+            "examples": self_explanations,
+        }
+        print(
+            f"Saved {output_prefix} self explanations for {len(self_explanations)} "
+            f"example{'s' if len(self_explanations) != 1 else ''}."
         )
 
     shap_subset = tree_texts[: config.shap_surrogate_samples]
@@ -1066,6 +1286,9 @@ def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) 
             "integrated_gradients",
             "lrp",
             "representer_points",
+            "attention_rollout",
+            "attention_flow",
+            "self_explanations",
         ):
             method_summary = model_summary.get(method)
             if method_summary:
@@ -1082,6 +1305,194 @@ def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) 
         json.dump(_ensure_json_serializable(outputs), handle, indent=2)
 
     return output_path
+
+
+def _decode_tokens(tokenizer, input_ids: torch.Tensor, seq_length: int) -> List[str]:
+    return tokenizer.convert_ids_to_tokens(input_ids[:seq_length].tolist())
+
+
+def _attention_rollout_attributions(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> Optional[Dict[str, object]]:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True)
+
+    attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        return None
+
+    seq_length = int(inputs["attention_mask"].sum().item())
+    layer_attn = torch.stack([layer[0] for layer in attentions], dim=0)
+    mean_attn = layer_attn.mean(dim=1)
+    eye = torch.eye(mean_attn.size(-1), device=mean_attn.device)
+    augmented = mean_attn + eye
+    normalized = augmented / augmented.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    rollout = normalized[0]
+    for layer in normalized[1:]:
+        rollout = rollout @ layer
+
+    target_index = seq_length - 1
+    token_scores = rollout[target_index, :seq_length].detach().cpu().tolist()
+    tokens = _decode_tokens(tokenizer, inputs["input_ids"][0], seq_length)
+
+    return {
+        "text": text,
+        "tokens": tokens,
+        "target_index": int(target_index),
+        "importance": token_scores,
+        "method": "attention_rollout",
+    }
+
+
+def _attention_flow_attributions(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> Optional[Dict[str, object]]:
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs, output_attentions=True)
+
+    attentions = getattr(outputs, "attentions", None)
+    if not attentions:
+        return None
+
+    seq_length = int(inputs["attention_mask"].sum().item())
+    layer_attn = torch.stack([layer[0] for layer in attentions], dim=0)
+    mean_attn = layer_attn.mean(dim=1)
+    eye = torch.eye(mean_attn.size(-1), device=mean_attn.device)
+    normalized = (mean_attn + eye) / (mean_attn + eye).sum(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    flow = torch.zeros(normalized.size(-1), device=device)
+    flow[seq_length - 1] = 1.0
+    for layer in reversed(normalized):
+        flow = layer.transpose(0, 1) @ flow
+    token_scores = flow[:seq_length].detach().cpu().tolist()
+    tokens = _decode_tokens(tokenizer, inputs["input_ids"][0], seq_length)
+
+    return {
+        "text": text,
+        "tokens": tokens,
+        "target_index": int(seq_length - 1),
+        "importance": token_scores,
+        "method": "attention_flow",
+    }
+
+
+def _generate_self_explanation(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    text: str,
+    device: torch.device,
+    max_length: int,
+) -> Dict[str, str]:
+    prompt = f"{text}\n\nExplain why this review is positive. Highlight key phrases."
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    eos_token_id = tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs,
+            max_new_tokens=128,
+            do_sample=False,
+            temperature=0.0,
+            eos_token_id=eos_token_id,
+            pad_token_id=pad_token_id,
+        )
+    new_tokens = generated[0, inputs["input_ids"].shape[-1] :]
+    explanation = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+    return {"text": text, "prompt": prompt, "explanation": explanation}
+
+
+def _plot_attention_importances(
+    *,
+    examples: Sequence[Dict[str, object]],
+    output_dir: str,
+    prefix: str,
+    method: str,
+    top_k: int = 15,
+) -> List[str]:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print(
+            "matplotlib is not installed; skipping attention attribution plots. Install it with `pip install matplotlib` to generate the figures."
+        )
+        return []
+
+    saved_paths: List[str] = []
+    for index, example in enumerate(examples):
+        tokens = example.get("tokens")
+        scores = example.get("importance")
+        if not isinstance(tokens, list) or not isinstance(scores, list) or not tokens:
+            continue
+        # Truncate/normalize to match lengths in case of padding.
+        token_scores = np.array(scores, dtype=float)[: len(tokens)]
+        ordering = np.argsort(np.abs(token_scores))[::-1]
+        ordering = ordering[: min(top_k, len(ordering))]
+        ordered_tokens = [tokens[pos] for pos in ordering][::-1]
+        ordered_scores = [float(token_scores[pos]) for pos in ordering][::-1]
+
+        height = max(3.0, 0.35 * len(ordered_tokens) + 1.0)
+        fig, ax = plt.subplots(figsize=(9, height))
+        bars = ax.barh(np.arange(len(ordered_tokens)), ordered_scores, color="#8c6bb1")
+        ax.set_yticks(np.arange(len(ordered_tokens)))
+        ax.set_yticklabels(ordered_tokens)
+        ax.set_xlabel("Token importance")
+        ax.set_title(f"Top attention weights ({method.replace('_', ' ').title()} #{index})")
+        ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+        for bar, score in zip(bars, ordered_scores):
+            ax.text(bar.get_width(), bar.get_y() + bar.get_height() / 2, f" {score:.3f}", va="center")
+
+        fig.tight_layout()
+        output_path = os.path.join(
+            output_dir, f"{prefix}_{method}_example_{index}.png"
+        )
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+        saved_paths.append(os.path.abspath(output_path))
+
+    if saved_paths:
+        print(
+            f"Saved {len(saved_paths)} attention attribution plots for {method.replace('_', ' ')} to {output_dir}."
+        )
+    return saved_paths
+
+
+def _save_self_explanations_text(
+    examples: Sequence[Dict[str, str]], output_dir: str, prefix: str
+) -> Optional[str]:
+    if not examples:
+        return None
+
+    path = os.path.join(output_dir, f"{prefix}_self_explanations.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        for idx, example in enumerate(examples):
+            handle.write(f"Example {idx}\n")
+            handle.write("Prompt:\n")
+            handle.write(example.get("prompt", "") + "\n")
+            handle.write("Explanation:\n")
+            handle.write(example.get("explanation", "") + "\n")
+            handle.write("\n" + "-" * 40 + "\n\n")
+
+    print(f"Saved self-explanation texts to {os.path.abspath(path)}.")
+    return path
 
 
 def _serialize_shap(explanation: shap.Explanation) -> Dict[str, object]:
@@ -1119,7 +1530,9 @@ def _plot_metric_bars(
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError:  # pragma: no cover - optional dependency in Colab
-        print("matplotlib is not installed; skipping metric visualization.")
+        print(
+            "matplotlib is not installed; skipping metric visualization. Install it with `pip install matplotlib` to view the bar chart."
+        )
         return
 
     metrics = ["accuracy", "precision", "recall", "f1", "mcc"]
@@ -1127,6 +1540,8 @@ def _plot_metric_bars(
     tuned_values: Optional[List[float]] = None
     if fine_tuned_metrics is not None:
         tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
+    else:
+        print("Fine-tuned metrics were not provided; plotting zero-shot scores only.")
 
     x = np.arange(len(metrics))
     width = 0.35 if tuned_values is not None else 0.6
@@ -1167,6 +1582,51 @@ def _plot_metric_bars(
     if not inline_displayed:
         message += " Inline display is unavailable in this environment; open the PNG to view the chart."
     print(message)
+
+
+def _plot_confusion_matrix(
+    confusion: np.ndarray, labels: Sequence[int], output_dir: str, prefix: str
+) -> None:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print("matplotlib is not installed; skipping confusion matrix visualization.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(confusion, interpolation="nearest", cmap="Blues")
+    ax.figure.colorbar(im, ax=ax)
+
+    tick_labels = [str(label) for label in labels]
+    ax.set(
+        xticks=np.arange(confusion.shape[1]),
+        yticks=np.arange(confusion.shape[0]),
+        xticklabels=tick_labels,
+        yticklabels=tick_labels,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title=f"{prefix.replace('_', ' ').title()} Confusion Matrix",
+    )
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    thresh = confusion.max() / 2.0 if confusion.size else 0.0
+    for i in range(confusion.shape[0]):
+        for j in range(confusion.shape[1]):
+            ax.text(
+                j,
+                i,
+                format(int(confusion[i, j])),
+                ha="center",
+                va="center",
+                color="white" if confusion[i, j] > thresh else "black",
+            )
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.png")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    print(f"Saved confusion matrix visualization to {os.path.abspath(output_path)}.")
 
 
 def _plot_shap_summary(
@@ -1524,7 +1984,9 @@ def run_experiment(args: argparse.Namespace) -> None:
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
         interpretability_example_count=args.interpretability_example_count,
+        interpretability_batch_size=args.interpretability_batch_size,
         lime_num_features=args.lime_num_features,
+        lime_num_samples=args.lime_num_samples,
         shap_surrogate_samples=args.shap_surrogate_samples,
         shap_top_features=args.shap_top_features,
         shap_vectorizer_max_features=args.shap_vectorizer_max_features,
@@ -1535,6 +1997,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
 
     set_seed(config.random_seed)
+    _autoscale_for_device_capacity(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config.load_in_4bit and device.type != "cuda":
         print("4-bit quantization requested but CUDA is unavailable; falling back to full precision.")
@@ -1572,27 +2035,16 @@ def run_experiment(args: argparse.Namespace) -> None:
     formatter = PromptFormatter(label_space)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
 
-    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
-    zero_shot_metrics = evaluate_zero_shot(
-        model,
-        tokenizer,
-        zero_shot_texts,
-        zero_shot_labels,
-        label_token_map,
-        device,
-        config.max_seq_length,
-    )
-    print("Zero-shot evaluation metrics:")
-    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
-
-    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
-        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
-
     tuned_model: Optional[PeftModel] = None
     fine_tuned_metrics: Optional[Dict[str, float]] = None
+    sequence_length_reduced = False
+    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
     if args.finetune:
-        tuned_model = train_lora_classifier(config, model, processed_dataset)
+        tuned_model, sequence_length_reduced = train_lora_classifier(
+            config, model, processed_dataset
+        )
         tuned_model.save_pretrained(os.path.join(config.output_dir, "lora_adapter"))
+
         fine_tuned_metrics = evaluate_zero_shot(
             tuned_model,
             tokenizer,
@@ -1607,9 +2059,47 @@ def run_experiment(args: argparse.Namespace) -> None:
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(fine_tuned_metrics), handle, indent=2)
 
+    zero_shot_metrics = evaluate_zero_shot(
+        model,
+        tokenizer,
+        zero_shot_texts,
+        zero_shot_labels,
+        label_token_map,
+        device,
+        config.max_seq_length,
+    )
+
+    if sequence_length_reduced:
+        print(
+            "Evaluated zero-shot baseline after fine-tuning adjusted max_seq_length to keep comparisons aligned."
+        )
+
+    print("Zero-shot evaluation metrics:")
+    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
+
+    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
+
     _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
+    label_order = list(sorted(label_token_map))
+    if zero_shot_metrics.get("confusion_matrix"):
+        _plot_confusion_matrix(
+            np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
+        )
+    if fine_tuned_metrics and fine_tuned_metrics.get("confusion_matrix"):
+        _plot_confusion_matrix(
+            np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
+        )
 
     interpretability_summary: Optional[Dict[str, object]] = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(
+            "Cleared CUDA cache before interpretability; the attribution runs operate on small batches "
+            "and are unlikely to cause OOM unless the GPU is already at capacity. "
+            "Lower --shap-example-count or disable --run-shap if attribution memory errors persist."
+        )
+
     if config.run_shap:
         shap_samples = zero_shot_texts[: config.shap_example_count]
         shap_surrogate_samples = zero_shot_texts[: config.shap_surrogate_samples]
@@ -1682,22 +2172,34 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Explicit list of label ids to model (defaults to inferring from the dataset)",
     )
-    parser.add_argument("--train-subset", type=int, default=500)
-    parser.add_argument("--eval-subset", type=int, default=200)
+    parser.add_argument("--train-subset", type=int, default=5000)
+    parser.add_argument("--eval-subset", type=int, default=2000)
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
     parser.add_argument("--shap-example-count", type=int, default=50)
     parser.add_argument("--shap-max-evals", type=int, default=200)
     parser.add_argument("--interpretability-example-count", type=int, default=5)
+    parser.add_argument(
+        "--interpretability-batch-size",
+        type=int,
+        default=8,
+        help="Maximum batch size for interpretability prediction calls to avoid OOM.",
+    )
     parser.add_argument("--lime-num-features", type=int, default=10)
+    parser.add_argument(
+        "--lime-num-samples",
+        type=int,
+        default=512,
+        help="Number of perturbed samples per LIME explanation; lower to reduce GPU load.",
+    )
     parser.add_argument("--shap-surrogate-samples", type=int, default=200)
     parser.add_argument("--shap-top-features", type=int, default=12)
     parser.add_argument("--shap-vectorizer-max-features", type=int, default=5000)
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=512,
+        default=2048,
         help="Maximum sequence length for tokenization; reduce to lower GPU memory usage.",
     )
     parser.add_argument("--load-in-4bit", action="store_true")
