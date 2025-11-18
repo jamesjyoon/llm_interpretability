@@ -165,9 +165,8 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
 @dataclass
 class ExperimentConfig:
     """Configuration for the classification experiment."""
-
-    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
-    dataset_name: str = "imdb"
+    model_name: str = "meta-llama/Llama-3.2-1B"
+    dataset_name: str = "mteb/tweet_sentiment_extraction"
     dataset_config: Optional[str] = None
     train_split: str = "train"
     eval_split: str = "test"
