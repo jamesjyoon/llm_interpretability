@@ -16,7 +16,9 @@ conda activate /storage/ice1/6/3/jyoon370/llm-interpretability/envs/llm-1B
 cd /storage/ice1/6/3/jyoon370/llm-interpretability
 
 python experiments_llama_3.2_1B_interpretability.py \
-  --model_name meta-llama/Llama-3.2-1B \
+  --model-name meta-llama/Llama-3.2-1B \
+  --dataset-name mteb/tweet_sentiment_extraction \
+  --dataset-config None
   --output-dir outputs/llama_sentiment_1B \
   --run-shap \
   --finetune
