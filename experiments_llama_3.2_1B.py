@@ -92,20 +92,21 @@ def _configure_cuda_allocator() -> None:
     if not torch.cuda.is_available():
         return
 
-    env_key = "PYTORCH_CUDA_ALLOC_CONF"
+    env_keys = ("PYTORCH_ALLOC_CONF", "PYTORCH_CUDA_ALLOC_CONF")
     recommended = "expandable_segments:True"
-    current = os.environ.get(env_key)
 
-    if current is None:
-        os.environ[env_key] = recommended
-        print(
-            "Set PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to reduce CUDA memory fragmentation."
-        )
-    elif recommended not in current:
-        os.environ[env_key] = f"{current},{recommended}"
-        print(
-            "Appended expandable_segments:True to PYTORCH_CUDA_ALLOC_CONF to reduce CUDA memory fragmentation."
-        )
+    for env_key in env_keys:
+        current = os.environ.get(env_key)
+        if current is None:
+            os.environ[env_key] = recommended
+            print(
+                f"Set {env_key}=expandable_segments:True to reduce CUDA memory fragmentation."
+            )
+        elif recommended not in current:
+            os.environ[env_key] = f"{current},{recommended}"
+            print(
+                f"Appended expandable_segments:True to {env_key} to reduce CUDA memory fragmentation."
+            )
 
 
 def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
@@ -597,31 +598,56 @@ def train_lora_classifier(
         model.config.use_cache = False
     peft_model = get_peft_model(model, lora_config)
     peft_model.print_trainable_parameters()
+    peft_model.gradient_checkpointing_enable()
 
-    training_args = TrainingArguments(
-        output_dir=config.output_dir,
-        num_train_epochs=config.num_train_epochs,
-        per_device_train_batch_size=config.per_device_train_batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        learning_rate=config.learning_rate,
-        lr_scheduler_type="cosine",
-        warmup_ratio=0.03,
-        logging_steps=10,
-        save_strategy="no",
-        report_to=[],
-        bf16=model_gradient_dtype == torch.bfloat16,
-        fp16=model_gradient_dtype == torch.float16,
-    )
+    def _build_trainer(batch_size: int) -> Trainer:
+        training_args = TrainingArguments(
+            output_dir=config.output_dir,
+            num_train_epochs=config.num_train_epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            learning_rate=config.learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.03,
+            logging_steps=10,
+            save_strategy="no",
+            report_to=[],
+            bf16=model_gradient_dtype == torch.bfloat16,
+            fp16=model_gradient_dtype == torch.float16,
+            gradient_checkpointing=True,
+        )
 
-    trainer = Trainer(
-        model=peft_model,
-        args=training_args,
-        train_dataset=processed_dataset[config.train_split],
-        eval_dataset=processed_dataset[config.eval_split],
-        data_collator=default_data_collator,
-    )
+        return Trainer(
+            model=peft_model,
+            args=training_args,
+            train_dataset=processed_dataset[config.train_split],
+            eval_dataset=processed_dataset[config.eval_split],
+            data_collator=default_data_collator,
+        )
 
-    trainer.train()
+    current_batch_size = max(1, config.per_device_train_batch_size)
+    trainer: Optional[Trainer] = None
+    while True:
+        trainer = _build_trainer(current_batch_size)
+        try:
+            trainer.train()
+            break
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if current_batch_size == 1:
+                print(
+                    "CUDA OOM occurred even at batch size 1; consider lowering `max_seq_length` or "
+                    "using a smaller model checkpoint."
+                )
+                raise
+            next_batch_size = max(1, current_batch_size // 2)
+            print(
+                f"CUDA OOM at batch size {current_batch_size}; retrying with batch size {next_batch_size}."
+            )
+            current_batch_size = next_batch_size
+            del trainer
+            continue
+
     peft_model.eval()
     return peft_model
 
