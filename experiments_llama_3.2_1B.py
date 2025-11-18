@@ -162,7 +162,9 @@ class ExperimentConfig:
     shap_max_evals: int = 200
     shap_example_count: int = 50
     interpretability_example_count: int = 5
+    interpretability_batch_size: int = 8
     lime_num_features: int = 10
+    lime_num_samples: int = 512
     shap_surrogate_samples: int = 200
     shap_top_features: int = 12
     shap_vectorizer_max_features: int = 5000
@@ -369,28 +371,39 @@ def _classification_probabilities(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    *,
+    max_batch_size: Optional[int] = None,
 ) -> np.ndarray:
-    inputs = tokenizer(
-        list(prompts),
-        padding=True,
-        truncation=True,
-        max_length=max_length,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to(device) for k, v in inputs.items()}
-    model.eval()
-    with torch.no_grad():
-        outputs = model(**inputs)
-    logits = outputs.logits
-    sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
-    final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
-    ordered_labels = list(sorted(label_token_map))
-    label_token_ids = torch.tensor(
-        [label_token_map[label] for label in ordered_labels], device=device
-    )
-    label_logits = final_logits[:, label_token_ids]
-    probs = torch.softmax(label_logits, dim=-1)
-    return probs.detach().cpu().numpy()
+    # Lime can request thousands of perturbed samples at once. Microbatch the
+    # probability computation to avoid a single oversized forward pass on the GPU.
+    batch_size = max_batch_size or len(prompts)
+    probabilities: List[np.ndarray] = []
+
+    for start in range(0, len(prompts), batch_size):
+        batch_prompts = list(prompts[start : start + batch_size])
+        inputs = tokenizer(
+            batch_prompts,
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        model.eval()
+        with torch.no_grad():
+            outputs = model(**inputs)
+        logits = outputs.logits
+        sequence_lengths = inputs["attention_mask"].sum(dim=-1) - 1
+        final_logits = logits[torch.arange(logits.size(0), device=device), sequence_lengths]
+        ordered_labels = list(sorted(label_token_map))
+        label_token_ids = torch.tensor(
+            [label_token_map[label] for label in ordered_labels], device=device
+        )
+        label_logits = final_logits[:, label_token_ids]
+        probs = torch.softmax(label_logits, dim=-1)
+        probabilities.append(probs.detach().cpu().numpy())
+
+    return np.concatenate(probabilities, axis=0)
 
 
 def _build_probability_fn(
@@ -399,6 +412,8 @@ def _build_probability_fn(
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    *,
+    max_batch_size: Optional[int] = None,
 ) -> Callable[[Sequence[str]], np.ndarray]:
     """Return a callable that exposes class probabilities for raw prompts."""
 
@@ -415,6 +430,7 @@ def _build_probability_fn(
             label_token_map,
             device,
             max_length,
+            max_batch_size=max_batch_size,
         )
 
     return _predict
@@ -759,6 +775,8 @@ def run_lime_text_explanations(
     predict_fn: Callable[[Sequence[str]], np.ndarray],
     class_names: Sequence[str],
     num_features: int,
+    *,
+    num_samples: int,
 ) -> List[Dict[str, object]]:
     """Generate LIME explanations for a handful of prompts."""
 
@@ -768,7 +786,9 @@ def run_lime_text_explanations(
     explainer = LimeTextExplainer(class_names=list(class_names))
     results: List[Dict[str, object]] = []
     for text in texts:
-        explanation = explainer.explain_instance(text, predict_fn, num_features=num_features)
+        explanation = explainer.explain_instance(
+            text, predict_fn, num_features=num_features, num_samples=num_samples
+        )
         probabilities = predict_fn([text])[0]
         results.append(
             {
@@ -868,11 +888,24 @@ def collect_text_interpretability_outputs(
     """Run interpretability suites for a given model."""
 
     class_names = [str(label) for label in sorted(label_token_map)]
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length)
+    predict_fn = _build_probability_fn(
+        model,
+        tokenizer,
+        label_token_map,
+        device,
+        config.max_seq_length,
+        max_batch_size=config.interpretability_batch_size,
+    )
     summary: Dict[str, object] = {}
 
     lime_samples = shap_texts[: config.interpretability_example_count]
-    lime_outputs = run_lime_text_explanations(lime_samples, predict_fn, class_names, config.lime_num_features)
+    lime_outputs = run_lime_text_explanations(
+        lime_samples,
+        predict_fn,
+        class_names,
+        config.lime_num_features,
+        num_samples=config.lime_num_samples,
+    )
     if lime_outputs:
         lime_path = os.path.join(config.output_dir, f"{output_prefix}_lime.json")
         with open(lime_path, "w", encoding="utf-8") as handle:
@@ -1951,7 +1984,9 @@ def run_experiment(args: argparse.Namespace) -> None:
         shap_example_count=args.shap_example_count,
         shap_max_evals=args.shap_max_evals,
         interpretability_example_count=args.interpretability_example_count,
+        interpretability_batch_size=args.interpretability_batch_size,
         lime_num_features=args.lime_num_features,
+        lime_num_samples=args.lime_num_samples,
         shap_surrogate_samples=args.shap_surrogate_samples,
         shap_top_features=args.shap_top_features,
         shap_vectorizer_max_features=args.shap_vectorizer_max_features,
@@ -2145,7 +2180,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shap-example-count", type=int, default=50)
     parser.add_argument("--shap-max-evals", type=int, default=200)
     parser.add_argument("--interpretability-example-count", type=int, default=5)
+    parser.add_argument(
+        "--interpretability-batch-size",
+        type=int,
+        default=8,
+        help="Maximum batch size for interpretability prediction calls to avoid OOM.",
+    )
     parser.add_argument("--lime-num-features", type=int, default=10)
+    parser.add_argument(
+        "--lime-num-samples",
+        type=int,
+        default=512,
+        help="Number of perturbed samples per LIME explanation; lower to reduce GPU load.",
+    )
     parser.add_argument("--shap-surrogate-samples", type=int, default=200)
     parser.add_argument("--shap-top-features", type=int, default=12)
     parser.add_argument("--shap-vectorizer-max-features", type=int, default=5000)
