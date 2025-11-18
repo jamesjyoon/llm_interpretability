@@ -1289,10 +1289,22 @@ def run_experiment(args: argparse.Namespace) -> None:
         _raise_hf_access_error("tokenizer", config.model_name, exc)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-
-    base_model_kwargs = {}
+        
+    base_model_kwargs = {
+        # good defaults even without 4bit
+        "device_map": "auto",
+        "torch_dtype": torch.float16,      # V100 does NOT support bfloat16
+        "low_cpu_mem_usage": True,
+    }
     if config.load_in_4bit:
-        base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
+        base_model_kwargs.update(
+            {
+                "load_in_4bit": True,
+                "bnb_4bit_compute_dtype": torch.float16,
+                "bnb_4bit_use_double_quant": True,
+                "bnb_4bit_quant_type": "nf4",
+            }
+        )
 
     try:
         model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
