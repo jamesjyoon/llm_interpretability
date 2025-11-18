@@ -887,7 +887,17 @@ def collect_text_interpretability_outputs(
         rollout_path = os.path.join(config.output_dir, f"{output_prefix}_attention_rollout.json")
         with open(rollout_path, "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(attention_rollouts), handle, indent=2)
-        summary["attention_rollout"] = {"output_path": rollout_path, "examples": attention_rollouts}
+        rollout_plots = _plot_attention_importances(
+            examples=attention_rollouts,
+            output_dir=config.output_dir,
+            prefix=output_prefix,
+            method="attention_rollout",
+        )
+        summary["attention_rollout"] = {
+            "output_path": rollout_path,
+            "examples": attention_rollouts,
+            "plots": rollout_plots,
+        }
         print(
             f"Saved {output_prefix} attention rollout explanations for {len(attention_rollouts)} "
             f"example{'s' if len(attention_rollouts) != 1 else ''}."
@@ -896,7 +906,17 @@ def collect_text_interpretability_outputs(
         flow_path = os.path.join(config.output_dir, f"{output_prefix}_attention_flow.json")
         with open(flow_path, "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(attention_flows), handle, indent=2)
-        summary["attention_flow"] = {"output_path": flow_path, "examples": attention_flows}
+        flow_plots = _plot_attention_importances(
+            examples=attention_flows,
+            output_dir=config.output_dir,
+            prefix=output_prefix,
+            method="attention_flow",
+        )
+        summary["attention_flow"] = {
+            "output_path": flow_path,
+            "examples": attention_flows,
+            "plots": flow_plots,
+        }
         print(
             f"Saved {output_prefix} attention flow explanations for {len(attention_flows)} "
             f"example{'s' if len(attention_flows) != 1 else ''}."
@@ -905,7 +925,14 @@ def collect_text_interpretability_outputs(
         self_exp_path = os.path.join(config.output_dir, f"{output_prefix}_self_explanations.json")
         with open(self_exp_path, "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(self_explanations), handle, indent=2)
-        summary["self_explanations"] = {"output_path": self_exp_path, "examples": self_explanations}
+        self_exp_text = _save_self_explanations_text(
+            examples=self_explanations, output_dir=config.output_dir, prefix=output_prefix
+        )
+        summary["self_explanations"] = {
+            "output_path": self_exp_path,
+            "text_dump": self_exp_text,
+            "examples": self_explanations,
+        }
         print(
             f"Saved {output_prefix} self explanations for {len(self_explanations)} "
             f"example{'s' if len(self_explanations) != 1 else ''}."
@@ -1125,6 +1152,9 @@ def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) 
             "integrated_gradients",
             "lrp",
             "representer_points",
+            "attention_rollout",
+            "attention_flow",
+            "self_explanations",
         ):
             method_summary = model_summary.get(method)
             if method_summary:
@@ -1253,6 +1283,80 @@ def _generate_self_explanation(
     new_tokens = generated[0, inputs["input_ids"].shape[-1] :]
     explanation = tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
     return {"text": text, "prompt": prompt, "explanation": explanation}
+
+
+def _plot_attention_importances(
+    *,
+    examples: Sequence[Dict[str, object]],
+    output_dir: str,
+    prefix: str,
+    method: str,
+    top_k: int = 15,
+) -> List[str]:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency in Colab
+        print("matplotlib is not installed; skipping attention attribution plots.")
+        return []
+
+    saved_paths: List[str] = []
+    for index, example in enumerate(examples):
+        tokens = example.get("tokens")
+        scores = example.get("importance")
+        if not isinstance(tokens, list) or not isinstance(scores, list) or not tokens:
+            continue
+        # Truncate/normalize to match lengths in case of padding.
+        token_scores = np.array(scores, dtype=float)[: len(tokens)]
+        ordering = np.argsort(np.abs(token_scores))[::-1]
+        ordering = ordering[: min(top_k, len(ordering))]
+        ordered_tokens = [tokens[pos] for pos in ordering][::-1]
+        ordered_scores = [float(token_scores[pos]) for pos in ordering][::-1]
+
+        height = max(3.0, 0.35 * len(ordered_tokens) + 1.0)
+        fig, ax = plt.subplots(figsize=(9, height))
+        bars = ax.barh(np.arange(len(ordered_tokens)), ordered_scores, color="#8c6bb1")
+        ax.set_yticks(np.arange(len(ordered_tokens)))
+        ax.set_yticklabels(ordered_tokens)
+        ax.set_xlabel("Token importance")
+        ax.set_title(f"Top attention weights ({method.replace('_', ' ').title()} #{index})")
+        ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+        for bar, score in zip(bars, ordered_scores):
+            ax.text(bar.get_width(), bar.get_y() + bar.get_height() / 2, f" {score:.3f}", va="center")
+
+        fig.tight_layout()
+        output_path = os.path.join(
+            output_dir, f"{prefix}_{method}_example_{index}.png"
+        )
+        fig.savefig(output_path, dpi=200)
+        plt.close(fig)
+        saved_paths.append(os.path.abspath(output_path))
+
+    if saved_paths:
+        print(
+            f"Saved {len(saved_paths)} attention attribution plots for {method.replace('_', ' ')} to {output_dir}."
+        )
+    return saved_paths
+
+
+def _save_self_explanations_text(
+    examples: Sequence[Dict[str, str]], output_dir: str, prefix: str
+) -> Optional[str]:
+    if not examples:
+        return None
+
+    path = os.path.join(output_dir, f"{prefix}_self_explanations.txt")
+    with open(path, "w", encoding="utf-8") as handle:
+        for idx, example in enumerate(examples):
+            handle.write(f"Example {idx}\n")
+            handle.write("Prompt:\n")
+            handle.write(example.get("prompt", "") + "\n")
+            handle.write("Explanation:\n")
+            handle.write(example.get("explanation", "") + "\n")
+            handle.write("\n" + "-" * 40 + "\n\n")
+
+    print(f"Saved self-explanation texts to {os.path.abspath(path)}.")
+    return path
 
 
 def _serialize_shap(explanation: shap.Explanation) -> Dict[str, object]:
