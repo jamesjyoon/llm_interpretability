@@ -17,7 +17,7 @@ module load anaconda3
 eval "$(conda shell.bash hook)"
 conda activate $SLURM_SUBMIT_DIR/envs/llm-1B
 
-python experiments_llama_3.2_1B.py \
+python experiments_llama_3.2_1B_interpretability.py \
     --output-dir outputs/llama_sentiment_1B \
     --run-shap \
     --finetune
