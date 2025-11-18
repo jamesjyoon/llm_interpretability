@@ -184,7 +184,7 @@ class ExperimentConfig:
     lora_dropout: float = 0.1
     max_seq_length: int = 2048
     max_target_length: int = 4
-    output_dir: str = "outputs/imdb"
+    output_dir: str = "outputs/mteb/tweet_sentiment_extraction"
     run_shap: bool = True
     shap_max_evals: int = 200
     shap_example_count: int = 50
@@ -2190,8 +2190,8 @@ def run_experiment(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
-    parser.add_argument("--model-name", default="unsloth/Llama-3.2-1B-Instruct")
-    parser.add_argument("--dataset-name", default="imdb")
+    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--eval-split", default="test")
@@ -2237,7 +2237,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
     parser.set_defaults(load_in_4bit=True)
     parser.add_argument("--finetune", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/imdb")
+    parser.add_argument("--output-dir", default="outputs/mteb/tweet_sentiment_extraction")
     parser.add_argument(
         "--huggingface-token",
         default=None,
