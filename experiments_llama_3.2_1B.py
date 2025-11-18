@@ -172,8 +172,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 5000
-    eval_subset: Optional[int] = 2000
+    train_subset: Optional[int] = 500
+    eval_subset: Optional[int] = 200
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 2.0
@@ -182,7 +182,7 @@ class ExperimentConfig:
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.1
-    max_seq_length: int = 2048
+    max_seq_length: int = 516
     max_target_length: int = 4
     output_dir: str = "outputs/mteb/tweet_sentiment_extraction"
     run_shap: bool = True
