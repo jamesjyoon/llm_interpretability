@@ -39,6 +39,8 @@ from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_t
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    LogitsProcessor,
+    LogitsProcessorList,
     default_data_collator,
     set_seed,
     Trainer,
@@ -70,6 +72,32 @@ def _raise_hf_access_error(target: str, model_name: str, exc: Exception) -> NoRe
 
 
 LabelTokenMap = Dict[int, int]
+
+
+class RestrictedLabelLogitsProcessor(LogitsProcessor):
+    """Force generation to stay within a fixed label vocabulary.
+
+    Some base checkpoints occasionally emit stray punctuation or whitespace tokens when
+    asked to generate a single-digit label. This logits processor masks all
+    vocabulary entries except the provided label tokens so greedy decoding cannot
+    wander outside the expected label space.
+    """
+
+    def __init__(self, allowed_token_ids: Sequence[int]):
+        if not allowed_token_ids:
+            raise ValueError("At least one label token id must be supplied for restriction.")
+        self.allowed_token_ids = torch.tensor(sorted(set(int(t) for t in allowed_token_ids)))
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:  # type: ignore[override]
+        if self.allowed_token_ids.max().item() >= scores.size(-1):
+            raise ValueError("Allowed token id exceeds the vocabulary size.")
+
+        original = scores
+        restricted = torch.full_like(original, torch.finfo(original.dtype).min)
+        allowed = self.allowed_token_ids.to(original.device)
+        expanded = allowed.unsqueeze(0).expand(original.size(0), -1)
+        restricted.scatter_(1, expanded, original.gather(1, expanded))
+        return restricted
 
 
 def _maybe_login_to_hf(token: Optional[str]) -> None:
@@ -463,6 +491,9 @@ def _generate_class_predictions(
     )
     inputs = {k: v.to(device) for k, v in inputs.items()}
     eos_token_id = _generation_eos_ids(tokenizer, label_token_map)
+    logits_processor = LogitsProcessorList(
+        [RestrictedLabelLogitsProcessor(label_token_map.values())]
+    )
     model.eval()
     with torch.no_grad():
         generation = model.generate(
@@ -473,6 +504,7 @@ def _generate_class_predictions(
             top_p=1.0,
             eos_token_id=eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
+            logits_processor=logits_processor,
             return_dict_in_generate=True,
             output_scores=True,
         )
