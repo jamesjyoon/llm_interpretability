@@ -268,6 +268,44 @@ def _prepare_dataset(
     return processed
 
 
+def _autoscale_for_device_capacity(config: ExperimentConfig) -> None:
+    """Lower max sequence length and subsets on small GPUs to mitigate OOM."""
+
+    if not torch.cuda.is_available():
+        return
+
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    # Prefer keeping the user-requested configuration when ample memory exists.
+    if total_gb >= 22:
+        return
+
+    # Tighten sequence length and dataset sizes when running on ~16 GB cards.
+    recommended_max_seq_length = min(config.max_seq_length, 1024)
+    recommended_train_subset = None if config.train_subset is None else min(config.train_subset, 3500)
+    recommended_eval_subset = None if config.eval_subset is None else min(config.eval_subset, 1400)
+
+    if recommended_max_seq_length < config.max_seq_length:
+        print(
+            "Detected <22 GB GPU; lowering max_seq_length from "
+            f"{config.max_seq_length} to {recommended_max_seq_length} to reduce activation memory."
+        )
+        config.max_seq_length = recommended_max_seq_length
+
+    if recommended_train_subset is not None and recommended_train_subset < config.train_subset:
+        print(
+            f"Reducing train_subset from {config.train_subset} to {recommended_train_subset} "
+            "to shorten fine-tuning batches on constrained GPUs."
+        )
+        config.train_subset = recommended_train_subset
+
+    if recommended_eval_subset is not None and recommended_eval_subset < config.eval_subset:
+        print(
+            f"Reducing eval_subset from {config.eval_subset} to {recommended_eval_subset} "
+            "to keep evaluation memory usage lower."
+        )
+        config.eval_subset = recommended_eval_subset
+
+
 def _truncate_tokenized_dataset(dataset: DatasetDict, max_length: int) -> DatasetDict:
     """Trim tokenized columns to a smaller maximum length to reduce GPU memory usage."""
 
@@ -595,7 +633,7 @@ def train_lora_classifier(
     config: ExperimentConfig,
     model: AutoModelForCausalLM,
     processed_dataset: DatasetDict,
-) -> PeftModel:
+) -> Tuple[PeftModel, bool]:
     model_gradient_dtype = getattr(model, "dtype", torch.float32)
     if config.load_in_4bit:
         model = prepare_model_for_kbit_training(model)
@@ -642,6 +680,7 @@ def train_lora_classifier(
     current_dataset = processed_dataset
     current_max_seq_length = config.max_seq_length
     trainer: Optional[Trainer] = None
+    sequence_length_reduced = False
     while True:
         trainer = _build_trainer(current_batch_size, current_dataset)
         try:
@@ -661,6 +700,7 @@ def train_lora_classifier(
                     current_dataset = _truncate_tokenized_dataset(
                         current_dataset, next_max_seq_length
                     )
+                    sequence_length_reduced = True
                     del trainer
                     continue
                 print(
@@ -677,7 +717,7 @@ def train_lora_classifier(
             continue
 
     peft_model.eval()
-    return peft_model
+    return peft_model, sequence_length_reduced
 
 
 def _shap_masker(tokenizer):
@@ -1922,6 +1962,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
 
     set_seed(config.random_seed)
+    _autoscale_for_device_capacity(config)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if config.load_in_4bit and device.type != "cuda":
         print("4-bit quantization requested but CUDA is unavailable; falling back to full precision.")
@@ -1959,27 +2000,16 @@ def run_experiment(args: argparse.Namespace) -> None:
     formatter = PromptFormatter(label_space)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
 
-    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
-    zero_shot_metrics = evaluate_zero_shot(
-        model,
-        tokenizer,
-        zero_shot_texts,
-        zero_shot_labels,
-        label_token_map,
-        device,
-        config.max_seq_length,
-    )
-    print("Zero-shot evaluation metrics:")
-    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
-
-    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
-        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
-
     tuned_model: Optional[PeftModel] = None
     fine_tuned_metrics: Optional[Dict[str, float]] = None
+    sequence_length_reduced = False
+    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
     if args.finetune:
-        tuned_model = train_lora_classifier(config, model, processed_dataset)
+        tuned_model, sequence_length_reduced = train_lora_classifier(
+            config, model, processed_dataset
+        )
         tuned_model.save_pretrained(os.path.join(config.output_dir, "lora_adapter"))
+
         fine_tuned_metrics = evaluate_zero_shot(
             tuned_model,
             tokenizer,
@@ -1994,6 +2024,27 @@ def run_experiment(args: argparse.Namespace) -> None:
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(fine_tuned_metrics), handle, indent=2)
 
+    zero_shot_metrics = evaluate_zero_shot(
+        model,
+        tokenizer,
+        zero_shot_texts,
+        zero_shot_labels,
+        label_token_map,
+        device,
+        config.max_seq_length,
+    )
+
+    if sequence_length_reduced:
+        print(
+            "Evaluated zero-shot baseline after fine-tuning adjusted max_seq_length to keep comparisons aligned."
+        )
+
+    print("Zero-shot evaluation metrics:")
+    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
+
+    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
+
     _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
     label_order = list(sorted(label_token_map))
     if zero_shot_metrics.get("confusion_matrix"):
@@ -2006,6 +2057,14 @@ def run_experiment(args: argparse.Namespace) -> None:
         )
 
     interpretability_summary: Optional[Dict[str, object]] = None
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        print(
+            "Cleared CUDA cache before interpretability; the attribution runs operate on small batches "
+            "and are unlikely to cause OOM unless the GPU is already at capacity. "
+            "Lower --shap-example-count or disable --run-shap if attribution memory errors persist."
+        )
+
     if config.run_shap:
         shap_samples = zero_shot_texts[: config.shap_example_count]
         shap_surrogate_samples = zero_shot_texts[: config.shap_surrogate_samples]
