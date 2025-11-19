@@ -1241,6 +1241,11 @@ def run_experiment(args: argparse.Namespace) -> None:
                     tuned_plot = tuned_lime.get("plot_path") if isinstance(tuned_lime, dict) else None
                     if tuned_plot:
                         print(f"Saved fine-tuned LIME visualization to {tuned_plot}.")
+                    elif args.finetune:
+                        raise RuntimeError(
+                            "Fine-tuned LIME plot was expected but missing; ensure matplotlib is installed "
+                            "and that --run-lime remains enabled."
+                        )
                     if interpretability_summary is None:
                         interpretability_summary = {}
                     interpretability_summary["fine_tuned"] = tuned_summary
