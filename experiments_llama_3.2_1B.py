@@ -77,7 +77,8 @@ def _maybe_login_to_hf(token: Optional[str]) -> None:
 
 def _configure_cuda_allocator() -> None:
     if torch.cuda.is_available():
-        os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+        # Updated environment variable name to suppress warning
+        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
     label_token_map: LabelTokenMap = {}
@@ -114,6 +115,7 @@ class ExperimentConfig:
     lime_num_samples: int = 512
     run_lime: bool = True
     load_in_4bit: bool = True
+    finetune: bool = False  # <--- Added missing field here
     label_space: Optional[Sequence[int]] = (0, 1)
 
 class PromptFormatter:
@@ -365,7 +367,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     config = ExperimentConfig(
         model_name=args.model_name, output_dir=args.output_dir,
         load_in_4bit=args.load_in_4bit, run_lime=args.run_lime,
-        finetune=args.finetune # Added this to config for convenience if needed, though typically it's in args
+        finetune=args.finetune 
     )
     
     os.makedirs(config.output_dir, exist_ok=True)
@@ -450,7 +452,6 @@ def run_experiment(args: argparse.Namespace) -> None:
             trainer.train()
         except Exception as e:
             print(f"Training failed: {e}")
-            # Try to continue to evaluation if partial model exists, else exit
         
         peft_model.eval()
         
@@ -464,7 +465,6 @@ def run_experiment(args: argparse.Namespace) -> None:
         _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
         
         if config.run_lime:
-            # Run LIME on Fine-Tuned Model specifically
             run_lime(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
 
     # ==========================================
