@@ -64,13 +64,7 @@ LabelTokenMap = Dict[int, int]
 
 
 class RestrictedLabelLogitsProcessor(LogitsProcessor):
-    """Force generation to stay within a fixed label vocabulary.
-
-    Some base checkpoints occasionally emit stray punctuation or whitespace tokens when
-    asked to generate a single-digit label. This logits processor masks all
-    vocabulary entries except the provided label tokens so greedy decoding cannot
-    wander outside the expected label space.
-    """
+    """Force generation to stay within a fixed label vocabulary."""
 
     def __init__(self, allowed_token_ids: Sequence[int]):
         if not allowed_token_ids:
@@ -127,14 +121,7 @@ def _configure_cuda_allocator() -> None:
 
 
 def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
-    """Return a mapping from dataset labels to their token ids.
-
-    LLaMA-style tokenizers encode numbers with a leading space as a single
-    token (e.g., ``" 0"`` becomes ``"▁0"``).  Using the space-prefixed
-    representation ensures the labels align with how prompts are constructed
-    elsewhere in this module and avoids situations where ``"0"`` would be
-    split across multiple tokens.
-    """
+    """Return a mapping from dataset labels to their token ids."""
 
     if not label_space:
         raise ValueError("At least one label must be provided to build the token map.")
@@ -180,7 +167,7 @@ class ExperimentConfig:
     lime_num_samples: int = 512
     run_lime: bool = True
     load_in_4bit: bool = True
-    label_space: Optional[Sequence[int]] = None
+    label_space: Optional[Sequence[int]] = (0, 1)
 
 
 class PromptFormatter:
@@ -231,15 +218,10 @@ def _prepare_dataset(
             padding="max_length",
         )
 
-        # The causal-LM objective should only supervise the final label token. Mask the
-        # prompt portion of each sequence with ``-100`` so the cross-entropy loss
-        # focuses on the classification target instead of the copied instruction text.
         attention = model_inputs["attention_mask"]
         labels = []
         for input_ids, mask in zip(model_inputs["input_ids"], attention):
             masked = [-100] * len(input_ids)
-            # ``attention_mask`` marks non-padding tokens with 1s. The final
-            # non-padding position corresponds to the label token we appended.
             seq_length = int(sum(mask))
             if seq_length > 0:
                 label_index = seq_length - 1
@@ -282,11 +264,9 @@ def _autoscale_for_device_capacity(config: ExperimentConfig) -> None:
         return
 
     total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
-    # Prefer keeping the user-requested configuration when ample memory exists.
     if total_gb >= 22:
         return
 
-    # Tighten sequence length and dataset sizes when running on ~16 GB cards.
     recommended_max_seq_length = min(config.max_seq_length, 1024)
     recommended_train_subset = None if config.train_subset is None else min(config.train_subset, 3500)
     recommended_eval_subset = None if config.eval_subset is None else min(config.eval_subset, 1400)
@@ -362,10 +342,8 @@ def _filter_dataset_by_labels(
     """Restrict the dataset to the requested label ids."""
 
     allowed_labels = {int(label) for label in label_space}
-
     def predicate(example):
         return int(example[config.label_field]) in allowed_labels
-
     return dataset.filter(predicate)
 
 
@@ -379,8 +357,6 @@ def _classification_probabilities(
     *,
     max_batch_size: Optional[int] = None,
 ) -> np.ndarray:
-    # Lime can request thousands of perturbed samples at once. Microbatch the
-    # probability computation to avoid a single oversized forward pass on the GPU.
     batch_size = max_batch_size or len(prompts)
     probabilities: List[np.ndarray] = []
 
@@ -521,8 +497,6 @@ def _batched(iterator: Sequence[str], batch_size: int) -> Iterable[Sequence[str]
 def _build_confusion_matrix(
     labels: Sequence[int], predictions: Sequence[int], ordered_labels: Sequence[int]
 ) -> torch.Tensor:
-    """Construct a confusion matrix aligned to ``ordered_labels``."""
-
     label_to_index = {int(label): idx for idx, label in enumerate(ordered_labels)}
     matrix = torch.zeros((len(ordered_labels), len(ordered_labels)), dtype=torch.long)
     for true_label, pred_label in zip(labels, predictions):
@@ -537,8 +511,6 @@ def _build_confusion_matrix(
 def _per_class_metrics(
     confusion: torch.Tensor, ordered_labels: Sequence[int]
 ) -> Dict[str, Dict[str, float]]:
-    """Compute precision/recall/F1/support for every class."""
-
     per_class: Dict[str, Dict[str, float]] = {}
     for idx, label in enumerate(ordered_labels):
         tp = confusion[idx, idx].item()
@@ -851,14 +823,6 @@ def _ensure_json_serializable(value):
 
 
 def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) -> Optional[str]:
-    """Persist the generated interpretability artifacts to disk.
-
-    The interpretability summary can contain comparison statistics and
-    intermediate metadata.  This helper extracts the per-model outputs for LIME
-    and writes them to a single JSON file so they can be consumed after the
-    experiment run.
-    """
-
     outputs: Dict[str, Dict[str, object]] = {}
     for model_key in ("zero_shot", "fine_tuned"):
         model_summary = summary.get(model_key)
@@ -891,18 +855,14 @@ def _plot_metric_bars(
     zero_shot_metrics: Dict[str, float],
     fine_tuned_metrics: Optional[Dict[str, float]],
     output_dir: str,
+    *,
+    require_fine_tuned: bool = False,
 ) -> None:
-    """Visualize classification metrics and save the figure.
-
-    The bar chart focuses on core metrics that are available for both the
-    zero-shot baseline and the optional fine-tuned model.  Matplotlib is
-    imported lazily so that the experiment can still run in lightweight
-    environments that do not preinstall plotting libraries.
-    """
+    """Visualize classification metrics and save the figure."""
 
     try:
         import matplotlib.pyplot as plt  # type: ignore
-    except ImportError:  # pragma: no cover - optional dependency in Colab
+    except ImportError:
         print(
             "matplotlib is not installed; skipping metric visualization. Install it with `pip install matplotlib` to view the bar chart."
         )
@@ -913,8 +873,10 @@ def _plot_metric_bars(
     tuned_values: Optional[List[float]] = None
     if fine_tuned_metrics is not None:
         tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
-    else:
-        print("Fine-tuned metrics were not provided; plotting zero-shot scores only.")
+    elif require_fine_tuned:
+        raise RuntimeError(
+            "Fine-tuned metrics were expected for comparison but were unavailable; rerun with --finetune enabled."
+        )
 
     x = np.arange(len(metrics))
     width = 0.35 if tuned_values is not None else 0.6
@@ -959,10 +921,10 @@ def _plot_metric_bars(
 
 def _plot_confusion_matrix(
     confusion: np.ndarray, labels: Sequence[int], output_dir: str, prefix: str
-) -> None:
+) -> str:
     try:
         import matplotlib.pyplot as plt  # type: ignore
-    except ImportError:  # pragma: no cover - optional dependency in Colab
+    except ImportError:
         print("matplotlib is not installed; skipping confusion matrix visualization.")
         return
 
@@ -999,7 +961,9 @@ def _plot_confusion_matrix(
     output_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.png")
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
-    print(f"Saved confusion matrix visualization to {os.path.abspath(output_path)}.")
+    absolute_path = os.path.abspath(output_path)
+    print(f"Saved confusion matrix visualization to {absolute_path}.")
+    return absolute_path
 
 
 def _plot_lime_explanations(
@@ -1012,7 +976,7 @@ def _plot_lime_explanations(
 
     try:
         import matplotlib.pyplot as plt  # type: ignore
-    except ImportError:  # pragma: no cover - optional dependency
+    except ImportError:
         print(
             "matplotlib is not installed; skipping LIME visualization. Install it with `pip install matplotlib` to view the plots."
         )
@@ -1120,11 +1084,61 @@ def run_experiment(args: argparse.Namespace) -> None:
     formatter = PromptFormatter(label_space)
     processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
 
+    # =========================================================================
+    # PHASE 1: ZERO-SHOT EVALUATION (Performed BEFORE fine-tuning)
+    # =========================================================================
+    print("Running Zero-Shot evaluation...")
+    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset)
+    
+    zero_shot_metrics = evaluate_zero_shot(
+        model,
+        tokenizer,
+        zero_shot_texts,
+        zero_shot_labels,
+        label_token_map,
+        device,
+        config.max_seq_length,
+        formatter,
+    )
+    print("Zero-shot evaluation metrics:")
+    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
+    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
+    
+    label_order = list(sorted(label_token_map))
+    if zero_shot_metrics.get("confusion_matrix"):
+        _plot_confusion_matrix(
+            np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
+        )
+
+    # Zero-Shot LIME
+    interpretability_summary: Optional[Dict[str, object]] = {}
+    if config.run_lime:
+        print("Running Zero-Shot LIME explanations...")
+        lime_samples = zero_shot_texts[: config.interpretability_example_count]
+        if lime_samples:
+            zero_summary = collect_text_interpretability_outputs(
+                model=model,
+                tokenizer=tokenizer,
+                label_token_map=label_token_map,
+                device=device,
+                config=config,
+                texts=lime_samples,
+                formatter=formatter,
+                output_prefix="zero_shot",
+            )
+            if zero_summary:
+                interpretability_summary["zero_shot"] = zero_summary
+
+    # =========================================================================
+    # PHASE 2: FINE-TUNING AND EVALUATION
+    # =========================================================================
     tuned_model: Optional[PeftModel] = None
     fine_tuned_metrics: Optional[Dict[str, float]] = None
     sequence_length_reduced = False
-    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset)
+
     if args.finetune:
+        print("Starting fine-tuning...")
         tuned_model, sequence_length_reduced = train_lora_classifier(
             config, model, processed_dataset
         )
@@ -1145,83 +1159,49 @@ def run_experiment(args: argparse.Namespace) -> None:
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(fine_tuned_metrics), handle, indent=2)
 
-    zero_shot_metrics = evaluate_zero_shot(
-        model,
-        tokenizer,
-        zero_shot_texts,
-        zero_shot_labels,
-        label_token_map,
-        device,
-        config.max_seq_length,
-        formatter,
-    )
-
-    if sequence_length_reduced:
-        print(
-            "Evaluated zero-shot baseline after fine-tuning adjusted max_seq_length to keep comparisons aligned."
-        )
-
-    print("Zero-shot evaluation metrics:")
-    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
-
-    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
-        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
-
-    _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
-    label_order = list(sorted(label_token_map))
-    if zero_shot_metrics.get("confusion_matrix"):
-        _plot_confusion_matrix(
-            np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
-        )
-    if fine_tuned_metrics and fine_tuned_metrics.get("confusion_matrix"):
-        _plot_confusion_matrix(
-            np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
-        )
-
-    interpretability_summary: Optional[Dict[str, object]] = None
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        print(
-            "Cleared CUDA cache before interpretability; the attribution runs operate on small batches "
-            "and are unlikely to cause OOM unless the GPU is already at capacity. "
-            "Lower --lime-num-samples or disable --run-lime if attribution memory errors persist."
-        )
-
-    if config.run_lime:
-        lime_samples = zero_shot_texts[: config.interpretability_example_count]
-        if lime_samples:
-            zero_summary = collect_text_interpretability_outputs(
-                model=model,
+        if fine_tuned_metrics.get("confusion_matrix"):
+            fine_tuned_confusion_path = _plot_confusion_matrix(
+                np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
+            )
+            print(f"Saved fine-tuned confusion matrix visualization to {fine_tuned_confusion_path}.")
+        
+        # Fine-Tuned LIME
+        if config.run_lime:
+            print("Running Fine-Tuned LIME explanations...")
+            lime_samples = zero_shot_texts[: config.interpretability_example_count]
+            tuned_summary = collect_text_interpretability_outputs(
+                model=tuned_model,
                 tokenizer=tokenizer,
                 label_token_map=label_token_map,
                 device=device,
                 config=config,
                 texts=lime_samples,
                 formatter=formatter,
-                output_prefix="zero_shot",
+                output_prefix="fine_tuned",
             )
-            if zero_summary:
-                interpretability_summary = {"zero_shot": zero_summary}
+            if tuned_summary:
+                interpretability_summary["fine_tuned"] = tuned_summary
+                tuned_lime = tuned_summary.get("lime", {})
+                tuned_plot = tuned_lime.get("plot_path") if isinstance(tuned_lime, dict) else None
+                if tuned_plot:
+                    print(f"Saved fine-tuned LIME visualization to {tuned_plot}.")
 
-            if tuned_model is not None:
-                tuned_summary = collect_text_interpretability_outputs(
-                    model=tuned_model,
-                    tokenizer=tokenizer,
-                    label_token_map=label_token_map,
-                    device=device,
-                    config=config,
-                    texts=lime_samples,
-                    formatter=formatter,
-                    output_prefix="fine_tuned",
-                )
-                if tuned_summary:
-                    if interpretability_summary is None:
-                        interpretability_summary = {}
-                    interpretability_summary["fine_tuned"] = tuned_summary
-        else:
-            print("No samples available for interpretability analysis; skipping LIME generation.")
+    if sequence_length_reduced:
+        print("Note: Fine-tuning required reducing sequence length. Metrics may be affected.")
 
-    if interpretability_summary is not None:
+    # =========================================================================
+    # PHASE 3: FINAL COMPARISON PLOTS
+    # =========================================================================
+    # Now we have both zero_shot_metrics and fine_tuned_metrics, plot them together.
+    _plot_metric_bars(
+        zero_shot_metrics,
+        fine_tuned_metrics,
+        config.output_dir,
+        require_fine_tuned=args.finetune,
+    )
+
+    # Save final interpretability summary
+    if interpretability_summary:
         summary_path = os.path.join(config.output_dir, "interpretability_metrics.json")
         with open(summary_path, "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(interpretability_summary), handle, indent=2)
@@ -1245,7 +1225,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--label-space",
         nargs="*",
         type=int,
-        help="Explicit list of label ids to model (defaults to inferring from the dataset)",
+        default=[0, 1],
+        help="Explicit list of label ids to model (defaults to binary sentiment {0,1} unless overridden)",
     )
     parser.add_argument("--train-subset", type=int, default=5000)
     parser.add_argument("--eval-subset", type=int, default=2000)
@@ -1285,7 +1266,7 @@ def build_parser() -> argparse.ArgumentParser:
         " environment variables when present.",
     )
     return parser
-    
+
 if __name__ == "__main__":
     parser = build_parser()
     run_experiment(parser.parse_args())
