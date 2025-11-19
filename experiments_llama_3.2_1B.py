@@ -641,3 +641,632 @@ def train_lora_classifier(
         model = prepare_model_for_kbit_training(model)
     lora_config = LoraConfig(
         r=config.lora_r,
+        lora_alpha=config.lora_alpha,
+        lora_dropout=config.lora_dropout,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=["q_proj", "v_proj"],
+    )
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+    peft_model = get_peft_model(model, lora_config)
+    peft_model.print_trainable_parameters()
+    peft_model.gradient_checkpointing_enable()
+
+    def _build_trainer(batch_size: int, dataset: DatasetDict) -> Trainer:
+        training_args = TrainingArguments(
+            output_dir=config.output_dir,
+            num_train_epochs=config.num_train_epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            learning_rate=config.learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.03,
+            logging_steps=10,
+            save_strategy="no",
+            report_to=[],
+            bf16=model_gradient_dtype == torch.bfloat16,
+            fp16=model_gradient_dtype == torch.float16,
+            gradient_checkpointing=True,
+        )
+
+        return Trainer(
+            model=peft_model,
+            args=training_args,
+            train_dataset=dataset[config.train_split],
+            eval_dataset=dataset[config.eval_split],
+            data_collator=default_data_collator,
+        )
+
+    current_batch_size = max(1, config.per_device_train_batch_size)
+    current_dataset = processed_dataset
+    current_max_seq_length = config.max_seq_length
+    trainer: Optional[Trainer] = None
+    sequence_length_reduced = False
+    while True:
+        trainer = _build_trainer(current_batch_size, current_dataset)
+        try:
+            trainer.train()
+            break
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            if current_batch_size == 1:
+                if current_max_seq_length > 256:
+                    next_max_seq_length = max(256, current_max_seq_length // 2)
+                    print(
+                        "CUDA OOM at batch size 1; lowering max_seq_length from "
+                        f"{current_max_seq_length} to {next_max_seq_length} and retrying."
+                    )
+                    current_max_seq_length = next_max_seq_length
+                    config.max_seq_length = next_max_seq_length
+                    current_dataset = _truncate_tokenized_dataset(
+                        current_dataset, next_max_seq_length
+                    )
+                    sequence_length_reduced = True
+                    del trainer
+                    continue
+                print(
+                    "CUDA OOM occurred even at batch size 1 and minimum sequence length; "
+                    "consider lowering `max_seq_length` or using a smaller model checkpoint."
+                )
+                raise
+            next_batch_size = max(1, current_batch_size // 2)
+            print(
+                f"CUDA OOM at batch size {current_batch_size}; retrying with batch size {next_batch_size}."
+            )
+            current_batch_size = next_batch_size
+            del trainer
+            continue
+
+    peft_model.eval()
+    return peft_model, sequence_length_reduced
+
+
+def run_lime_text_explanations(
+    texts: Sequence[str],
+    predict_fn: Callable[[Sequence[str]], np.ndarray],
+    class_names: Sequence[str],
+    num_features: int,
+    *,
+    num_samples: int,
+) -> List[Dict[str, object]]:
+    """Generate LIME explanations for a handful of prompts."""
+
+    if not texts:
+        return []
+
+    explainer = LimeTextExplainer(class_names=list(class_names))
+    results: List[Dict[str, object]] = []
+    for text in texts:
+        explanation = explainer.explain_instance(
+            text, predict_fn, num_features=num_features, num_samples=num_samples
+        )
+        probabilities = predict_fn([text])[0]
+        results.append(
+            {
+                "text": text,
+                "predicted_label": class_names[int(np.argmax(probabilities))],
+                "prediction_confidence": float(np.max(probabilities)),
+                "token_weights": [(token, float(weight)) for token, weight in explanation.as_list()],
+            }
+        )
+    return results
+
+
+def collect_text_interpretability_outputs(
+    *,
+    model: AutoModelForCausalLM,
+    tokenizer,
+    label_token_map: LabelTokenMap,
+    device: torch.device,
+    config: ExperimentConfig,
+    texts: Sequence[str],
+    formatter: PromptFormatter,
+    output_prefix: str,
+) -> Dict[str, object]:
+    """Run interpretability suites for a given model."""
+
+    class_names = [str(label) for label in sorted(label_token_map)]
+    predict_fn = _build_probability_fn(
+        model,
+        tokenizer,
+        label_token_map,
+        device,
+        config.max_seq_length,
+        max_batch_size=config.interpretability_batch_size,
+        formatter=formatter,
+    )
+    summary: Dict[str, object] = {}
+
+    lime_samples = texts[: config.interpretability_example_count]
+    lime_outputs = run_lime_text_explanations(
+        lime_samples,
+        predict_fn,
+        class_names,
+        config.lime_num_features,
+        num_samples=config.lime_num_samples,
+    )
+    if lime_outputs:
+        lime_path = os.path.join(config.output_dir, f"{output_prefix}_lime.json")
+        with open(lime_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(lime_outputs), handle, indent=2)
+        lime_plot_path = _plot_lime_explanations(lime_outputs, config.output_dir, output_prefix)
+        summary["lime"] = {
+            "output_path": lime_path,
+            "plot_path": lime_plot_path,
+            "examples": lime_outputs,
+        }
+        print(
+            f"Saved {output_prefix} LIME explanations for {len(lime_outputs)} "
+            f"example{'s' if len(lime_outputs) != 1 else ''}."
+        )
+
+    return summary
+
+
+def _ensure_json_serializable(value):
+    """Recursively convert numpy/tensor objects into JSON-friendly Python types."""
+
+    if isinstance(value, torch.Tensor):
+        return _ensure_json_serializable(value.detach().cpu().numpy())
+    if isinstance(value, np.ndarray):
+        return _ensure_json_serializable(value.tolist())
+    if isinstance(value, (list, tuple)):
+        return [_ensure_json_serializable(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _ensure_json_serializable(item) for key, item in value.items()}
+    if isinstance(value, (np.generic,)):
+        return value.item()
+    if hasattr(value, "tolist"):
+        return _ensure_json_serializable(value.tolist())
+    return value
+
+
+def _save_interpretability_outputs(summary: Dict[str, object], output_dir: str) -> Optional[str]:
+    outputs: Dict[str, Dict[str, object]] = {}
+    for model_key in ("zero_shot", "fine_tuned"):
+        model_summary = summary.get(model_key)
+        if not isinstance(model_summary, dict):
+            continue
+
+        method_outputs: Dict[str, object] = {}
+        lime_summary = model_summary.get("lime")
+        if lime_summary:
+            method_outputs["lime"] = lime_summary
+
+        if method_outputs:
+            outputs[model_key] = method_outputs
+
+    if not outputs:
+        return None
+
+    output_path = os.path.join(output_dir, "interpretability_outputs.json")
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(_ensure_json_serializable(outputs), handle, indent=2)
+
+    return output_path
+
+
+def _ensure_output_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def _plot_metric_bars(
+    zero_shot_metrics: Dict[str, float],
+    fine_tuned_metrics: Optional[Dict[str, float]],
+    output_dir: str,
+    *,
+    require_fine_tuned: bool = False,
+) -> None:
+    """Visualize classification metrics and save the figure."""
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        print(
+            "matplotlib is not installed; skipping metric visualization. Install it with `pip install matplotlib` to view the bar chart."
+        )
+        return
+
+    metrics = ["accuracy", "precision", "recall", "f1", "mcc"]
+    zero_values = [zero_shot_metrics.get(metric, float("nan")) for metric in metrics]
+    tuned_values: Optional[List[float]] = None
+    if fine_tuned_metrics is not None:
+        tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
+    elif require_fine_tuned:
+        raise RuntimeError(
+            "Fine-tuned metrics were expected for comparison but were unavailable; rerun with --finetune enabled."
+        )
+
+    x = np.arange(len(metrics))
+    width = 0.35 if tuned_values is not None else 0.6
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.bar(x - width / 2 if tuned_values is not None else x, zero_values, width, label="Zero-shot")
+    if tuned_values is not None:
+        ax.bar(x + width / 2, tuned_values, width, label="Fine-tuned")
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([metric.upper() for metric in metrics])
+    ax.set_ylim(0.0, 1.05)
+    ax.set_ylabel("Score")
+    ax.set_title("Classification Metrics")
+    ax.legend()
+    ax.grid(axis="y", linestyle="--", alpha=0.4)
+
+    output_path = os.path.join(output_dir, "metrics_comparison.png")
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=200)
+
+    inline_displayed = False
+    try:  # Attempt inline display for notebook and Colab workflows.
+        from IPython import get_ipython  # type: ignore
+        from IPython.display import display  # type: ignore
+    except ImportError:
+        pass
+    else:
+        ipython = get_ipython()
+        if ipython is not None and getattr(ipython, "kernel", None) is not None:
+            display(fig)
+            inline_displayed = True
+
+    plt.close(fig)
+
+    absolute_path = os.path.abspath(output_path)
+    message = f"Saved metric visualization to {absolute_path}."
+    if not inline_displayed:
+        message += " Inline display is unavailable in this environment; open the PNG to view the chart."
+    print(message)
+
+
+def _plot_confusion_matrix(
+    confusion: np.ndarray, labels: Sequence[int], output_dir: str, prefix: str
+) -> str:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        print("matplotlib is not installed; skipping confusion matrix visualization.")
+        return
+
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(confusion, interpolation="nearest", cmap="Blues")
+    ax.figure.colorbar(im, ax=ax)
+
+    tick_labels = [str(label) for label in labels]
+    ax.set(
+        xticks=np.arange(confusion.shape[1]),
+        yticks=np.arange(confusion.shape[0]),
+        xticklabels=tick_labels,
+        yticklabels=tick_labels,
+        ylabel="True label",
+        xlabel="Predicted label",
+        title=f"{prefix.replace('_', ' ').title()} Confusion Matrix",
+    )
+
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+
+    thresh = confusion.max() / 2.0 if confusion.size else 0.0
+    for i in range(confusion.shape[0]):
+        for j in range(confusion.shape[1]):
+            ax.text(
+                j,
+                i,
+                format(int(confusion[i, j])),
+                ha="center",
+                va="center",
+                color="white" if confusion[i, j] > thresh else "black",
+            )
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.png")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+    absolute_path = os.path.abspath(output_path)
+    print(f"Saved confusion matrix visualization to {absolute_path}.")
+    return absolute_path
+
+
+def _plot_lime_explanations(
+    lime_outputs: Sequence[Dict[str, object]], output_dir: str, prefix: str
+) -> Optional[str]:
+    """Visualize LIME token weights for each analyzed example."""
+
+    if not lime_outputs:
+        return None
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:
+        print(
+            "matplotlib is not installed; skipping LIME visualization. Install it with `pip install matplotlib` to view the plots."
+        )
+        return None
+
+    n_rows = len(lime_outputs)
+    fig_height = max(3, 3 * n_rows)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(10, fig_height))
+    if n_rows == 1:
+        axes = [axes]
+
+    for ax, example in zip(axes, lime_outputs):
+        token_weights = example.get("token_weights", [])  # type: ignore[assignment]
+        if not token_weights:
+            ax.axis("off")
+            continue
+        tokens, weights = zip(*token_weights)  # type: ignore[misc]
+        indices = np.arange(len(tokens))
+        colors = ["#2c7bb6" if weight >= 0 else "#d7191c" for weight in weights]
+        ax.barh(indices, weights, color=colors)
+        ax.set_yticks(indices)
+        ax.set_yticklabels(tokens)
+        ax.invert_yaxis()
+        ax.set_xlabel("LIME weight")
+        ax.set_title(f"{prefix.replace('_', ' ').title()} example LIME attribution")
+        ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_lime_plot.png")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    absolute_path = os.path.abspath(output_path)
+    print(
+        "Saved LIME visualization to "
+        f"{absolute_path}. Inline display may be unavailable; open the PNG to view the chart."
+    )
+    return output_path
+
+
+def run_experiment(args: argparse.Namespace) -> None:
+    provided_token = args.huggingface_token or os.environ.get("HF_TOKEN") or os.environ.get(
+        "HUGGINGFACE_TOKEN"
+    )
+    _maybe_login_to_hf(provided_token)
+    _configure_cuda_allocator()
+
+    config = ExperimentConfig(
+        model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
+        train_split=args.train_split,
+        eval_split=args.eval_split,
+        text_field=args.text_field,
+        label_field=args.label_field,
+        train_subset=args.train_subset,
+        eval_subset=args.eval_subset,
+        run_lime=args.run_lime,
+        interpretability_example_count=args.interpretability_example_count,
+        interpretability_batch_size=args.interpretability_batch_size,
+        lime_num_features=args.lime_num_features,
+        lime_num_samples=args.lime_num_samples,
+        max_seq_length=args.max_seq_length,
+        load_in_4bit=args.load_in_4bit,
+        output_dir=args.output_dir,
+        label_space=args.label_space,
+    )
+
+    set_seed(config.random_seed)
+    _autoscale_for_device_capacity(config)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if config.load_in_4bit and device.type != "cuda":
+        print("4-bit quantization requested but CUDA is unavailable; falling back to full precision.")
+        config.load_in_4bit = False
+
+    _ensure_output_dir(config.output_dir)
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
+    except HF_ACCESS_ERRORS as exc:
+        _raise_hf_access_error("tokenizer", config.model_name, exc)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    base_model_kwargs = {}
+    if config.load_in_4bit:
+        base_model_kwargs.update({"load_in_4bit": True, "device_map": "auto"})
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(config.model_name, **base_model_kwargs)
+    except HF_ACCESS_ERRORS as exc:
+        _raise_hf_access_error("model", config.model_name, exc)
+    if not config.load_in_4bit:
+        model.to(device)
+
+    if config.dataset_config:
+        raw_dataset = load_dataset(config.dataset_name, config.dataset_config)
+    else:
+        raw_dataset = load_dataset(config.dataset_name)
+
+    label_space = _resolve_label_space(config, raw_dataset)
+    if config.label_space is not None:
+        raw_dataset = _filter_dataset_by_labels(raw_dataset, config, label_space)
+    label_token_map = _load_label_token_map(tokenizer, label_space)
+    formatter = PromptFormatter(label_space)
+    processed_dataset = _prepare_dataset(raw_dataset, config, tokenizer, formatter)
+
+    # =========================================================================
+    # PHASE 1: ZERO-SHOT EVALUATION (Performed BEFORE fine-tuning)
+    # =========================================================================
+    print("Running Zero-Shot evaluation...")
+    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset)
+    
+    zero_shot_metrics = evaluate_zero_shot(
+        model,
+        tokenizer,
+        zero_shot_texts,
+        zero_shot_labels,
+        label_token_map,
+        device,
+        config.max_seq_length,
+        formatter,
+    )
+    print("Zero-shot evaluation metrics:")
+    print(json.dumps(_ensure_json_serializable(zero_shot_metrics), indent=2))
+    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
+        json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
+    
+    label_order = list(sorted(label_token_map))
+    if zero_shot_metrics.get("confusion_matrix"):
+        _plot_confusion_matrix(
+            np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
+        )
+
+    # Zero-Shot LIME
+    interpretability_summary: Optional[Dict[str, object]] = {}
+    if config.run_lime:
+        print("Running Zero-Shot LIME explanations...")
+        lime_samples = zero_shot_texts[: config.interpretability_example_count]
+        if lime_samples:
+            zero_summary = collect_text_interpretability_outputs(
+                model=model,
+                tokenizer=tokenizer,
+                label_token_map=label_token_map,
+                device=device,
+                config=config,
+                texts=lime_samples,
+                formatter=formatter,
+                output_prefix="zero_shot",
+            )
+            if zero_summary:
+                interpretability_summary["zero_shot"] = zero_summary
+
+    # =========================================================================
+    # PHASE 2: FINE-TUNING AND EVALUATION
+    # =========================================================================
+    tuned_model: Optional[PeftModel] = None
+    fine_tuned_metrics: Optional[Dict[str, float]] = None
+    sequence_length_reduced = False
+
+    if args.finetune:
+        print("Starting fine-tuning...")
+        tuned_model, sequence_length_reduced = train_lora_classifier(
+            config, model, processed_dataset
+        )
+        tuned_model.save_pretrained(os.path.join(config.output_dir, "lora_adapter"))
+
+        fine_tuned_metrics = evaluate_zero_shot(
+            tuned_model,
+            tokenizer,
+            zero_shot_texts,
+            zero_shot_labels,
+            label_token_map,
+            device,
+            config.max_seq_length,
+            formatter,
+        )
+        print("Fine-tuned evaluation metrics:")
+        print(json.dumps(_ensure_json_serializable(fine_tuned_metrics), indent=2))
+        with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(fine_tuned_metrics), handle, indent=2)
+
+        if fine_tuned_metrics.get("confusion_matrix"):
+            fine_tuned_confusion_path = _plot_confusion_matrix(
+                np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
+            )
+            print(f"Saved fine-tuned confusion matrix visualization to {fine_tuned_confusion_path}.")
+        
+        # Fine-Tuned LIME
+        if config.run_lime:
+            print("Running Fine-Tuned LIME explanations...")
+            lime_samples = zero_shot_texts[: config.interpretability_example_count]
+            tuned_summary = collect_text_interpretability_outputs(
+                model=tuned_model,
+                tokenizer=tokenizer,
+                label_token_map=label_token_map,
+                device=device,
+                config=config,
+                texts=lime_samples,
+                formatter=formatter,
+                output_prefix="fine_tuned",
+            )
+            if tuned_summary:
+                interpretability_summary["fine_tuned"] = tuned_summary
+                tuned_lime = tuned_summary.get("lime", {})
+                tuned_plot = tuned_lime.get("plot_path") if isinstance(tuned_lime, dict) else None
+                if tuned_plot:
+                    print(f"Saved fine-tuned LIME visualization to {tuned_plot}.")
+
+    if sequence_length_reduced:
+        print("Note: Fine-tuning required reducing sequence length. Metrics may be affected.")
+
+    # =========================================================================
+    # PHASE 3: FINAL COMPARISON PLOTS
+    # =========================================================================
+    # Now we have both zero_shot_metrics and fine_tuned_metrics, plot them together.
+    _plot_metric_bars(
+        zero_shot_metrics,
+        fine_tuned_metrics,
+        config.output_dir,
+        require_fine_tuned=args.finetune,
+    )
+
+    # Save final interpretability summary
+    if interpretability_summary:
+        summary_path = os.path.join(config.output_dir, "interpretability_metrics.json")
+        with open(summary_path, "w", encoding="utf-8") as handle:
+            json.dump(_ensure_json_serializable(interpretability_summary), handle, indent=2)
+        print(f"Saved interpretability comparison metrics to {summary_path}.")
+
+        outputs_path = _save_interpretability_outputs(interpretability_summary, config.output_dir)
+        if outputs_path:
+            print(f"Saved interpretability outputs to {outputs_path}.")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
+    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
+    parser.add_argument("--dataset-config", default=None)
+    parser.add_argument("--train-split", default="train")
+    parser.add_argument("--eval-split", default="test")
+    parser.add_argument("--text-field", default="text")
+    parser.add_argument("--label-field", default="label")
+    parser.add_argument(
+        "--label-space",
+        nargs="*",
+        type=int,
+        default=[0, 1],
+        help="Explicit list of label ids to model (defaults to binary sentiment {0,1} unless overridden)",
+    )
+    parser.add_argument("--train-subset", type=int, default=5000)
+    parser.add_argument("--eval-subset", type=int, default=2000)
+    parser.add_argument("--run-lime", action="store_true")
+    parser.add_argument("--no-run-lime", dest="run_lime", action="store_false")
+    parser.set_defaults(run_lime=True)
+    parser.add_argument("--interpretability-example-count", type=int, default=5)
+    parser.add_argument(
+        "--interpretability-batch-size",
+        type=int,
+        default=8,
+        help="Maximum batch size for interpretability prediction calls to avoid OOM.",
+    )
+    parser.add_argument("--lime-num-features", type=int, default=10)
+    parser.add_argument(
+        "--lime-num-samples",
+        type=int,
+        default=512,
+        help="Number of perturbed samples per LIME explanation; lower to reduce GPU load.",
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=2048,
+        help="Maximum sequence length for tokenization; reduce to lower GPU memory usage.",
+    )
+    parser.add_argument("--load-in-4bit", action="store_true")
+    parser.add_argument("--no-load-in-4bit", dest="load_in_4bit", action="store_false")
+    parser.set_defaults(load_in_4bit=True)
+    parser.add_argument("--finetune", action="store_true")
+    parser.add_argument("--output-dir", default="outputs/mteb/tweet_sentiment_extraction")
+    parser.add_argument(
+        "--huggingface-token",
+        default=None,
+        help="Personal access token for gated Hugging Face repositories."
+        " If omitted, the script will fall back to the HF_TOKEN or HUGGINGFACE_TOKEN"
+        " environment variables when present.",
+    )
+    return parser
+
+if __name__ == "__main__":
+    parser = build_parser()
+    run_experiment(parser.parse_args())
