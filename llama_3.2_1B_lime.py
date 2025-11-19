@@ -161,8 +161,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 5000
-    eval_subset: Optional[int] = 2000
+    train_subset: Optional[int] = 800
+    eval_subset: Optional[int] = 200
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 2.0
