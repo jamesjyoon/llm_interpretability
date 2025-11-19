@@ -891,8 +891,6 @@ def _plot_metric_bars(
     zero_shot_metrics: Dict[str, float],
     fine_tuned_metrics: Optional[Dict[str, float]],
     output_dir: str,
-    *,
-    require_fine_tuned: bool = False,
 ) -> None:
     """Visualize classification metrics and save the figure.
 
@@ -915,11 +913,6 @@ def _plot_metric_bars(
     tuned_values: Optional[List[float]] = None
     if fine_tuned_metrics is not None:
         tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
-    elif require_fine_tuned:
-        print(
-            "Fine-tuned metrics were expected but not available; rerun with --finetune to produce a side-by-side chart."
-        )
-        return
     else:
         print("Fine-tuned metrics were not provided; plotting zero-shot scores only.")
 
@@ -1174,12 +1167,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
         json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
 
-    _plot_metric_bars(
-        zero_shot_metrics,
-        fine_tuned_metrics,
-        config.output_dir,
-        require_fine_tuned=args.finetune,
-    )
+    _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
     label_order = list(sorted(label_token_map))
     if zero_shot_metrics.get("confusion_matrix"):
         _plot_confusion_matrix(

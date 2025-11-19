@@ -115,7 +115,7 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
 class ExperimentConfig:
     """Configuration for the classification experiment."""
 
-    model_name: str = "unsloth/Llama-3.2-1B-Instruct"
+    model_name: str = "meta-llama/Llama-3.2-1B"
     dataset_name: str = "mteb/tweet_sentiment_extraction"
     dataset_config: Optional[str] = None
     train_split: str = "train"
@@ -1442,7 +1442,7 @@ def run_experiment(args: argparse.Namespace) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a classification interpretability experiment.")
-    parser.add_argument("--model-name", default="unsloth/Llama-3.2-1B-Instruct")
+    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--train-split", default="train")
