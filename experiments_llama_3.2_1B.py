@@ -161,8 +161,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 500
-    eval_subset: Optional[int] = 200
+    train_subset: Optional[int] = 5000
+    eval_subset: Optional[int] = 2000
     random_seed: int = 42
     learning_rate: float = 2e-4
     num_train_epochs: float = 2.0
@@ -190,24 +190,18 @@ class PromptFormatter:
         self.label_space = list(label_space)
         label_list = ", ".join(str(label) for label in self.label_space)
         if set(self.label_space) == {0, 1}:
-            instruction = (
-                "Respond with only the digit `1` for positive sentiment and `0` for negative sentiment."
-            )
+            instruction = "Respond with only one of the digits 0 (for negative) or 1 (for positive)."
         else:
             instruction = (
                 "Respond with only one of the digits "
                 + label_list
                 + " to indicate the sentiment class."
             )
-        self.template = (
-            "You are a sentiment classifier.\n"
-            f"{instruction}\n"
-            "Tweet: {sentence}\n"
-            "Label:"
-        )
+        self.template = "{instruction}\nTweet: {sentence}\nLabel:"
+        self.instruction = instruction
 
     def build_prompt(self, sentence: str) -> str:
-        return self.template.format(sentence=sentence)
+        return self.template.format(instruction=self.instruction, sentence=sentence)
 
 
 def _prepare_dataset(
@@ -333,14 +327,14 @@ def _truncate_tokenized_dataset(dataset: DatasetDict, max_length: int) -> Datase
 
 
 def _prepare_zero_shot_texts(
-    config: ExperimentConfig, original_dataset: DatasetDict, formatter: PromptFormatter
+    config: ExperimentConfig, original_dataset: DatasetDict
 ) -> Tuple[List[str], List[int]]:
     validation_split = original_dataset[config.eval_split]
     if config.eval_subset:
         eval_count = min(config.eval_subset, len(validation_split))
         validation_split = validation_split.shuffle(seed=config.random_seed)
         validation_split = validation_split.select(range(eval_count))
-    texts = [formatter.build_prompt(sentence) for sentence in validation_split[config.text_field]]
+    texts = list(validation_split[config.text_field])
     labels = list(validation_split[config.label_field])
     return texts, labels
 
@@ -425,8 +419,9 @@ def _build_probability_fn(
     max_length: int,
     *,
     max_batch_size: Optional[int] = None,
+    formatter: Optional[PromptFormatter] = None,
 ) -> Callable[[Sequence[str]], np.ndarray]:
-    """Return a callable that exposes class probabilities for raw prompts."""
+    """Return a callable that exposes class probabilities for raw texts."""
 
     def _predict(batch_texts: Sequence[str]) -> np.ndarray:
         normalized: List[str]
@@ -434,6 +429,8 @@ def _build_probability_fn(
             normalized = [str(item) for item in batch_texts.tolist()]
         else:
             normalized = [str(item) for item in batch_texts]
+        if formatter is not None:
+            normalized = [formatter.build_prompt(text) for text in normalized]
         return _classification_probabilities(
             model,
             tokenizer,
@@ -607,17 +604,19 @@ def _aggregate_metrics(
 def evaluate_zero_shot(
     model: AutoModelForCausalLM,
     tokenizer,
-    prompts: Sequence[str],
+    texts: Sequence[str],
     labels: Sequence[int],
     label_token_map: LabelTokenMap,
     device: torch.device,
     max_length: int,
+    formatter: PromptFormatter,
     batch_size: int = 8,
 ) -> Dict[str, float]:
     predictions: List[int] = []
     probability_rows: List[List[float]] = []
     ordered_labels = list(sorted(label_token_map))
-    for batch_prompts in _batched(list(prompts), batch_size):
+    formatted_prompts = [formatter.build_prompt(text) for text in texts]
+    for batch_prompts in _batched(formatted_prompts, batch_size):
         preds, probs = _generate_class_predictions(
             model,
             tokenizer,
@@ -790,6 +789,7 @@ def collect_text_interpretability_outputs(
     device: torch.device,
     config: ExperimentConfig,
     texts: Sequence[str],
+    formatter: PromptFormatter,
     output_prefix: str,
 ) -> Dict[str, object]:
     """Run interpretability suites for a given model."""
@@ -802,6 +802,7 @@ def collect_text_interpretability_outputs(
         device,
         config.max_seq_length,
         max_batch_size=config.interpretability_batch_size,
+        formatter=formatter,
     )
     summary: Dict[str, object] = {}
 
@@ -817,7 +818,12 @@ def collect_text_interpretability_outputs(
         lime_path = os.path.join(config.output_dir, f"{output_prefix}_lime.json")
         with open(lime_path, "w", encoding="utf-8") as handle:
             json.dump(_ensure_json_serializable(lime_outputs), handle, indent=2)
-        summary["lime"] = {"output_path": lime_path, "examples": lime_outputs}
+        lime_plot_path = _plot_lime_explanations(lime_outputs, config.output_dir, output_prefix)
+        summary["lime"] = {
+            "output_path": lime_path,
+            "plot_path": lime_plot_path,
+            "examples": lime_outputs,
+        }
         print(
             f"Saved {output_prefix} LIME explanations for {len(lime_outputs)} "
             f"example{'s' if len(lime_outputs) != 1 else ''}."
@@ -996,6 +1002,57 @@ def _plot_confusion_matrix(
     print(f"Saved confusion matrix visualization to {os.path.abspath(output_path)}.")
 
 
+def _plot_lime_explanations(
+    lime_outputs: Sequence[Dict[str, object]], output_dir: str, prefix: str
+) -> Optional[str]:
+    """Visualize LIME token weights for each analyzed example."""
+
+    if not lime_outputs:
+        return None
+
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except ImportError:  # pragma: no cover - optional dependency
+        print(
+            "matplotlib is not installed; skipping LIME visualization. Install it with `pip install matplotlib` to view the plots."
+        )
+        return None
+
+    n_rows = len(lime_outputs)
+    fig_height = max(3, 3 * n_rows)
+    fig, axes = plt.subplots(n_rows, 1, figsize=(10, fig_height))
+    if n_rows == 1:
+        axes = [axes]
+
+    for ax, example in zip(axes, lime_outputs):
+        token_weights = example.get("token_weights", [])  # type: ignore[assignment]
+        if not token_weights:
+            ax.axis("off")
+            continue
+        tokens, weights = zip(*token_weights)  # type: ignore[misc]
+        indices = np.arange(len(tokens))
+        colors = ["#2c7bb6" if weight >= 0 else "#d7191c" for weight in weights]
+        ax.barh(indices, weights, color=colors)
+        ax.set_yticks(indices)
+        ax.set_yticklabels(tokens)
+        ax.invert_yaxis()
+        ax.set_xlabel("LIME weight")
+        ax.set_title(f"{prefix.replace('_', ' ').title()} example LIME attribution")
+        ax.grid(axis="x", linestyle="--", alpha=0.4)
+
+    fig.tight_layout()
+    output_path = os.path.join(output_dir, f"{prefix}_lime_plot.png")
+    fig.savefig(output_path, dpi=200)
+    plt.close(fig)
+
+    absolute_path = os.path.abspath(output_path)
+    print(
+        "Saved LIME visualization to "
+        f"{absolute_path}. Inline display may be unavailable; open the PNG to view the chart."
+    )
+    return output_path
+
+
 def run_experiment(args: argparse.Namespace) -> None:
     provided_token = args.huggingface_token or os.environ.get("HF_TOKEN") or os.environ.get(
         "HUGGINGFACE_TOKEN"
@@ -1066,7 +1123,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     tuned_model: Optional[PeftModel] = None
     fine_tuned_metrics: Optional[Dict[str, float]] = None
     sequence_length_reduced = False
-    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset, formatter)
+    zero_shot_texts, zero_shot_labels = _prepare_zero_shot_texts(config, raw_dataset)
     if args.finetune:
         tuned_model, sequence_length_reduced = train_lora_classifier(
             config, model, processed_dataset
@@ -1081,6 +1138,7 @@ def run_experiment(args: argparse.Namespace) -> None:
             label_token_map,
             device,
             config.max_seq_length,
+            formatter,
         )
         print("Fine-tuned evaluation metrics:")
         print(json.dumps(_ensure_json_serializable(fine_tuned_metrics), indent=2))
@@ -1095,6 +1153,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         label_token_map,
         device,
         config.max_seq_length,
+        formatter,
     )
 
     if sequence_length_reduced:
@@ -1138,6 +1197,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                 device=device,
                 config=config,
                 texts=lime_samples,
+                formatter=formatter,
                 output_prefix="zero_shot",
             )
             if zero_summary:
@@ -1151,6 +1211,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                     device=device,
                     config=config,
                     texts=lime_samples,
+                    formatter=formatter,
                     output_prefix="fine_tuned",
                 )
                 if tuned_summary:
