@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models on binary classification datasets.
-Fixed to ensure Zero-Shot runs before Fine-Tuning and all plots are generated.
+Updated to use SHAP for interpretability.
 """
 
 import argparse
@@ -16,11 +16,11 @@ import torch
 from datasets import DatasetDict, load_dataset
 from sklearn.metrics import matthews_corrcoef
 
-# Import LIME
+# --- Import SHAP instead of LIME ---
 try:
-    from lime.lime_text import LimeTextExplainer  # type: ignore
+    import shap
 except ImportError as exc:
-    raise SystemExit("The `lime` package is required. Install it via `pip install lime`.") from exc
+    raise SystemExit("The `shap` package is required. Install it via `pip install shap`.") from exc
 
 try:
     import matplotlib.pyplot as plt
@@ -77,7 +77,6 @@ def _maybe_login_to_hf(token: Optional[str]) -> None:
 
 def _configure_cuda_allocator() -> None:
     if torch.cuda.is_available():
-        # Updated environment variable name to suppress warning
         os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
@@ -97,8 +96,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 4000
-    eval_subset: Optional[int] = 2000
+    train_subset: Optional[int] = 800
+    eval_subset: Optional[int] = 200
     random_seed: int = 42
     learning_rate: float = 5e-5
     num_train_epochs: float = 2.0
@@ -108,14 +107,15 @@ class ExperimentConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.1
     max_seq_length: int = 516
-    output_dir: str = "outputs/experiment"
-    interpretability_example_count: int = 5
-    interpretability_batch_size: int = 8
-    lime_num_features: int = 10
-    lime_num_samples: int = 512
-    run_lime: bool = True
+    output_dir: str = "outputs/experiment_shap"
+    
+    # Interpretability
+    interpretability_example_count: int = 3 # Reduced for SHAP speed
+    shap_max_evals: int = 100
+    run_shap: bool = True
+    
     load_in_4bit: bool = True
-    finetune: bool = False  # <--- Added missing field here
+    finetune: bool = False 
     label_space: Optional[Sequence[int]] = (0, 1)
 
 class PromptFormatter:
@@ -143,23 +143,6 @@ def _prepare_dataset(dataset: DatasetDict, config: ExperimentConfig, tokenizer, 
             if seq_len > 0:
                 masked[seq_len - 1] = input_ids[seq_len - 1]
             labels.append(masked)
-
-        # --- DEBUG START ---
-        print(f"\n[DEBUG] Checking first example label...")
-        # Get the token ID that we set as the target
-        target_idx = int(sum(model_inputs["attention_mask"][0])) - 1
-        target_id = labels[0][target_idx]
-        decoded_target = tokenizer.decode([target_id])
-        
-        print(f"[DEBUG] Target Token ID: {target_id}")
-        print(f"[DEBUG] Decoded Target: '{decoded_target}'")
-        
-        if target_id == tokenizer.eos_token_id:
-            print("[CRITICAL WARNING] You are training on the EOS token! The model will fail.")
-        else:
-            print("[DEBUG] Label looks correct (it is not EOS).")
-        # --- DEBUG END ---
-        
         model_inputs["labels"] = labels
         return model_inputs
 
@@ -193,16 +176,14 @@ def _filter_dataset(dataset: DatasetDict, config: ExperimentConfig, label_space:
     allowed = set(label_space)
     return dataset.filter(lambda x: int(x[config.label_field]) in allowed)
 
-# --- Core Evaluation & LIME Functions ---
+# --- Core Evaluation & SHAP Functions ---
 
 def _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter):
-    """Returns a function that takes raw texts and returns probabilities for LIME."""
+    """Returns a function that takes raw texts and returns probabilities for SHAP."""
     def _predict(texts: Sequence[str]) -> np.ndarray:
-        # Ensure texts are strings
         texts = [str(t) for t in texts]
         prompts = [formatter.build_prompt(t) for t in texts]
         
-        # Batch processing
         probs_list = []
         batch_size = 8
         for i in range(0, len(prompts), batch_size):
@@ -214,11 +195,9 @@ def _build_probability_fn(model, tokenizer, label_token_map, device, max_length,
                 outputs = model(**inputs)
             
             logits = outputs.logits
-            # Get logits of the last token
             seq_lens = inputs.attention_mask.sum(dim=-1) - 1
             final_logits = logits[torch.arange(logits.size(0), device=device), seq_lens]
             
-            # Extract only label tokens
             sorted_labels = sorted(label_token_map.keys())
             target_ids = torch.tensor([label_token_map[l] for l in sorted_labels], device=device)
             label_logits = final_logits[:, target_ids]
@@ -229,23 +208,15 @@ def _build_probability_fn(model, tokenizer, label_token_map, device, max_length,
     return _predict
 
 def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max_length, formatter):
-    """Generic evaluation loop."""
     preds = []
-    probs_all = []
     sorted_labels = sorted(label_token_map.keys())
     
     predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter)
-    
-    # Get probabilities
     probs_all = predict_fn(texts)
-    
-    # Get predictions
     pred_indices = np.argmax(probs_all, axis=1)
     preds = [sorted_labels[i] for i in pred_indices]
     
-    # Metrics
     from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
-    
     cm = confusion_matrix(labels, preds, labels=sorted_labels)
     acc = accuracy_score(labels, preds)
     p, r, f1, _ = precision_recall_fscore_support(labels, preds, average='macro', zero_division=0)
@@ -259,67 +230,81 @@ def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max
         "confusion_matrix": cm.tolist()
     }
 
-def run_lime(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
-    """Runs LIME and saves the plot immediately."""
-    print(f"Running LIME for {prefix}...")
+def run_shap(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
+    """Runs SHAP and saves plots."""
+    print(f"Running SHAP for {prefix}...")
     predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
     class_names = [str(l) for l in sorted(label_token_map.keys())]
     
-    explainer = LimeTextExplainer(class_names=class_names)
-    lime_outputs = []
+    # Setup SHAP
+    # We use a Text masker on the tokenizer, and pass the prediction function
+    masker = shap.maskers.Text(tokenizer)
+    explainer = shap.Explainer(predict_fn, masker, output_names=class_names)
     
-    # Limit samples for speed
+    # Limit samples
     samples = texts[:config.interpretability_example_count]
     
-    for text in samples:
-        exp = explainer.explain_instance(
-            text, predict_fn, num_features=config.lime_num_features, num_samples=config.lime_num_samples
-        )
+    # Calculate SHAP values
+    # max_evals limits the number of permutations to prevent it from taking hours
+    shap_values = explainer(samples, max_evals=config.shap_max_evals)
+    
+    # Save SHAP values to JSON (simplified for readability)
+    json_output = []
+    for i, text in enumerate(samples):
+        # shap_values[i] is an Explanation object
+        # .values is (seq_len, n_classes)
+        # .data is the tokens
         probs = predict_fn([text])[0]
-        pred_label = class_names[np.argmax(probs)]
+        pred_idx = np.argmax(probs)
         
-        lime_outputs.append({
+        # Extract weights for the predicted class
+        # Handle dimensions: (tokens, classes)
+        vals = shap_values[i].values
+        if len(vals.shape) > 1:
+            vals = vals[:, pred_idx]
+            
+        tokens = shap_values[i].data
+        
+        json_output.append({
             "text": text,
-            "predicted_label": pred_label,
-            "token_weights": exp.as_list()
+            "predicted_label": class_names[pred_idx],
+            "confidence": float(probs[pred_idx]),
+            "token_weights": list(zip(tokens, vals.tolist()))
         })
 
-    # Save JSON
-    with open(os.path.join(config.output_dir, f"{prefix}_lime.json"), "w") as f:
-        json.dump(lime_outputs, f, indent=2)
+    with open(os.path.join(config.output_dir, f"{prefix}_shap.json"), "w") as f:
+        json.dump(json_output, f, indent=2)
 
-    # Save PLOT
-    _plot_lime(lime_outputs, config.output_dir, prefix)
+    # Generate Plots
+    _plot_shap(shap_values, config.output_dir, prefix)
     
-    return lime_outputs
+    return shap_values
 
 # --- Plotting Functions ---
 
-def _plot_lime(lime_data, output_dir, prefix):
-    if not plt or not lime_data: return
+def _plot_shap(shap_values, output_dir, prefix):
+    """Generates SHAP bar plots using shap.plots.bar"""
+    if not plt: return
+
+    # We iterate through the examples and plot them one by one
+    # SHAP's native plots are a bit tricky to save without being displayed, 
+    # but passing show=False usually works with matplotlib backend.
     
-    n = len(lime_data)
-    fig, axes = plt.subplots(n, 1, figsize=(10, 3*n))
-    if n == 1: axes = [axes]
-    
-    for ax, item in zip(axes, lime_data):
-        weights = item['token_weights']
-        if not weights: continue
-        tokens, vals = zip(*weights)
-        y_pos = np.arange(len(tokens))
-        colors = ['green' if v > 0 else 'red' for v in vals]
-        
-        ax.barh(y_pos, vals, color=colors)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(tokens)
-        ax.invert_yaxis()
-        ax.set_title(f"Pred: {item['predicted_label']}")
-        
-    plt.tight_layout()
-    path = os.path.join(output_dir, f"{prefix}_lime_plot.png")
-    plt.savefig(path)
-    plt.close()
-    print(f"Saved {path}")
+    for i in range(len(shap_values)):
+        fig = plt.figure()
+        # Plot the bar chart for the i-th example
+        # We usually want to show the class that was predicted, or the most significant one.
+        # By default shap.plots.bar plots the class with highest output if multi-class
+        try:
+            shap.plots.bar(shap_values[i], show=False, max_display=12)
+            plt.title(f"SHAP: {prefix} Example {i+1}")
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f"{prefix}_shap_plot_ex{i}.png"), bbox_inches='tight')
+            plt.close()
+        except Exception as e:
+            print(f"Could not plot SHAP for example {i}: {e}")
+
+    print(f"Saved SHAP plots to {output_dir}")
 
 def _plot_confusion_matrix(cm, labels, output_dir, prefix):
     if not plt: return
@@ -383,8 +368,12 @@ def run_experiment(args: argparse.Namespace) -> None:
     
     config = ExperimentConfig(
         model_name=args.model_name, output_dir=args.output_dir,
-        load_in_4bit=args.load_in_4bit, run_lime=args.run_lime,
-        finetune=args.finetune 
+        load_in_4bit=args.load_in_4bit, run_shap=args.run_shap,
+        finetune=args.finetune,
+        train_subset=args.train_subset,
+        eval_subset=args.eval_subset,
+        learning_rate=args.learning_rate,
+        lora_r=args.lora_r
     )
     
     os.makedirs(config.output_dir, exist_ok=True)
@@ -416,18 +405,17 @@ def run_experiment(args: argparse.Namespace) -> None:
     eval_texts, eval_labels = _prepare_texts_labels(config, dataset)
 
     # ==========================================
-    # PHASE 1: ZERO-SHOT (Before Fine-Tuning)
+    # PHASE 1: ZERO-SHOT
     # ==========================================
     print("--- Phase 1: Running Zero-Shot Evaluation ---")
     zs_metrics = evaluate_model(model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
     print("Zero-Shot Metrics:", zs_metrics)
     
-    # Save Zero-Shot Artifacts
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
     _plot_confusion_matrix(zs_metrics['confusion_matrix'], label_space, config.output_dir, "zero_shot")
     
-    if config.run_lime:
-        run_lime(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
+    if config.run_shap:
+        run_shap(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
 
     # ==========================================
     # PHASE 2: FINE-TUNING
@@ -436,17 +424,14 @@ def run_experiment(args: argparse.Namespace) -> None:
     if args.finetune:
         print("--- Phase 2: Starting Fine-Tuning ---")
         
-        # Prepare Data for Training
         processed_dataset = _prepare_dataset(dataset, config, tokenizer, formatter)
         
-        # Config LoRA
         if config.load_in_4bit: model = prepare_model_for_kbit_training(model)
         peft_config = LoraConfig(r=config.lora_r, lora_alpha=config.lora_alpha, task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"])
         model.config.use_cache = False
         peft_model = get_peft_model(model, peft_config)
         peft_model.print_trainable_parameters()
         
-        # Train
         trainer = Trainer(
             model=peft_model,
             train_dataset=processed_dataset[config.train_split],
@@ -464,7 +449,6 @@ def run_experiment(args: argparse.Namespace) -> None:
             data_collator=default_data_collator
         )
         
-        # Handle OOM
         try:
             trainer.train()
         except Exception as e:
@@ -472,17 +456,15 @@ def run_experiment(args: argparse.Namespace) -> None:
         
         peft_model.eval()
         
-        # Evaluate Fine-Tuned
         print("Evaluating Fine-Tuned Model...")
         ft_metrics = evaluate_model(peft_model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
         print("Fine-Tuned Metrics:", ft_metrics)
         
-        # Save Fine-Tuned Artifacts
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
         _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
         
-        if config.run_lime:
-            run_lime(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
+        if config.run_shap:
+            run_shap(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
 
     # ==========================================
     # PHASE 3: COMPARISON
@@ -496,12 +478,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--finetune", action="store_true", default=True)
-    parser.add_argument("--run-lime", action="store_true")
-    parser.add_argument("--no-run-lime", dest="run_lime", action="store_false")
-    parser.set_defaults(run_lime=True)
+    
+    # Updated args
+    parser.add_argument("--finetune", action="store_true", default=False)
+    parser.add_argument("--run-shap", action="store_true")
+    parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
+    parser.set_defaults(run_shap=True)
+    parser.add_argument("--shap-max-evals", type=int, default=100)
+    
+    parser.add_argument("--train-subset", type=int, default=4000)
+    parser.add_argument("--eval-subset", type=int, default=2000)
+    parser.add_argument("--learning-rate", type=float, default=5e-5)
+    parser.add_argument("--lora-r", type=int, default=8)
+    
     parser.add_argument("--load-in-4bit", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/experiment")
+    parser.add_argument("--output-dir", default="outputs/experiment_shap")
     parser.add_argument("--huggingface-token", default=None)
     return parser
 
