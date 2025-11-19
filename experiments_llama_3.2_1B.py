@@ -180,7 +180,7 @@ class ExperimentConfig:
     lime_num_samples: int = 512
     run_lime: bool = True
     load_in_4bit: bool = True
-    label_space: Optional[Sequence[int]] = None
+    label_space: Optional[Sequence[int]] = (0, 1)
 
 
 class PromptFormatter:
@@ -916,10 +916,9 @@ def _plot_metric_bars(
     if fine_tuned_metrics is not None:
         tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
     elif require_fine_tuned:
-        print(
-            "Fine-tuned metrics were expected but not available; rerun with --finetune to produce a side-by-side chart."
+        raise RuntimeError(
+            "Fine-tuned metrics were expected for comparison but were unavailable; rerun with --finetune enabled."
         )
-        return
     else:
         print("Fine-tuned metrics were not provided; plotting zero-shot scores only.")
 
@@ -1274,7 +1273,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--label-space",
         nargs="*",
         type=int,
-        help="Explicit list of label ids to model (defaults to inferring from the dataset)",
+        default=[0, 1],
+        help="Explicit list of label ids to model (defaults to binary sentiment {0,1} unless overridden)",
     )
     parser.add_argument("--train-subset", type=int, default=5000)
     parser.add_argument("--eval-subset", type=int, default=2000)
