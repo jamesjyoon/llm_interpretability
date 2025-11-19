@@ -479,7 +479,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
-    parser.add_argument("--finetune", action="store_true")
+    parser.add_argument("--finetune", action="store_true", default=True)
     parser.add_argument("--run-lime", action="store_true")
     parser.add_argument("--no-run-lime", dest="run_lime", action="store_false")
     parser.set_defaults(run_lime=True)
