@@ -966,7 +966,7 @@ def _plot_metric_bars(
 
 def _plot_confusion_matrix(
     confusion: np.ndarray, labels: Sequence[int], output_dir: str, prefix: str
-) -> None:
+) -> str:
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError:  # pragma: no cover - optional dependency in Colab
@@ -1006,7 +1006,9 @@ def _plot_confusion_matrix(
     output_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.png")
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
-    print(f"Saved confusion matrix visualization to {os.path.abspath(output_path)}.")
+    absolute_path = os.path.abspath(output_path)
+    print(f"Saved confusion matrix visualization to {absolute_path}.")
+    return absolute_path
 
 
 def _plot_lime_explanations(
@@ -1185,9 +1187,18 @@ def run_experiment(args: argparse.Namespace) -> None:
         _plot_confusion_matrix(
             np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
         )
+    else:
+        print("Zero-shot confusion matrix unavailable; skipping visualization.")
+    if args.finetune and not fine_tuned_metrics:
+        raise RuntimeError("Fine-tuned metrics are required to plot comparisons but were missing.")
     if fine_tuned_metrics and fine_tuned_metrics.get("confusion_matrix"):
-        _plot_confusion_matrix(
+        fine_tuned_confusion_path = _plot_confusion_matrix(
             np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
+        )
+        print(f"Saved fine-tuned confusion matrix visualization to {fine_tuned_confusion_path}.")
+    elif args.finetune:
+        raise RuntimeError(
+            "Fine-tuned confusion matrix was not generated; ensure evaluation produced predictions."
         )
 
     interpretability_summary: Optional[Dict[str, object]] = None
@@ -1227,9 +1238,15 @@ def run_experiment(args: argparse.Namespace) -> None:
                     output_prefix="fine_tuned",
                 )
                 if tuned_summary:
+                    tuned_lime = tuned_summary.get("lime", {})
+                    tuned_plot = tuned_lime.get("plot_path") if isinstance(tuned_lime, dict) else None
+                    if tuned_plot:
+                        print(f"Saved fine-tuned LIME visualization to {tuned_plot}.")
                     if interpretability_summary is None:
                         interpretability_summary = {}
                     interpretability_summary["fine_tuned"] = tuned_summary
+                elif args.finetune:
+                    raise RuntimeError("Fine-tuned LIME explanations were expected but missing.")
         else:
             print("No samples available for interpretability analysis; skipping LIME generation.")
 
