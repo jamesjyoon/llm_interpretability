@@ -180,7 +180,7 @@ class ExperimentConfig:
     lime_num_samples: int = 512
     run_lime: bool = True
     load_in_4bit: bool = True
-    label_space: Optional[Sequence[int]] = (0, 1)
+    label_space: Optional[Sequence[int]] = None
 
 
 class PromptFormatter:
@@ -891,8 +891,6 @@ def _plot_metric_bars(
     zero_shot_metrics: Dict[str, float],
     fine_tuned_metrics: Optional[Dict[str, float]],
     output_dir: str,
-    *,
-    require_fine_tuned: bool = False,
 ) -> None:
     """Visualize classification metrics and save the figure.
 
@@ -915,10 +913,6 @@ def _plot_metric_bars(
     tuned_values: Optional[List[float]] = None
     if fine_tuned_metrics is not None:
         tuned_values = [fine_tuned_metrics.get(metric, float("nan")) for metric in metrics]
-    elif require_fine_tuned:
-        raise RuntimeError(
-            "Fine-tuned metrics were expected for comparison but were unavailable; rerun with --finetune enabled."
-        )
     else:
         print("Fine-tuned metrics were not provided; plotting zero-shot scores only.")
 
@@ -965,7 +959,7 @@ def _plot_metric_bars(
 
 def _plot_confusion_matrix(
     confusion: np.ndarray, labels: Sequence[int], output_dir: str, prefix: str
-) -> str:
+) -> None:
     try:
         import matplotlib.pyplot as plt  # type: ignore
     except ImportError:  # pragma: no cover - optional dependency in Colab
@@ -1005,9 +999,7 @@ def _plot_confusion_matrix(
     output_path = os.path.join(output_dir, f"{prefix}_confusion_matrix.png")
     fig.savefig(output_path, dpi=200)
     plt.close(fig)
-    absolute_path = os.path.abspath(output_path)
-    print(f"Saved confusion matrix visualization to {absolute_path}.")
-    return absolute_path
+    print(f"Saved confusion matrix visualization to {os.path.abspath(output_path)}.")
 
 
 def _plot_lime_explanations(
@@ -1175,29 +1167,15 @@ def run_experiment(args: argparse.Namespace) -> None:
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w", encoding="utf-8") as handle:
         json.dump(_ensure_json_serializable(zero_shot_metrics), handle, indent=2)
 
-    _plot_metric_bars(
-        zero_shot_metrics,
-        fine_tuned_metrics,
-        config.output_dir,
-        require_fine_tuned=args.finetune,
-    )
+    _plot_metric_bars(zero_shot_metrics, fine_tuned_metrics, config.output_dir)
     label_order = list(sorted(label_token_map))
     if zero_shot_metrics.get("confusion_matrix"):
         _plot_confusion_matrix(
             np.array(zero_shot_metrics["confusion_matrix"]), label_order, config.output_dir, "zero_shot"
         )
-    else:
-        print("Zero-shot confusion matrix unavailable; skipping visualization.")
-    if args.finetune and not fine_tuned_metrics:
-        raise RuntimeError("Fine-tuned metrics are required to plot comparisons but were missing.")
     if fine_tuned_metrics and fine_tuned_metrics.get("confusion_matrix"):
-        fine_tuned_confusion_path = _plot_confusion_matrix(
+        _plot_confusion_matrix(
             np.array(fine_tuned_metrics["confusion_matrix"]), label_order, config.output_dir, "fine_tuned"
-        )
-        print(f"Saved fine-tuned confusion matrix visualization to {fine_tuned_confusion_path}.")
-    elif args.finetune:
-        raise RuntimeError(
-            "Fine-tuned confusion matrix was not generated; ensure evaluation produced predictions."
         )
 
     interpretability_summary: Optional[Dict[str, object]] = None
@@ -1237,15 +1215,9 @@ def run_experiment(args: argparse.Namespace) -> None:
                     output_prefix="fine_tuned",
                 )
                 if tuned_summary:
-                    tuned_lime = tuned_summary.get("lime", {})
-                    tuned_plot = tuned_lime.get("plot_path") if isinstance(tuned_lime, dict) else None
-                    if tuned_plot:
-                        print(f"Saved fine-tuned LIME visualization to {tuned_plot}.")
                     if interpretability_summary is None:
                         interpretability_summary = {}
                     interpretability_summary["fine_tuned"] = tuned_summary
-                elif args.finetune:
-                    raise RuntimeError("Fine-tuned LIME explanations were expected but missing.")
         else:
             print("No samples available for interpretability analysis; skipping LIME generation.")
 
@@ -1273,8 +1245,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--label-space",
         nargs="*",
         type=int,
-        default=[0, 1],
-        help="Explicit list of label ids to model (defaults to binary sentiment {0,1} unless overridden)",
+        help="Explicit list of label ids to model (defaults to inferring from the dataset)",
     )
     parser.add_argument("--train-subset", type=int, default=5000)
     parser.add_argument("--eval-subset", type=int, default=2000)
