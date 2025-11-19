@@ -97,14 +97,14 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 800
-    eval_subset: Optional[int] = 200
+    train_subset: Optional[int] = 4000
+    eval_subset: Optional[int] = 2000
     random_seed: int = 42
-    learning_rate: float = 2e-4
+    learning_rate: float = 5e-5
     num_train_epochs: float = 2.0
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
-    lora_r: int = 16
+    lora_r: int = 8
     lora_alpha: int = 32
     lora_dropout: float = 0.1
     max_seq_length: int = 516
@@ -143,6 +143,23 @@ def _prepare_dataset(dataset: DatasetDict, config: ExperimentConfig, tokenizer, 
             if seq_len > 0:
                 masked[seq_len - 1] = input_ids[seq_len - 1]
             labels.append(masked)
+
+        # --- DEBUG START ---
+        print(f"\n[DEBUG] Checking first example label...")
+        # Get the token ID that we set as the target
+        target_idx = int(sum(model_inputs["attention_mask"][0])) - 1
+        target_id = labels[0][target_idx]
+        decoded_target = tokenizer.decode([target_id])
+        
+        print(f"[DEBUG] Target Token ID: {target_id}")
+        print(f"[DEBUG] Decoded Target: '{decoded_target}'")
+        
+        if target_id == tokenizer.eos_token_id:
+            print("[CRITICAL WARNING] You are training on the EOS token! The model will fail.")
+        else:
+            print("[DEBUG] Label looks correct (it is not EOS).")
+        # --- DEBUG END ---
+        
         model_inputs["labels"] = labels
         return model_inputs
 
