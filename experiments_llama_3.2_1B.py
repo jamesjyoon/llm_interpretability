@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models.
-Fixed: Uses spacy.blank('en') to avoid internet download errors on cluster.
+Updated to use OCCLUSION (Leave-One-Out) for interpretability.
 """
 
 import argparse
@@ -16,13 +16,7 @@ import torch
 from datasets import DatasetDict, load_dataset
 from sklearn.metrics import matthews_corrcoef
 
-# --- Import ALIBI and SPACY ---
-try:
-    from alibi.explainers import AnchorText
-    import spacy # Required for tokenization in Anchors
-except ImportError as exc:
-    raise SystemExit("The `alibi` and `spacy` packages are required. Install via `pip install alibi spacy`.") from exc
-
+# --- Visualization Imports ---
 try:
     import matplotlib.pyplot as plt
 except ImportError:
@@ -97,9 +91,10 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 4000
-    eval_subset: Optional[int] = 2000
-    random_seed: int = 42
+    
+    # Hyperparameters optimized for Llama-1B fine-tuning
+    train_subset: Optional[int] = 4000 
+    eval_subset: Optional[int] = 2000 
     learning_rate: float = 5e-5
     num_train_epochs: float = 2.0
     per_device_train_batch_size: int = 4
@@ -107,16 +102,17 @@ class ExperimentConfig:
     lora_r: int = 8
     lora_alpha: int = 32
     lora_dropout: float = 0.1
+    
     max_seq_length: int = 516
-    output_dir: str = "outputs/experiment_anchors"
+    output_dir: str = "outputs/experiment_occlusion"
     
     # Interpretability
     interpretability_example_count: int = 3 
-    run_anchors: bool = True
-    anchor_threshold: float = 0.95
+    run_occlusion: bool = True
     
     load_in_4bit: bool = True
     finetune: bool = True
+    random_seed: int = 42
     label_space: Optional[Sequence[int]] = (0, 1)
 
 class PromptFormatter:
@@ -177,7 +173,7 @@ def _filter_dataset(dataset: DatasetDict, config: ExperimentConfig, label_space:
     allowed = set(label_space)
     return dataset.filter(lambda x: int(x[config.label_field]) in allowed)
 
-# --- Core Evaluation & Anchor Functions ---
+# --- Core Evaluation & Occlusion Functions ---
 
 def _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter):
     """Returns a function that takes raw texts and returns probabilities."""
@@ -231,90 +227,104 @@ def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max
         "confusion_matrix": cm.tolist()
     }
 
-def run_anchors(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
-    """Runs Anchors with a blank SpaCy model to avoid download issues."""
-    print(f"Running Anchors for {prefix}...")
-    
-    # 1. Define Predictor (must return class IDs)
-    prob_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
-    predict_fn = lambda x: np.argmax(prob_fn(x), axis=1)
-    
+def run_occlusion(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
+    """
+    Runs Occlusion (Leave-One-Out) analysis.
+    Iteratively removes one word and measures confidence drop.
+    """
+    print(f"Running Occlusion for {prefix}...")
+    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
     class_names = [str(l) for l in sorted(label_token_map.keys())]
-    
-    # 2. Initialize SpaCy (The Fix: Use blank 'en' model)
-    try:
-        nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        print("SpaCy 'en_core_web_sm' not found. Using blank 'en' model (no download required).")
-        nlp = spacy.blank("en")
-
-    # 3. Initialize Explainer
-    # We pass the `nlp` object explicitly so Alibi doesn't try to download one.
-    explainer = AnchorText(predictor=predict_fn, sampling_strategy='unknown', nlp=nlp)
     
     samples = texts[:config.interpretability_example_count]
     results = []
     
-    for i, text in enumerate(samples):
-        print(f"Explaining example {i+1}/{len(samples)}...")
-        try:
-            explanation = explainer.explain(text, threshold=config.anchor_threshold)
+    for idx, text in enumerate(samples):
+        print(f"Analyzing example {idx+1}/{len(samples)}...")
+        
+        # 1. Get Baseline
+        base_probs = predict_fn([text])[0]
+        base_pred_idx = np.argmax(base_probs)
+        base_conf = base_probs[base_pred_idx]
+        predicted_label = class_names[base_pred_idx]
+        
+        # 2. Tokenize (Word-level split for better interpretability than BPE tokens)
+        words = text.split()
+        impact_scores = []
+        
+        # 3. Iterate
+        for i in range(len(words)):
+            # Create perturbed text (remove word i)
+            new_text = " ".join(words[:i] + words[i+1:])
             
-            pred_idx = predict_fn([text])[0]
-            pred_label = class_names[pred_idx]
+            # Predict
+            new_probs = predict_fn([new_text])[0]
             
-            results.append({
-                "text": text,
-                "predicted_label": pred_label,
-                "anchor_words": explanation.anchor,
-                "precision": explanation.precision,
-                "coverage": explanation.coverage
-            })
-        except Exception as e:
-            print(f"Error explaining example {i}: {e}")
+            # We look at the confidence of the ORIGINAL predicted class
+            new_conf = new_probs[base_pred_idx]
+            
+            # Score = How much did confidence DROP?
+            # > 0: The word helped (Removing it lowered confidence) -> Important
+            # < 0: The word hurt (Removing it raised confidence) -> Distractor
+            impact = base_conf - new_conf
+            impact_scores.append((words[i], float(impact)))
+            
+        results.append({
+            "text": text,
+            "predicted_label": predicted_label,
+            "base_confidence": float(base_conf),
+            "token_weights": impact_scores
+        })
 
     # Save JSON
-    with open(os.path.join(config.output_dir, f"{prefix}_anchors.json"), "w") as f:
+    with open(os.path.join(config.output_dir, f"{prefix}_occlusion.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # Generate Plots
-    _plot_anchors_text(results, config.output_dir, prefix)
+    # Plot
+    _plot_occlusion(results, config.output_dir, prefix)
     
     return results
 
 # --- Plotting Functions ---
 
-def _plot_anchors_text(anchor_results, output_dir, prefix):
+def _plot_occlusion(occlusion_results, output_dir, prefix):
     if not plt: return
 
-    for i, res in enumerate(anchor_results):
-        text = res['text']
-        anchors = res['anchor_words']
-        pred_label = res['predicted_label']
-        precision = res['precision']
+    for i, res in enumerate(occlusion_results):
+        weights = res['token_weights']
+        if not weights: continue
         
-        fig, ax = plt.subplots(figsize=(10, 4))
-        ax.axis('off')
+        words, impacts = zip(*weights)
         
-        ax.text(0.5, 0.9, f"{prefix} Example {i+1} (Pred: {pred_label})", 
-                ha='center', fontsize=14, weight='bold')
+        # Sort by impact for cleaner visualization (Top 15)
+        indices = np.argsort(np.abs(impacts))
+        if len(indices) > 15:
+            indices = indices[-15:]
         
-        # Simple text wrap for display
-        wrapped_text = "\n".join([text[j:j+80] for j in range(0, len(text), 80)])
-        ax.text(0.5, 0.6, f"ORIGINAL TEXT:\n{wrapped_text}", 
-                ha='center', va='center', fontsize=10, style='italic')
+        sorted_words = [words[j] for j in indices]
+        sorted_impacts = [impacts[j] for j in indices]
         
-        anchor_str = ", ".join([f"'{w}'" for w in anchors])
-        ax.text(0.5, 0.3, f"ANCHOR RULE (Precision: {precision:.2f}):\nIF words [{anchor_str}] present\nTHEN Pred = {pred_label}", 
-                ha='center', va='center', fontsize=12, color='darkred', weight='bold',
-                bbox=dict(boxstyle="round,pad=0.5", fc="mistyrose", ec="red", lw=2))
-
+        fig, ax = plt.subplots(figsize=(8, 6))
+        y_pos = np.arange(len(sorted_words))
+        
+        # Color: Red if Positive Impact (Important), Blue if Negative (Distracting)
+        colors = ['#d62728' if x > 0 else '#1f77b4' for x in sorted_impacts]
+        
+        ax.barh(y_pos, sorted_impacts, color=colors)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(sorted_words)
+        ax.set_xlabel("Confidence Drop (Impact)")
+        ax.set_title(f"{prefix} Example {i+1}: Pred '{res['predicted_label']}'")
+        
+        # Add a grid
+        ax.grid(axis='x', linestyle='--', alpha=0.6)
+        
         plt.tight_layout()
-        path = os.path.join(output_dir, f"{prefix}_anchor_plot_ex{i}.png")
+        path = os.path.join(output_dir, f"{prefix}_occlusion_plot_ex{i}.png")
         plt.savefig(path)
         plt.close()
-
-    print(f"Saved Anchor visual rules to {output_dir}")
+    
+    print(f"Saved Occlusion plots to {output_dir}")
 
 def _plot_confusion_matrix(cm, labels, output_dir, prefix):
     if not plt: return
@@ -378,7 +388,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     
     config = ExperimentConfig(
         model_name=args.model_name, output_dir=args.output_dir,
-        load_in_4bit=args.load_in_4bit, run_anchors=args.run_anchors,
+        load_in_4bit=args.load_in_4bit, run_occlusion=args.run_occlusion,
         finetune=args.finetune,
         train_subset=args.train_subset,
         eval_subset=args.eval_subset,
@@ -390,6 +400,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+    # 1. Load Tokenizer & Data
     print("Loading tokenizer and data...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
     if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
@@ -401,6 +412,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
     
+    # 2. Load BASE Model
     print("Loading Base Model...")
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name, 
@@ -409,6 +421,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
     if not config.load_in_4bit: model.to(device)
 
+    # 3. Prepare Evaluation Data
     eval_texts, eval_labels = _prepare_texts_labels(config, dataset)
 
     # ==========================================
@@ -421,8 +434,8 @@ def run_experiment(args: argparse.Namespace) -> None:
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
     _plot_confusion_matrix(zs_metrics['confusion_matrix'], label_space, config.output_dir, "zero_shot")
     
-    if config.run_anchors:
-        run_anchors(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
+    if config.run_occlusion:
+        run_occlusion(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
 
     # ==========================================
     # PHASE 2: FINE-TUNING
@@ -470,8 +483,8 @@ def run_experiment(args: argparse.Namespace) -> None:
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
         _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
         
-        if config.run_anchors:
-            run_anchors(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
+        if config.run_occlusion:
+            run_occlusion(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
 
     # ==========================================
     # PHASE 3: COMPARISON
@@ -486,11 +499,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     
+    # Updated args
     parser.add_argument("--finetune", action="store_true", default=True) 
     
-    parser.add_argument("--run-anchors", action="store_true")
-    parser.add_argument("--no-run-anchors", dest="run_anchors", action="store_false")
-    parser.set_defaults(run_anchors=True)
+    parser.add_argument("--run-occlusion", action="store_true")
+    parser.add_argument("--no-run-occlusion", dest="run_occlusion", action="store_false")
+    parser.set_defaults(run_occlusion=True)
     
     parser.add_argument("--train-subset", type=int, default=4000)
     parser.add_argument("--eval-subset", type=int, default=2000)
@@ -498,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-r", type=int, default=8)
     
     parser.add_argument("--load-in-4bit", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/experiment_anchors")
+    parser.add_argument("--output-dir", default="outputs/experiment_occlusion")
     parser.add_argument("--huggingface-token", default=None)
     return parser
 
