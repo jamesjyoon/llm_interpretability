@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-__doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models on binary classification datasets.
-Updated to use ANCHORS (Alibi) for interpretability.
+__doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models.
+Fixed: Uses spacy.blank('en') to avoid internet download errors on cluster.
 """
 
 import argparse
@@ -16,15 +16,15 @@ import torch
 from datasets import DatasetDict, load_dataset
 from sklearn.metrics import matthews_corrcoef
 
-# --- Import ALIBI (Anchors) instead of SHAP ---
+# --- Import ALIBI and SPACY ---
 try:
     from alibi.explainers import AnchorText
+    import spacy # Required for tokenization in Anchors
 except ImportError as exc:
-    raise SystemExit("The `alibi` package is required. Install it via `pip install alibi`.") from exc
+    raise SystemExit("The `alibi` and `spacy` packages are required. Install via `pip install alibi spacy`.") from exc
 
 try:
     import matplotlib.pyplot as plt
-    import matplotlib.patches as patches
 except ImportError:
     plt = None
 
@@ -232,47 +232,52 @@ def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max
     }
 
 def run_anchors(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
-    """Runs Anchors and generates text visualizations."""
+    """Runs Anchors with a blank SpaCy model to avoid download issues."""
     print(f"Running Anchors for {prefix}...")
     
-    # 1. Anchors requires a predictor that returns CLASSES (ints), not probabilities
+    # 1. Define Predictor (must return class IDs)
     prob_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
     predict_fn = lambda x: np.argmax(prob_fn(x), axis=1)
     
     class_names = [str(l) for l in sorted(label_token_map.keys())]
     
-    # 2. Initialize Explainer
-    # sampling_strategy='unknown' replaces words with UNK to find invariance.
-    # This avoids downloading heavy Spacy models if they aren't available.
-    explainer = AnchorText(predictor=predict_fn, sampling_strategy='unknown')
+    # 2. Initialize SpaCy (The Fix: Use blank 'en' model)
+    try:
+        nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        print("SpaCy 'en_core_web_sm' not found. Using blank 'en' model (no download required).")
+        nlp = spacy.blank("en")
+
+    # 3. Initialize Explainer
+    # We pass the `nlp` object explicitly so Alibi doesn't try to download one.
+    explainer = AnchorText(predictor=predict_fn, sampling_strategy='unknown', nlp=nlp)
     
-    # Limit samples
     samples = texts[:config.interpretability_example_count]
-    
     results = []
     
     for i, text in enumerate(samples):
-        # Generate Anchor
         print(f"Explaining example {i+1}/{len(samples)}...")
-        explanation = explainer.explain(text, threshold=config.anchor_threshold)
-        
-        # Get predictions
-        pred_idx = predict_fn([text])[0]
-        pred_label = class_names[pred_idx]
-        
-        results.append({
-            "text": text,
-            "predicted_label": pred_label,
-            "anchor_words": explanation.anchor,
-            "precision": explanation.precision,
-            "coverage": explanation.coverage
-        })
+        try:
+            explanation = explainer.explain(text, threshold=config.anchor_threshold)
+            
+            pred_idx = predict_fn([text])[0]
+            pred_label = class_names[pred_idx]
+            
+            results.append({
+                "text": text,
+                "predicted_label": pred_label,
+                "anchor_words": explanation.anchor,
+                "precision": explanation.precision,
+                "coverage": explanation.coverage
+            })
+        except Exception as e:
+            print(f"Error explaining example {i}: {e}")
 
     # Save JSON
     with open(os.path.join(config.output_dir, f"{prefix}_anchors.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    # Generate Plots (Text Highlight)
+    # Generate Plots
     _plot_anchors_text(results, config.output_dir, prefix)
     
     return results
@@ -280,9 +285,6 @@ def run_anchors(model, tokenizer, texts, label_token_map, device, config, format
 # --- Plotting Functions ---
 
 def _plot_anchors_text(anchor_results, output_dir, prefix):
-    """
-    Generates an image showing the original text with Anchor words highlighted.
-    """
     if not plt: return
 
     for i, res in enumerate(anchor_results):
@@ -291,61 +293,19 @@ def _plot_anchors_text(anchor_results, output_dir, prefix):
         pred_label = res['predicted_label']
         precision = res['precision']
         
-        # Create figure
-        fig, ax = plt.subplots(figsize=(12, 2))
-        ax.axis('off')
-        
-        # Simple text splitting (aligned with basic tokenization for visualization)
-        words = text.split()
-        
-        # Starting coordinates
-        x_pos = 0.0
-        y_pos = 0.5
-        
-        # Render text
-        # Note: This is a naive rendering. Matplotlib doesn't handle automatic wrapping well
-        # for word-by-word coloring without complex logic.
-        # We will construct a single string but use different colors? No, we must draw word by word.
-        
-        for word in words:
-            # Check if this word is part of the anchor
-            # Clean punctuation for matching
-            clean_word = word.strip(".,!?\"'")
-            is_anchor = any(a in clean_word for a in anchors) if anchors else False
-            
-            color = "red" if is_anchor else "black"
-            weight = "bold" if is_anchor else "normal"
-            bbox = dict(facecolor='yellow', alpha=0.3) if is_anchor else None
-            
-            t = ax.text(x_pos, y_pos, word + " ", color=color, weight=weight, 
-                        transform=ax.transAxes, fontsize=12, bbox=bbox)
-            
-            # Estimate width increase (very rough approximation)
-            # In a real app, we'd use a renderer to calculate width.
-            # Here we simply assume monospaced roughly or rely on small sentence length.
-            # To avoid overlap issues in matplotlib, we simply print the rule below the text instead.
-            pass
-            
-        # ALTERNATIVE VISUALIZATION:
-        # Since calculating word positions dynamically in matplotlib is error-prone:
-        # We will plot the Full Text at the top, and the "Anchor Rule" clearly below it.
-        plt.close(fig)
-        
         fig, ax = plt.subplots(figsize=(10, 4))
         ax.axis('off')
         
-        # Title
         ax.text(0.5, 0.9, f"{prefix} Example {i+1} (Pred: {pred_label})", 
                 ha='center', fontsize=14, weight='bold')
         
-        # Full Text
-        wrapped_text = "\n".join([text[i:i+80] for i in range(0, len(text), 80)]) # Simple wrap
+        # Simple text wrap for display
+        wrapped_text = "\n".join([text[j:j+80] for j in range(0, len(text), 80)])
         ax.text(0.5, 0.6, f"ORIGINAL TEXT:\n{wrapped_text}", 
                 ha='center', va='center', fontsize=10, style='italic')
         
-        # Anchor Rule
         anchor_str = ", ".join([f"'{w}'" for w in anchors])
-        ax.text(0.5, 0.3, f"ANCHOR RULE (Precision: {precision:.2f}):\nIF words [{anchor_str}] represent\nTHEN Pred = {pred_label}", 
+        ax.text(0.5, 0.3, f"ANCHOR RULE (Precision: {precision:.2f}):\nIF words [{anchor_str}] present\nTHEN Pred = {pred_label}", 
                 ha='center', va='center', fontsize=12, color='darkred', weight='bold',
                 bbox=dict(boxstyle="round,pad=0.5", fc="mistyrose", ec="red", lw=2))
 
@@ -430,7 +390,6 @@ def run_experiment(args: argparse.Namespace) -> None:
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Load Tokenizer & Data
     print("Loading tokenizer and data...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
     if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
@@ -442,7 +401,6 @@ def run_experiment(args: argparse.Namespace) -> None:
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
     
-    # 2. Load BASE Model
     print("Loading Base Model...")
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name, 
@@ -451,7 +409,6 @@ def run_experiment(args: argparse.Namespace) -> None:
     )
     if not config.load_in_4bit: model.to(device)
 
-    # 3. Prepare Evaluation Data
     eval_texts, eval_labels = _prepare_texts_labels(config, dataset)
 
     # ==========================================
@@ -529,7 +486,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     
-    # Updated args
     parser.add_argument("--finetune", action="store_true", default=True) 
     
     parser.add_argument("--run-anchors", action="store_true")
