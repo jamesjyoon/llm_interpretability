@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models on binary classification datasets.
-Fixed: Custom SHAP plotting to avoid 'partition tree' errors, and enabled finetuning by default.
+Updated to use ANCHORS (Alibi) for interpretability.
 """
 
 import argparse
@@ -16,14 +16,15 @@ import torch
 from datasets import DatasetDict, load_dataset
 from sklearn.metrics import matthews_corrcoef
 
-# --- Import SHAP instead of LIME ---
+# --- Import ALIBI (Anchors) instead of SHAP ---
 try:
-    import shap
+    from alibi.explainers import AnchorText
 except ImportError as exc:
-    raise SystemExit("The `shap` package is required. Install it via `pip install shap`.") from exc
+    raise SystemExit("The `alibi` package is required. Install it via `pip install alibi`.") from exc
 
 try:
     import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
 except ImportError:
     plt = None
 
@@ -96,8 +97,8 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 800
-    eval_subset: Optional[int] = 200
+    train_subset: Optional[int] = 4000
+    eval_subset: Optional[int] = 2000
     random_seed: int = 42
     learning_rate: float = 5e-5
     num_train_epochs: float = 2.0
@@ -107,15 +108,15 @@ class ExperimentConfig:
     lora_alpha: int = 32
     lora_dropout: float = 0.1
     max_seq_length: int = 516
-    output_dir: str = "outputs/experiment_shap"
+    output_dir: str = "outputs/experiment_anchors"
     
     # Interpretability
     interpretability_example_count: int = 3 
-    shap_max_evals: int = 100
-    run_shap: bool = True
+    run_anchors: bool = True
+    anchor_threshold: float = 0.95
     
     load_in_4bit: bool = True
-    finetune: bool = True # Changed default to True
+    finetune: bool = True
     label_space: Optional[Sequence[int]] = (0, 1)
 
 class PromptFormatter:
@@ -176,10 +177,10 @@ def _filter_dataset(dataset: DatasetDict, config: ExperimentConfig, label_space:
     allowed = set(label_space)
     return dataset.filter(lambda x: int(x[config.label_field]) in allowed)
 
-# --- Core Evaluation & SHAP Functions ---
+# --- Core Evaluation & Anchor Functions ---
 
 def _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter):
-    """Returns a function that takes raw texts and returns probabilities for SHAP."""
+    """Returns a function that takes raw texts and returns probabilities."""
     def _predict(texts: Sequence[str]) -> np.ndarray:
         texts = [str(t) for t in texts]
         prompts = [formatter.build_prompt(t) for t in texts]
@@ -230,95 +231,130 @@ def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max
         "confusion_matrix": cm.tolist()
     }
 
-def run_shap(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
-    """Runs SHAP and saves plots."""
-    print(f"Running SHAP for {prefix}...")
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
+def run_anchors(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
+    """Runs Anchors and generates text visualizations."""
+    print(f"Running Anchors for {prefix}...")
+    
+    # 1. Anchors requires a predictor that returns CLASSES (ints), not probabilities
+    prob_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
+    predict_fn = lambda x: np.argmax(prob_fn(x), axis=1)
+    
     class_names = [str(l) for l in sorted(label_token_map.keys())]
     
-    masker = shap.maskers.Text(tokenizer)
-    explainer = shap.Explainer(predict_fn, masker, output_names=class_names)
+    # 2. Initialize Explainer
+    # sampling_strategy='unknown' replaces words with UNK to find invariance.
+    # This avoids downloading heavy Spacy models if they aren't available.
+    explainer = AnchorText(predictor=predict_fn, sampling_strategy='unknown')
     
+    # Limit samples
     samples = texts[:config.interpretability_example_count]
     
-    # Calculate SHAP values
-    shap_values = explainer(samples, max_evals=config.shap_max_evals)
+    results = []
     
-    json_output = []
     for i, text in enumerate(samples):
-        probs = predict_fn([text])[0]
-        pred_idx = np.argmax(probs)
+        # Generate Anchor
+        print(f"Explaining example {i+1}/{len(samples)}...")
+        explanation = explainer.explain(text, threshold=config.anchor_threshold)
         
-        # Extract weights for the predicted class
-        vals = shap_values[i].values
-        if len(vals.shape) > 1:
-            vals = vals[:, pred_idx]
-            
-        tokens = shap_values[i].data
-        # Some maskers return bytes or arrays, ensure strings
-        if isinstance(tokens, np.ndarray): tokens = tokens.tolist()
-        tokens = [str(t) for t in tokens]
+        # Get predictions
+        pred_idx = predict_fn([text])[0]
+        pred_label = class_names[pred_idx]
         
-        json_output.append({
+        results.append({
             "text": text,
-            "predicted_label": class_names[pred_idx],
-            "confidence": float(probs[pred_idx]),
-            "token_weights": list(zip(tokens, vals.tolist()))
+            "predicted_label": pred_label,
+            "anchor_words": explanation.anchor,
+            "precision": explanation.precision,
+            "coverage": explanation.coverage
         })
 
-    with open(os.path.join(config.output_dir, f"{prefix}_shap.json"), "w") as f:
-        json.dump(json_output, f, indent=2)
+    # Save JSON
+    with open(os.path.join(config.output_dir, f"{prefix}_anchors.json"), "w") as f:
+        json.dump(results, f, indent=2)
 
-    # Generate Plots manually using the extracted JSON data
-    _plot_shap_manual(json_output, config.output_dir, prefix)
+    # Generate Plots (Text Highlight)
+    _plot_anchors_text(results, config.output_dir, prefix)
     
-    return shap_values
+    return results
 
 # --- Plotting Functions ---
 
-def _plot_shap_manual(shap_data, output_dir, prefix):
+def _plot_anchors_text(anchor_results, output_dir, prefix):
     """
-    Manually plots SHAP values using matplotlib to avoid shap.plots.bar errors.
-    shap_data: List of dicts containing 'token_weights' (list of [token, weight])
+    Generates an image showing the original text with Anchor words highlighted.
     """
     if not plt: return
 
-    for i, example in enumerate(shap_data):
-        weights = example['token_weights']
-        if not weights: continue
+    for i, res in enumerate(anchor_results):
+        text = res['text']
+        anchors = res['anchor_words']
+        pred_label = res['predicted_label']
+        precision = res['precision']
         
-        # Unzip
-        tokens, vals = zip(*weights)
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 2))
+        ax.axis('off')
         
-        # Convert to numpy for easier handling
-        vals = np.array(vals)
-        tokens = np.array(tokens)
+        # Simple text splitting (aligned with basic tokenization for visualization)
+        words = text.split()
         
-        # Sort by absolute value to show most important features, limit to top 15
-        indices = np.argsort(np.abs(vals))
-        if len(indices) > 15:
-            indices = indices[-15:]
+        # Starting coordinates
+        x_pos = 0.0
+        y_pos = 0.5
+        
+        # Render text
+        # Note: This is a naive rendering. Matplotlib doesn't handle automatic wrapping well
+        # for word-by-word coloring without complex logic.
+        # We will construct a single string but use different colors? No, we must draw word by word.
+        
+        for word in words:
+            # Check if this word is part of the anchor
+            # Clean punctuation for matching
+            clean_word = word.strip(".,!?\"'")
+            is_anchor = any(a in clean_word for a in anchors) if anchors else False
             
-        sorted_vals = vals[indices]
-        sorted_tokens = tokens[indices]
+            color = "red" if is_anchor else "black"
+            weight = "bold" if is_anchor else "normal"
+            bbox = dict(facecolor='yellow', alpha=0.3) if is_anchor else None
+            
+            t = ax.text(x_pos, y_pos, word + " ", color=color, weight=weight, 
+                        transform=ax.transAxes, fontsize=12, bbox=bbox)
+            
+            # Estimate width increase (very rough approximation)
+            # In a real app, we'd use a renderer to calculate width.
+            # Here we simply assume monospaced roughly or rely on small sentence length.
+            # To avoid overlap issues in matplotlib, we simply print the rule below the text instead.
+            pass
+            
+        # ALTERNATIVE VISUALIZATION:
+        # Since calculating word positions dynamically in matplotlib is error-prone:
+        # We will plot the Full Text at the top, and the "Anchor Rule" clearly below it.
+        plt.close(fig)
         
-        # Plot
-        fig, ax = plt.subplots(figsize=(8, 6))
-        y_pos = np.arange(len(sorted_tokens))
-        colors = ['#ff0051' if x > 0 else '#008bfb' for x in sorted_vals] # SHAP standard colors (Red=Positive, Blue=Negative)
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.axis('off')
         
-        ax.barh(y_pos, sorted_vals, color=colors)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(sorted_tokens)
-        ax.set_xlabel("SHAP Value (Impact on model output)")
-        ax.set_title(f"{prefix} Example {i+1}: Pred {example['predicted_label']}")
+        # Title
+        ax.text(0.5, 0.9, f"{prefix} Example {i+1} (Pred: {pred_label})", 
+                ha='center', fontsize=14, weight='bold')
         
+        # Full Text
+        wrapped_text = "\n".join([text[i:i+80] for i in range(0, len(text), 80)]) # Simple wrap
+        ax.text(0.5, 0.6, f"ORIGINAL TEXT:\n{wrapped_text}", 
+                ha='center', va='center', fontsize=10, style='italic')
+        
+        # Anchor Rule
+        anchor_str = ", ".join([f"'{w}'" for w in anchors])
+        ax.text(0.5, 0.3, f"ANCHOR RULE (Precision: {precision:.2f}):\nIF words [{anchor_str}] represent\nTHEN Pred = {pred_label}", 
+                ha='center', va='center', fontsize=12, color='darkred', weight='bold',
+                bbox=dict(boxstyle="round,pad=0.5", fc="mistyrose", ec="red", lw=2))
+
         plt.tight_layout()
-        path = os.path.join(output_dir, f"{prefix}_shap_plot_ex{i}.png")
+        path = os.path.join(output_dir, f"{prefix}_anchor_plot_ex{i}.png")
         plt.savefig(path)
         plt.close()
-        
-    print(f"Saved manual SHAP plots to {output_dir}")
+
+    print(f"Saved Anchor visual rules to {output_dir}")
 
 def _plot_confusion_matrix(cm, labels, output_dir, prefix):
     if not plt: return
@@ -382,7 +418,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     
     config = ExperimentConfig(
         model_name=args.model_name, output_dir=args.output_dir,
-        load_in_4bit=args.load_in_4bit, run_shap=args.run_shap,
+        load_in_4bit=args.load_in_4bit, run_anchors=args.run_anchors,
         finetune=args.finetune,
         train_subset=args.train_subset,
         eval_subset=args.eval_subset,
@@ -428,8 +464,8 @@ def run_experiment(args: argparse.Namespace) -> None:
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
     _plot_confusion_matrix(zs_metrics['confusion_matrix'], label_space, config.output_dir, "zero_shot")
     
-    if config.run_shap:
-        run_shap(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
+    if config.run_anchors:
+        run_anchors(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
 
     # ==========================================
     # PHASE 2: FINE-TUNING
@@ -477,8 +513,8 @@ def run_experiment(args: argparse.Namespace) -> None:
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
         _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
         
-        if config.run_shap:
-            run_shap(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
+        if config.run_anchors:
+            run_anchors(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
 
     # ==========================================
     # PHASE 3: COMPARISON
@@ -494,11 +530,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-config", default=None)
     
     # Updated args
-    parser.add_argument("--finetune", action="store_true", default=True) # DEFAULT TRUE
-    parser.add_argument("--run-shap", action="store_true")
-    parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
-    parser.set_defaults(run_shap=True)
-    parser.add_argument("--shap-max-evals", type=int, default=100)
+    parser.add_argument("--finetune", action="store_true", default=True) 
+    
+    parser.add_argument("--run-anchors", action="store_true")
+    parser.add_argument("--no-run-anchors", dest="run_anchors", action="store_false")
+    parser.set_defaults(run_anchors=True)
     
     parser.add_argument("--train-subset", type=int, default=4000)
     parser.add_argument("--eval-subset", type=int, default=2000)
@@ -506,7 +542,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lora-r", type=int, default=8)
     
     parser.add_argument("--load-in-4bit", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/experiment_shap")
+    parser.add_argument("--output-dir", default="outputs/experiment_anchors")
     parser.add_argument("--huggingface-token", default=None)
     return parser
 
