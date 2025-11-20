@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models.
-Fixed: Uses spacy.blank('en') to avoid internet download errors on cluster.
+Fixed: Added JSON serialization helper to handle numpy arrays returned by Alibi Anchors.
 """
 
 import argparse
@@ -19,7 +19,7 @@ from sklearn.metrics import matthews_corrcoef
 # --- Import ALIBI and SPACY ---
 try:
     from alibi.explainers import AnchorText
-    import spacy # Required for tokenization in Anchors
+    import spacy 
 except ImportError as exc:
     raise SystemExit("The `alibi` and `spacy` packages are required. Install via `pip install alibi spacy`.") from exc
 
@@ -54,6 +54,20 @@ HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
 # --- Helper Classes & Functions ---
 
 LabelTokenMap = Dict[int, int]
+
+def _ensure_json_serializable(value):
+    """Recursively convert numpy/tensor types to standard Python types for JSON."""
+    if isinstance(value, (np.ndarray, np.generic)):
+        return value.tolist()
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().tolist()
+    if isinstance(value, list):
+        return [_ensure_json_serializable(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_ensure_json_serializable(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _ensure_json_serializable(v) for k, v in value.items()}
+    return value
 
 class RestrictedLabelLogitsProcessor(LogitsProcessor):
     """Force generation to stay within a fixed label vocabulary."""
@@ -235,21 +249,17 @@ def run_anchors(model, tokenizer, texts, label_token_map, device, config, format
     """Runs Anchors with a blank SpaCy model to avoid download issues."""
     print(f"Running Anchors for {prefix}...")
     
-    # 1. Define Predictor (must return class IDs)
     prob_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
     predict_fn = lambda x: np.argmax(prob_fn(x), axis=1)
     
     class_names = [str(l) for l in sorted(label_token_map.keys())]
     
-    # 2. Initialize SpaCy (The Fix: Use blank 'en' model)
     try:
         nlp = spacy.load("en_core_web_sm")
     except OSError:
         print("SpaCy 'en_core_web_sm' not found. Using blank 'en' model (no download required).")
         nlp = spacy.blank("en")
 
-    # 3. Initialize Explainer
-    # We pass the `nlp` object explicitly so Alibi doesn't try to download one.
     explainer = AnchorText(predictor=predict_fn, sampling_strategy='unknown', nlp=nlp)
     
     samples = texts[:config.interpretability_example_count]
@@ -273,9 +283,9 @@ def run_anchors(model, tokenizer, texts, label_token_map, device, config, format
         except Exception as e:
             print(f"Error explaining example {i}: {e}")
 
-    # Save JSON
+    # Save JSON with cleaner
     with open(os.path.join(config.output_dir, f"{prefix}_anchors.json"), "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(_ensure_json_serializable(results), f, indent=2)
 
     # Generate Plots
     _plot_anchors_text(results, config.output_dir, prefix)
@@ -299,12 +309,14 @@ def _plot_anchors_text(anchor_results, output_dir, prefix):
         ax.text(0.5, 0.9, f"{prefix} Example {i+1} (Pred: {pred_label})", 
                 ha='center', fontsize=14, weight='bold')
         
-        # Simple text wrap for display
         wrapped_text = "\n".join([text[j:j+80] for j in range(0, len(text), 80)])
         ax.text(0.5, 0.6, f"ORIGINAL TEXT:\n{wrapped_text}", 
                 ha='center', va='center', fontsize=10, style='italic')
         
-        anchor_str = ", ".join([f"'{w}'" for w in anchors])
+        # Anchors might be numpy strings, convert for display
+        anchors_list = [str(w) for w in anchors]
+        anchor_str = ", ".join([f"'{w}'" for w in anchors_list])
+        
         ax.text(0.5, 0.3, f"ANCHOR RULE (Precision: {precision:.2f}):\nIF words [{anchor_str}] present\nTHEN Pred = {pred_label}", 
                 ha='center', va='center', fontsize=12, color='darkred', weight='bold',
                 bbox=dict(boxstyle="round,pad=0.5", fc="mistyrose", ec="red", lw=2))
@@ -418,7 +430,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     zs_metrics = evaluate_model(model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
     print("Zero-Shot Metrics:", zs_metrics)
     
-    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
+    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(_ensure_json_serializable(zs_metrics), f, indent=2)
     _plot_confusion_matrix(zs_metrics['confusion_matrix'], label_space, config.output_dir, "zero_shot")
     
     if config.run_anchors:
@@ -467,7 +479,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         ft_metrics = evaluate_model(peft_model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
         print("Fine-Tuned Metrics:", ft_metrics)
         
-        with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
+        with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(_ensure_json_serializable(ft_metrics), f, indent=2)
         _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
         
         if config.run_anchors:
@@ -486,6 +498,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
     parser.add_argument("--dataset-config", default=None)
     
+    # Updated args
     parser.add_argument("--finetune", action="store_true", default=True) 
     
     parser.add_argument("--run-anchors", action="store_true")
