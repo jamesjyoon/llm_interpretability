@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models on binary classification datasets.
-Updated to use SHAP for interpretability.
+Fixed: Custom SHAP plotting to avoid 'partition tree' errors, and enabled finetuning by default.
 """
 
 import argparse
@@ -110,12 +110,12 @@ class ExperimentConfig:
     output_dir: str = "outputs/experiment_shap"
     
     # Interpretability
-    interpretability_example_count: int = 3 # Reduced for SHAP speed
+    interpretability_example_count: int = 3 
     shap_max_evals: int = 100
     run_shap: bool = True
     
     load_in_4bit: bool = True
-    finetune: bool = False 
+    finetune: bool = True # Changed default to True
     label_space: Optional[Sequence[int]] = (0, 1)
 
 class PromptFormatter:
@@ -236,34 +236,28 @@ def run_shap(model, tokenizer, texts, label_token_map, device, config, formatter
     predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
     class_names = [str(l) for l in sorted(label_token_map.keys())]
     
-    # Setup SHAP
-    # We use a Text masker on the tokenizer, and pass the prediction function
     masker = shap.maskers.Text(tokenizer)
     explainer = shap.Explainer(predict_fn, masker, output_names=class_names)
     
-    # Limit samples
     samples = texts[:config.interpretability_example_count]
     
     # Calculate SHAP values
-    # max_evals limits the number of permutations to prevent it from taking hours
     shap_values = explainer(samples, max_evals=config.shap_max_evals)
     
-    # Save SHAP values to JSON (simplified for readability)
     json_output = []
     for i, text in enumerate(samples):
-        # shap_values[i] is an Explanation object
-        # .values is (seq_len, n_classes)
-        # .data is the tokens
         probs = predict_fn([text])[0]
         pred_idx = np.argmax(probs)
         
         # Extract weights for the predicted class
-        # Handle dimensions: (tokens, classes)
         vals = shap_values[i].values
         if len(vals.shape) > 1:
             vals = vals[:, pred_idx]
             
         tokens = shap_values[i].data
+        # Some maskers return bytes or arrays, ensure strings
+        if isinstance(tokens, np.ndarray): tokens = tokens.tolist()
+        tokens = [str(t) for t in tokens]
         
         json_output.append({
             "text": text,
@@ -275,36 +269,56 @@ def run_shap(model, tokenizer, texts, label_token_map, device, config, formatter
     with open(os.path.join(config.output_dir, f"{prefix}_shap.json"), "w") as f:
         json.dump(json_output, f, indent=2)
 
-    # Generate Plots
-    _plot_shap(shap_values, config.output_dir, prefix)
+    # Generate Plots manually using the extracted JSON data
+    _plot_shap_manual(json_output, config.output_dir, prefix)
     
     return shap_values
 
 # --- Plotting Functions ---
 
-def _plot_shap(shap_values, output_dir, prefix):
-    """Generates SHAP bar plots using shap.plots.bar"""
+def _plot_shap_manual(shap_data, output_dir, prefix):
+    """
+    Manually plots SHAP values using matplotlib to avoid shap.plots.bar errors.
+    shap_data: List of dicts containing 'token_weights' (list of [token, weight])
+    """
     if not plt: return
 
-    # We iterate through the examples and plot them one by one
-    # SHAP's native plots are a bit tricky to save without being displayed, 
-    # but passing show=False usually works with matplotlib backend.
-    
-    for i in range(len(shap_values)):
-        fig = plt.figure()
-        # Plot the bar chart for the i-th example
-        # We usually want to show the class that was predicted, or the most significant one.
-        # By default shap.plots.bar plots the class with highest output if multi-class
-        try:
-            shap.plots.bar(shap_values[i], show=False, max_display=12)
-            plt.title(f"SHAP: {prefix} Example {i+1}")
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, f"{prefix}_shap_plot_ex{i}.png"), bbox_inches='tight')
-            plt.close()
-        except Exception as e:
-            print(f"Could not plot SHAP for example {i}: {e}")
-
-    print(f"Saved SHAP plots to {output_dir}")
+    for i, example in enumerate(shap_data):
+        weights = example['token_weights']
+        if not weights: continue
+        
+        # Unzip
+        tokens, vals = zip(*weights)
+        
+        # Convert to numpy for easier handling
+        vals = np.array(vals)
+        tokens = np.array(tokens)
+        
+        # Sort by absolute value to show most important features, limit to top 15
+        indices = np.argsort(np.abs(vals))
+        if len(indices) > 15:
+            indices = indices[-15:]
+            
+        sorted_vals = vals[indices]
+        sorted_tokens = tokens[indices]
+        
+        # Plot
+        fig, ax = plt.subplots(figsize=(8, 6))
+        y_pos = np.arange(len(sorted_tokens))
+        colors = ['#ff0051' if x > 0 else '#008bfb' for x in sorted_vals] # SHAP standard colors (Red=Positive, Blue=Negative)
+        
+        ax.barh(y_pos, sorted_vals, color=colors)
+        ax.set_yticks(y_pos)
+        ax.set_yticklabels(sorted_tokens)
+        ax.set_xlabel("SHAP Value (Impact on model output)")
+        ax.set_title(f"{prefix} Example {i+1}: Pred {example['predicted_label']}")
+        
+        plt.tight_layout()
+        path = os.path.join(output_dir, f"{prefix}_shap_plot_ex{i}.png")
+        plt.savefig(path)
+        plt.close()
+        
+    print(f"Saved manual SHAP plots to {output_dir}")
 
 def _plot_confusion_matrix(cm, labels, output_dir, prefix):
     if not plt: return
@@ -480,7 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-config", default=None)
     
     # Updated args
-    parser.add_argument("--finetune", action="store_true", default=False)
+    parser.add_argument("--finetune", action="store_true", default=True) # DEFAULT TRUE
     parser.add_argument("--run-shap", action="store_true")
     parser.add_argument("--no-run-shap", dest="run_shap", action="store_false")
     parser.set_defaults(run_shap=True)
