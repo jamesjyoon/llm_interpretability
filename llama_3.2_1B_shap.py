@@ -13,8 +13,12 @@ from typing import Callable, Dict, Iterable, Iterator, List, NoReturn, Optional,
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from datasets import DatasetDict, load_dataset
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import matthews_corrcoef
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 # --- Import SHAP instead of LIME ---
 try:
@@ -39,6 +43,13 @@ from transformers import (
     TrainingArguments,
 )
 
+@dataclass
+class SequenceClassifierOutput:  # type: ignore[misc]
+    loss: torch.Tensor | None = None
+    logits: torch.Tensor | None = None
+    hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
+    attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
+
 try:
     from huggingface_hub import login as hf_login
     from huggingface_hub.errors import GatedRepoError, RepoAccessError
@@ -53,6 +64,78 @@ HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
 # --- Helper Classes & Functions ---
 
 LabelTokenMap = Dict[int, int]
+
+
+class SentimentClassificationModel(nn.Module):
+    """Wraps a causal LM with a dedicated sentiment head and calibration hooks."""
+
+    def __init__(self, base_model, num_labels: int, label_token_map: LabelTokenMap | None = None):
+        super().__init__()
+        self.base_model = base_model
+        hidden_size = getattr(base_model.config, "hidden_size", None)
+        if hidden_size is None:
+            raise ValueError("Base model must expose a `hidden_size` in its config to attach a classification head.")
+        self.classification_head = nn.Linear(hidden_size, num_labels)
+        self.temperature: Optional[float] = None
+        self.platt_coef: Optional[float] = None
+        self.platt_intercept: Optional[float] = None
+
+        if label_token_map:
+            try:
+                token_ids = [label_token_map[k] for k in sorted(label_token_map.keys())]
+                with torch.no_grad():
+                    self.classification_head.weight.copy_(self.base_model.lm_head.weight[token_ids])
+                    nn.init.zeros_(self.classification_head.bias)
+            except Exception:
+                # If anything fails we fall back to default init
+                pass
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            **kwargs,
+        )
+        hidden_states = outputs.hidden_states[-1]
+        seq_lens = attention_mask.sum(dim=-1) - 1
+        pooled = hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), seq_lens]
+        logits = self.classification_head(pooled)
+
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+
+        return SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
+
+
+class BalancedTrainer(Trainer):
+    """Trainer that applies class-balanced sampling to fight label collapse."""
+
+    def get_train_dataloader(self):
+        if self.train_dataset is None:
+            raise ValueError("Trainer: training requires a train_dataset")
+
+        labels = self.train_dataset["labels"]
+        unique, counts = np.unique(labels, return_counts=True)
+        freq = {int(u): c for u, c in zip(unique, counts)}
+        weights = [1.0 / freq[int(lbl)] for lbl in labels]
+        sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.per_device_train_batch_size,
+            sampler=sampler,
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
 
 class RestrictedLabelLogitsProcessor(LogitsProcessor):
     """Force generation to stay within a fixed label vocabulary."""
@@ -134,16 +217,9 @@ def _prepare_dataset(dataset: DatasetDict, config: ExperimentConfig, tokenizer, 
         prompts = [formatter.build_prompt(s) for s in examples[config.text_field]]
         full_seqs = [f"{p} {l}" for p, l in zip(prompts, examples[config.label_field])]
         model_inputs = tokenizer(full_seqs, max_length=config.max_seq_length, truncation=True, padding="max_length")
-        
+
         attention = model_inputs["attention_mask"]
-        labels = []
-        for input_ids, mask in zip(model_inputs["input_ids"], attention):
-            masked = [-100] * len(input_ids)
-            seq_len = int(sum(mask))
-            if seq_len > 0:
-                masked[seq_len - 1] = input_ids[seq_len - 1]
-            labels.append(masked)
-        model_inputs["labels"] = labels
+        model_inputs["labels"] = [int(l) for l in examples[config.label_field]]
         return model_inputs
 
     required_cols = sorted(set(dataset[config.train_split].column_names))
@@ -176,66 +252,128 @@ def _filter_dataset(dataset: DatasetDict, config: ExperimentConfig, label_space:
     allowed = set(label_space)
     return dataset.filter(lambda x: int(x[config.label_field]) in allowed)
 
+
+def _fit_temperature(logits: np.ndarray, labels: List[int]) -> float:
+    logits_tensor = torch.tensor(logits, dtype=torch.float)
+    labels_tensor = torch.tensor(labels, dtype=torch.long)
+    temperature = torch.nn.Parameter(torch.ones(1, device=logits_tensor.device))
+    optimizer = torch.optim.LBFGS([temperature], lr=0.01, max_iter=50)
+    criterion = torch.nn.CrossEntropyLoss()
+
+    def _closure():
+        optimizer.zero_grad()
+        loss = criterion(logits_tensor / temperature, labels_tensor)
+        loss.backward()
+        return loss
+
+    optimizer.step(_closure)
+    return float(temperature.detach().cpu())
+
+
+def _fit_platt_scaler(logits: np.ndarray, labels: List[int]) -> Tuple[Optional[float], Optional[float]]:
+    if logits.shape[1] != 2:
+        return None, None
+    scores = logits[:, 1] - logits[:, 0]
+    clf = LogisticRegression(max_iter=100)
+    clf.fit(scores.reshape(-1, 1), labels)
+    return float(clf.coef_[0][0]), float(clf.intercept_[0])
+
+
+def _temperature_calibrator(temperature: Optional[float]) -> Callable[[np.ndarray], np.ndarray]:
+    def _apply(logits: np.ndarray) -> np.ndarray:
+        logits_tensor = torch.tensor(logits, dtype=torch.float)
+        if temperature:
+            logits_tensor = logits_tensor / temperature
+        return torch.softmax(logits_tensor, dim=-1).cpu().numpy()
+
+    return _apply
+
+
+def _platt_calibrator(coef: Optional[float], intercept: Optional[float]) -> Callable[[np.ndarray], np.ndarray]:
+    def _apply(logits: np.ndarray) -> np.ndarray:
+        if coef is None or intercept is None or logits.shape[1] != 2:
+            return torch.softmax(torch.tensor(logits, dtype=torch.float), dim=-1).cpu().numpy()
+        scores = logits[:, 1] - logits[:, 0]
+        probs_pos = 1 / (1 + np.exp(-(scores * coef + intercept)))
+        return np.stack([1 - probs_pos, probs_pos], axis=1)
+
+    return _apply
+
 # --- Core Evaluation & SHAP Functions ---
 
-def _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter):
-    """Returns a function that takes raw texts and returns probabilities for SHAP."""
+def _build_logits_fn(model, tokenizer, device, max_length, formatter):
     def _predict(texts: Sequence[str]) -> np.ndarray:
-        texts = [str(t) for t in texts]
-        prompts = [formatter.build_prompt(t) for t in texts]
-        
-        probs_list = []
+        prompts = [formatter.build_prompt(str(t)) for t in texts]
+        logits_list = []
         batch_size = 8
         for i in range(0, len(prompts), batch_size):
-            batch = prompts[i:i+batch_size]
+            batch = prompts[i:i + batch_size]
             inputs = tokenizer(batch, padding=True, truncation=True, max_length=max_length, return_tensors="pt").to(device)
-            
             model.eval()
             with torch.no_grad():
                 outputs = model(**inputs)
-            
-            logits = outputs.logits
-            seq_lens = inputs.attention_mask.sum(dim=-1) - 1
-            final_logits = logits[torch.arange(logits.size(0), device=device), seq_lens]
-            
-            sorted_labels = sorted(label_token_map.keys())
-            target_ids = torch.tensor([label_token_map[l] for l in sorted_labels], device=device)
-            label_logits = final_logits[:, target_ids]
-            probs = torch.softmax(label_logits, dim=-1)
-            probs_list.append(probs.cpu().numpy())
-            
-        return np.concatenate(probs_list, axis=0)
+            logits_list.append(outputs.logits.cpu().numpy())
+        return np.concatenate(logits_list, axis=0)
+
     return _predict
 
-def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max_length, formatter):
-    preds = []
-    sorted_labels = sorted(label_token_map.keys())
-    
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter)
-    probs_all = predict_fn(texts)
-    pred_indices = np.argmax(probs_all, axis=1)
+
+def _compute_metrics(labels: List[int], probs: np.ndarray, label_space: Sequence[int]):
+    sorted_labels = list(sorted(label_space))
+    pred_indices = np.argmax(probs, axis=1)
     preds = [sorted_labels[i] for i in pred_indices]
-    
     from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
+
     cm = confusion_matrix(labels, preds, labels=sorted_labels)
     acc = accuracy_score(labels, preds)
     p, r, f1, _ = precision_recall_fscore_support(labels, preds, average='macro', zero_division=0)
     try:
         mcc = matthews_corrcoef(labels, preds)
-    except:
+    except Exception:
         mcc = 0.0
-
     return {
-        "accuracy": acc, "precision": p, "recall": r, "f1": f1, "mcc": mcc,
-        "confusion_matrix": cm.tolist()
+        "accuracy": acc,
+        "precision": p,
+        "recall": r,
+        "f1": f1,
+        "mcc": mcc,
+        "confusion_matrix": cm.tolist(),
     }
 
-def run_shap(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
+
+def evaluate_model(model, tokenizer, texts, labels, device, max_length, formatter, label_space, calibrate: bool = True):
+    logits_fn = _build_logits_fn(model, tokenizer, device, max_length, formatter)
+    logits = logits_fn(texts)
+    raw_probs = torch.softmax(torch.tensor(logits), dim=-1).cpu().numpy()
+    metrics = {"raw": _compute_metrics(labels, raw_probs, label_space)}
+    calibration = {}
+
+    if calibrate:
+        temp = _fit_temperature(logits, labels)
+        temp_probs = _temperature_calibrator(temp)(logits)
+        metrics["temperature"] = _compute_metrics(labels, temp_probs, label_space)
+        calibration["temperature"] = temp
+
+        coef, intercept = _fit_platt_scaler(logits, labels)
+        platt_probs = _platt_calibrator(coef, intercept)(logits)
+        metrics["platt"] = _compute_metrics(labels, platt_probs, label_space)
+        calibration["platt"] = {"coef": coef, "intercept": intercept}
+
+    return metrics, calibration
+
+def run_shap(model, tokenizer, texts, device, config, formatter, prefix, calibrator: Optional[Callable[[np.ndarray], np.ndarray]] = None):
     """Runs SHAP and saves plots."""
     print(f"Running SHAP for {prefix}...")
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
-    class_names = [str(l) for l in sorted(label_token_map.keys())]
-    
+    class_names = [str(l) for l in sorted(formatter.label_space)]
+
+    logits_fn = _build_logits_fn(model, tokenizer, device, config.max_seq_length, formatter)
+
+    def predict_fn(text_batch: Sequence[str]) -> np.ndarray:
+        logits = logits_fn(text_batch)
+        if calibrator:
+            return calibrator(logits)
+        return torch.softmax(torch.tensor(logits), dim=-1).cpu().numpy()
+
     masker = shap.maskers.Text(tokenizer)
     explainer = shap.Explainer(predict_fn, masker, output_names=class_names)
     
@@ -405,15 +543,18 @@ def run_experiment(args: argparse.Namespace) -> None:
     
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
-    
+
     # 2. Load BASE Model
     print("Loading Base Model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name, 
-        load_in_4bit=config.load_in_4bit, 
+    base_model = AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        load_in_4bit=config.load_in_4bit,
         device_map="auto" if config.load_in_4bit else None
     )
-    if not config.load_in_4bit: model.to(device)
+    base_model.config.output_hidden_states = True
+    if not config.load_in_4bit: base_model.to(device)
+    model = SentimentClassificationModel(base_model, num_labels=len(label_space), label_token_map=label_token_map)
+    model.to(device)
 
     # 3. Prepare Evaluation Data
     eval_texts, eval_labels = _prepare_texts_labels(config, dataset)
@@ -422,14 +563,15 @@ def run_experiment(args: argparse.Namespace) -> None:
     # PHASE 1: ZERO-SHOT
     # ==========================================
     print("--- Phase 1: Running Zero-Shot Evaluation ---")
-    zs_metrics = evaluate_model(model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
+    zs_metrics, zs_calibration = evaluate_model(model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
     print("Zero-Shot Metrics:", zs_metrics)
-    
+
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
-    _plot_confusion_matrix(zs_metrics['confusion_matrix'], label_space, config.output_dir, "zero_shot")
-    
+    _plot_confusion_matrix(zs_metrics['raw']['confusion_matrix'], label_space, config.output_dir, "zero_shot")
+
+    zero_shot_calibrator = _temperature_calibrator(zs_calibration.get("temperature")) if zs_calibration else None
     if config.run_shap:
-        run_shap(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
+        run_shap(model, tokenizer, eval_texts, device, config, formatter, "zero_shot", zero_shot_calibrator)
 
     # ==========================================
     # PHASE 2: FINE-TUNING
@@ -440,19 +582,22 @@ def run_experiment(args: argparse.Namespace) -> None:
         
         processed_dataset = _prepare_dataset(dataset, config, tokenizer, formatter)
         
-        if config.load_in_4bit: model = prepare_model_for_kbit_training(model)
+        if config.load_in_4bit: base_model = prepare_model_for_kbit_training(base_model)
         peft_config = LoraConfig(r=config.lora_r, lora_alpha=config.lora_alpha, task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"])
-        model.config.use_cache = False
-        peft_model = get_peft_model(model, peft_config)
+        base_model.config.use_cache = False
+        peft_model = get_peft_model(base_model, peft_config)
         peft_model.print_trainable_parameters()
-        
-        trainer = Trainer(
-            model=peft_model,
+
+        classification_model = SentimentClassificationModel(peft_model, num_labels=len(label_space), label_token_map=label_token_map)
+        classification_model.to(device)
+
+        trainer = BalancedTrainer(
+            model=classification_model,
             train_dataset=processed_dataset[config.train_split],
             eval_dataset=processed_dataset[config.eval_split],
             args=TrainingArguments(
-                output_dir=config.output_dir, 
-                num_train_epochs=config.num_train_epochs, 
+                output_dir=config.output_dir,
+                num_train_epochs=config.num_train_epochs,
                 per_device_train_batch_size=config.per_device_train_batch_size,
                 gradient_accumulation_steps=config.gradient_accumulation_steps,
                 learning_rate=config.learning_rate,
@@ -468,23 +613,25 @@ def run_experiment(args: argparse.Namespace) -> None:
         except Exception as e:
             print(f"Training failed: {e}")
         
-        peft_model.eval()
-        
+        classification_model.eval()
+
         print("Evaluating Fine-Tuned Model...")
-        ft_metrics = evaluate_model(peft_model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
+        ft_metrics, ft_calibration = evaluate_model(classification_model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
         print("Fine-Tuned Metrics:", ft_metrics)
-        
+
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
-        _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
-        
+        _plot_confusion_matrix(ft_metrics['raw']['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
+
+        fine_tuned_calibrator = _temperature_calibrator(ft_calibration.get("temperature")) if ft_calibration else None
+
         if config.run_shap:
-            run_shap(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
+            run_shap(classification_model, tokenizer, eval_texts, device, config, formatter, "fine_tuned", fine_tuned_calibrator)
 
     # ==========================================
     # PHASE 3: COMPARISON
     # ==========================================
     if ft_metrics:
-        _plot_comparison(zs_metrics, ft_metrics, config.output_dir)
+        _plot_comparison(zs_metrics["raw"], ft_metrics.get("raw"), config.output_dir)
 
 
 def build_parser() -> argparse.ArgumentParser:
