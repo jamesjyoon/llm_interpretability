@@ -46,7 +46,18 @@ from transformers import (
     set_seed,
     Trainer,
     TrainingArguments,
+    modeling_outputs as _transformers_outputs,
 )
+
+if hasattr(_transformers_outputs, "SequenceClassifierOutput"):
+    SequenceClassifierOutput = _transformers_outputs.SequenceClassifierOutput
+else:
+    @dataclass
+    class SequenceClassifierOutput:  # type: ignore[misc]
+        loss: torch.Tensor | None = None
+        logits: torch.Tensor | None = None
+        hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
+        attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
 
 try:
     from huggingface_hub import login as hf_login
