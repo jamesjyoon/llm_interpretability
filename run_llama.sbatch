@@ -25,7 +25,7 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 cd /storage/ice1/6/3/jyoon370/llm-interpretability
 
 # 3. Run your experiment script (adjust args if needed)
-python experiments_llama_3.2_1B.py \
+python llama_3.2_1B_lime.py \
     --model-name meta-llama/Llama-3.2-1B \
     --dataset-name mteb/tweet_sentiment_extraction \
     --dataset-config default \
