@@ -27,27 +27,19 @@ except ImportError:
     plt = None
 
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-try:
-    from transformers.modeling_outputs import SequenceClassifierOutput
-except Exception:  # pragma: no cover
-    @dataclass
-    class SequenceClassifierOutput:  # type: ignore[misc]
-        loss: torch.Tensor | None = None
-        logits: torch.Tensor | None = None
-        hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
-        attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
+
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
+    BitsAndBytesConfig,
     LogitsProcessor,
     LogitsProcessorList,
-    SequenceClassifierOutput,
-    default_data_collator,
-    set_seed,
     Trainer,
     TrainingArguments,
-    modeling_outputs as _transformers_outputs,
+    default_data_collator,
+    set_seed,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 if hasattr(_transformers_outputs, "SequenceClassifierOutput"):
     SequenceClassifierOutput = _transformers_outputs.SequenceClassifierOutput
@@ -549,7 +541,9 @@ def run_experiment(args: argparse.Namespace) -> None:
     # 1. Load Tokenizer & Data
     print("Loading tokenizer and data...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
-    if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
+    if not tokenizer.pad_token:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
     
     dataset = load_dataset(config.dataset_name, config.dataset_config) if config.dataset_config else load_dataset(config.dataset_name)
     label_space = _resolve_label_space(config, dataset)
@@ -560,10 +554,19 @@ def run_experiment(args: argparse.Namespace) -> None:
     
     # 2. Load BASE Model
     print("Loading Base Model...")
+    quantization_config = None
+    if config.load_in_4bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        load_in_4bit=config.load_in_4bit,
-        device_map="auto" if config.load_in_4bit else None
+        quantization_config=quantization_config,
+        device_map="auto" if config.load_in_4bit else None,
     )
     base_model.config.output_hidden_states = True
     if not config.load_in_4bit: base_model.to(device)
@@ -598,7 +601,20 @@ def run_experiment(args: argparse.Namespace) -> None:
         processed_dataset = _prepare_dataset(dataset, config, tokenizer, formatter)
         
         if config.load_in_4bit: base_model = prepare_model_for_kbit_training(base_model)
-        peft_config = LoraConfig(r=config.lora_r, lora_alpha=config.lora_alpha, task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"])
+        peft_config = LoraConfig(
+            r=config.lora_r,
+            lora_alpha=config.lora_alpha,
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        )
         base_model.config.use_cache = False
         peft_model = get_peft_model(base_model, peft_config)
         peft_model.print_trainable_parameters()
