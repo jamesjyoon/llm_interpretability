@@ -40,16 +40,13 @@ from transformers import (
 )
 try:
     from transformers.modeling_outputs import SequenceClassifierOutput
-except Exception:
-    try:
-        from transformers import SequenceClassifierOutput  # pragma: no cover
-    except Exception:  # pragma: no cover
-        @dataclass
-        class SequenceClassifierOutput:  # type: ignore[misc]
-            loss: torch.Tensor | None = None
-            logits: torch.Tensor | None = None
-            hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
-            attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
+except Exception:  # pragma: no cover
+    @dataclass
+    class SequenceClassifierOutput:  # type: ignore[misc]
+        loss: torch.Tensor | None = None
+        logits: torch.Tensor | None = None
+        hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
+        attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
 
 try:
     from huggingface_hub import login as hf_login
