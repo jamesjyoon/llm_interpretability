@@ -32,6 +32,7 @@ from transformers import (
     AutoTokenizer,
     LogitsProcessor,
     LogitsProcessorList,
+    SequenceClassifierOutput,
     default_data_collator,
     set_seed,
     Trainer,
