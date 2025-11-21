@@ -38,6 +38,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers.modeling_outputs import SequenceClassifierOutput
 
 try:
     from huggingface_hub import login as hf_login
