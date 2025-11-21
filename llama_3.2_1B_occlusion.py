@@ -27,23 +27,37 @@ except ImportError:
     plt = None
 
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+try:
+    from transformers.modeling_outputs import SequenceClassifierOutput
+except Exception:  # pragma: no cover
+    @dataclass
+    class SequenceClassifierOutput:  # type: ignore[misc]
+        loss: torch.Tensor | None = None
+        logits: torch.Tensor | None = None
+        hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
+        attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     LogitsProcessor,
     LogitsProcessorList,
+    SequenceClassifierOutput,
     default_data_collator,
     set_seed,
     Trainer,
     TrainingArguments,
+    modeling_outputs as _transformers_outputs,
 )
 
-@dataclass
-class SequenceClassifierOutput:  # type: ignore[misc]
-    loss: torch.Tensor | None = None
-    logits: torch.Tensor | None = None
-    hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
-    attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
+if hasattr(_transformers_outputs, "SequenceClassifierOutput"):
+    SequenceClassifierOutput = _transformers_outputs.SequenceClassifierOutput
+else:
+    @dataclass
+    class SequenceClassifierOutput:  # type: ignore[misc]
+        loss: torch.Tensor | None = None
+        logits: torch.Tensor | None = None
+        hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
+        attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
 
 try:
     from huggingface_hub import login as hf_login
