@@ -1,3 +1,4 @@
+# Move this try-except block to the top, before the main transformers import
 from __future__ import annotations
 
 __doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models on binary classification datasets.
