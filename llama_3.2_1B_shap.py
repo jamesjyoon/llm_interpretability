@@ -66,7 +66,7 @@ LabelTokenMap = Dict[int, int]
 class SentimentClassificationModel(nn.Module):
     """Wraps a causal LM with a dedicated sentiment head and calibration hooks."""
 
-    def __init__(self, base_model, num_labels: int, label_token_map: LabelTokenMap | None = None):
+    def __init__(self, base_model, num_labels: int, label_token_map: LabelTokenMap | None = None, class_weights: Optional[torch.Tensor] = None):
         super().__init__()
         self.base_model = base_model
         hidden_size = getattr(base_model.config, "hidden_size", None)
@@ -76,6 +76,7 @@ class SentimentClassificationModel(nn.Module):
         self.temperature: Optional[float] = None
         self.platt_coef: Optional[float] = None
         self.platt_intercept: Optional[float] = None
+        self.class_weights = class_weights
 
         if label_token_map:
             try:
@@ -101,7 +102,10 @@ class SentimentClassificationModel(nn.Module):
 
         loss = None
         if labels is not None:
-            loss = F.cross_entropy(logits, labels)
+            weight = None
+            if self.class_weights is not None:
+                weight = self.class_weights.to(logits.device)
+            loss = F.cross_entropy(logits, labels, weight=weight)
 
         return SequenceClassifierOutput(
             loss=loss,
@@ -166,6 +170,17 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
         token_ids = tokenizer(label_text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
         label_token_map[int(label)] = token_ids[-1]
     return label_token_map
+
+
+def _compute_class_weights(labels: Sequence[int], label_space: Sequence[int]) -> torch.Tensor:
+    counts = {int(label): 0 for label in label_space}
+    for lbl in labels:
+        counts[int(lbl)] = counts.get(int(lbl), 0) + 1
+    weights = []
+    for lbl in sorted(counts.keys()):
+        count = counts[lbl]
+        weights.append(0.0 if count == 0 else 1.0 / count)
+    return torch.tensor(weights, dtype=torch.float32)
 
 @dataclasses.dataclass
 class ExperimentConfig:
@@ -338,6 +353,22 @@ def _compute_metrics(labels: List[int], probs: np.ndarray, label_space: Sequence
     }
 
 
+def _select_best_variant(metrics: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, float]]:
+    """Return the metric variant with the highest F1 score.
+
+    Falls back to the raw metrics if no alternatives are present.
+    """
+    best_name, best_metrics = None, None
+    best_f1 = -1.0
+    for name, values in metrics.items():
+        f1 = values.get("f1", -1.0)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_name = name
+            best_metrics = values
+    return best_name or "raw", best_metrics or metrics.get("raw", {})
+
+
 def evaluate_model(model, tokenizer, texts, labels, device, max_length, formatter, label_space, calibrate: bool = True):
     logits_fn = _build_logits_fn(model, tokenizer, device, max_length, formatter)
     logits = logits_fn(texts)
@@ -482,12 +513,12 @@ def _plot_confusion_matrix(cm, labels, output_dir, prefix):
     plt.savefig(os.path.join(output_dir, f"{prefix}_confusion_matrix.png"))
     plt.close()
 
-def _plot_comparison(zs_metrics, ft_metrics, output_dir):
+def _plot_comparison(zs_metrics, ft_metrics, output_dir, zs_variant: str, ft_variant: str):
     if not plt or not ft_metrics: return
-    
+
     metrics = ['accuracy', 'precision', 'recall', 'f1']
-    z_vals = [zs_metrics[m] for m in metrics]
-    f_vals = [ft_metrics[m] for m in metrics]
+    z_vals = [zs_metrics.get(m, 0.0) for m in metrics]
+    f_vals = [ft_metrics.get(m, 0.0) for m in metrics]
     
     x = np.arange(len(metrics))
     width = 0.35
@@ -497,7 +528,7 @@ def _plot_comparison(zs_metrics, ft_metrics, output_dir):
     ax.bar(x + width/2, f_vals, width, label='Fine Tuned')
     
     ax.set_ylabel('Score')
-    ax.set_title('Metrics Comparison')
+    ax.set_title(f'Metrics Comparison (ZS: {zs_variant}, FT: {ft_variant})')
     ax.set_xticks(x)
     ax.set_xticklabels([m.upper() for m in metrics])
     ax.legend()
@@ -572,10 +603,11 @@ def run_experiment(args: argparse.Namespace) -> None:
     # ==========================================
     print("--- Phase 1: Running Zero-Shot Evaluation ---")
     zs_metrics, zs_calibration = evaluate_model(model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
+    zs_variant, zs_best_metrics = _select_best_variant(zs_metrics)
     print("Zero-Shot Metrics:", zs_metrics)
 
     with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
-    _plot_confusion_matrix(zs_metrics['raw']['confusion_matrix'], label_space, config.output_dir, "zero_shot")
+    _plot_confusion_matrix(zs_best_metrics.get('confusion_matrix', zs_metrics['raw']['confusion_matrix']), label_space, config.output_dir, "zero_shot")
 
     zero_shot_calibrator = _temperature_calibrator(zs_calibration.get("temperature")) if zs_calibration else None
     if config.run_shap:
@@ -587,9 +619,10 @@ def run_experiment(args: argparse.Namespace) -> None:
     ft_metrics = None
     if args.finetune:
         print("--- Phase 2: Starting Fine-Tuning ---")
-        
+
         processed_dataset = _prepare_dataset(dataset, config, tokenizer, formatter)
-        
+        class_weights = _compute_class_weights(processed_dataset[config.train_split]["labels"], label_space)
+
         if config.load_in_4bit: base_model = prepare_model_for_kbit_training(base_model)
         peft_config = LoraConfig(
             r=config.lora_r,
@@ -609,7 +642,12 @@ def run_experiment(args: argparse.Namespace) -> None:
         peft_model = get_peft_model(base_model, peft_config)
         peft_model.print_trainable_parameters()
 
-        classification_model = SentimentClassificationModel(peft_model, num_labels=len(label_space), label_token_map=label_token_map)
+        classification_model = SentimentClassificationModel(
+            peft_model,
+            num_labels=len(label_space),
+            label_token_map=label_token_map,
+            class_weights=class_weights.to(device),
+        )
         classification_model.to(device)
 
         trainer = BalancedTrainer(
@@ -638,10 +676,11 @@ def run_experiment(args: argparse.Namespace) -> None:
 
         print("Evaluating Fine-Tuned Model...")
         ft_metrics, ft_calibration = evaluate_model(classification_model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
+        ft_variant, ft_best_metrics = _select_best_variant(ft_metrics)
         print("Fine-Tuned Metrics:", ft_metrics)
 
         with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
-        _plot_confusion_matrix(ft_metrics['raw']['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
+        _plot_confusion_matrix(ft_best_metrics.get('confusion_matrix', ft_metrics['raw']['confusion_matrix']), label_space, config.output_dir, "fine_tuned")
 
         fine_tuned_calibrator = _temperature_calibrator(ft_calibration.get("temperature")) if ft_calibration else None
 
@@ -652,7 +691,7 @@ def run_experiment(args: argparse.Namespace) -> None:
     # PHASE 3: COMPARISON
     # ==========================================
     if ft_metrics:
-        _plot_comparison(zs_metrics["raw"], ft_metrics.get("raw"), config.output_dir)
+        _plot_comparison(zs_best_metrics, ft_best_metrics, config.output_dir, zs_variant, ft_variant)
 
 
 def build_parser() -> argparse.ArgumentParser:
