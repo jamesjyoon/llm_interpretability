@@ -186,11 +186,11 @@ class ExperimentConfig:
     eval_split: str = "test"
     text_field: str = "text"
     label_field: str = "label"
-    train_subset: Optional[int] = 4000
+    train_subset: Optional[int] = 8000
     eval_subset: Optional[int] = 2000
     random_seed: int = 42
     learning_rate: float = 5e-5
-    num_train_epochs: float = 2.0
+    num_train_epochs: float = 3.0
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
     lora_r: int = 8
