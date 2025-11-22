@@ -5,6 +5,7 @@ Fixed to ensure Zero-Shot runs before Fine-Tuning and all plots are generated.
 """
 
 import argparse
+import dataclasses
 import json
 import os
 import time
@@ -161,7 +162,7 @@ def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMa
         label_token_map[int(label)] = token_ids[-1]
     return label_token_map
 
-@dataclass
+@dataclasses.dataclass
 class ExperimentConfig:
     model_name: str = "meta-llama/Llama-3.2-1B"
     dataset_name: str = "mteb/tweet_sentiment_extraction"
