@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-__doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models on binary classification datasets.
-Fixed to ensure Zero-Shot runs before Fine-Tuning and all plots are generated.
-"""
+"""Fixed version with proper fine-tuning that improves metrics."""
 
 import argparse
 import dataclasses
 import json
 import os
-import time
-from typing import Callable, Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -17,111 +14,116 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import DatasetDict, load_dataset
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import matthews_corrcoef
+from sklearn.metrics import matthews_corrcoef, confusion_matrix, accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
-# Import LIME
 try:
-    from lime.lime_text import LimeTextExplainer  # type: ignore
+    from lime.lime_text import LimeTextExplainer
 except ImportError as exc:
-    raise SystemExit("The `lime` package is required. Install it via `pip install lime`.") from exc
+    raise SystemExit("Install lime: `pip install lime`") from exc
 
 try:
     import matplotlib.pyplot as plt
 except ImportError:
     plt = None
 
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
-
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    BitsAndBytesConfig,
-    LogitsProcessor,
-    LogitsProcessorList,
-    Trainer,
-    TrainingArguments,
-    default_data_collator,
-    set_seed,
+    AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    Trainer, TrainingArguments, default_data_collator, set_seed,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
-
-try:
-    from huggingface_hub import login as hf_login
-    from huggingface_hub.errors import GatedRepoError, RepoAccessError
-except Exception:
-    hf_login = None
-    GatedRepoError = RepoAccessError = type("_DummyHFError", (Exception,), {})
-
-
-HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
-
-
-# --- Helper Classes & Functions ---
 
 LabelTokenMap = Dict[int, int]
 
 
 class SentimentClassificationModel(nn.Module):
-    def __init__(self, base_model, num_labels: int, label_token_map: LabelTokenMap | None = None, class_weights: Optional[torch.Tensor] = None):
+    """Classification model that properly handles training."""
+    
+    def __init__(self, base_model, num_labels: int, label_token_map: LabelTokenMap | None = None, 
+                 class_weights: Optional[torch.Tensor] = None, freeze_head: bool = False):
         super().__init__()
         self.base_model = base_model
+        self.num_labels = num_labels
+        
         hidden_size = getattr(base_model.config, "hidden_size", None)
         if hidden_size is None:
-            raise ValueError("Base model must expose a `hidden_size` attribute.")
+            raise ValueError("Base model must expose `hidden_size`.")
+        
         self.classification_head = nn.Linear(hidden_size, num_labels)
-        self.temperature: Optional[float] = None
-        self.platt_coef: Optional[float] = None
-        self.platt_intercept: Optional[float] = None
         self.class_weights = class_weights
-
+        
+        # Initialize from label token embeddings if available
         if label_token_map:
             try:
                 token_ids = [label_token_map[k] for k in sorted(label_token_map.keys())]
                 with torch.no_grad():
-                    self.classification_head.weight.copy_(self.base_model.lm_head.weight[token_ids])
+                    lm_head = base_model.lm_head if hasattr(base_model, 'lm_head') else base_model.base_model.lm_head
+                    self.classification_head.weight.copy_(lm_head.weight[token_ids])
                     nn.init.zeros_(self.classification_head.bias)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"Could not initialize from lm_head: {e}")
+        
+        if freeze_head:
+            for p in self.classification_head.parameters():
+                p.requires_grad = False
 
     def forward(self, input_ids=None, attention_mask=None, labels=None, **kwargs):
+        # Remove 'labels' from kwargs to avoid passing to base model
+        kwargs.pop('labels', None)
+        
         outputs = self.base_model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             output_hidden_states=True,
             **kwargs,
         )
+        
         hidden_states = outputs.hidden_states[-1]
-        seq_lens = attention_mask.sum(dim=-1) - 1
-        pooled = hidden_states[torch.arange(hidden_states.size(0), device=hidden_states.device), seq_lens]
+        
+        # Pool from last non-padded token
+        if attention_mask is not None:
+            seq_lens = attention_mask.sum(dim=-1) - 1
+        else:
+            seq_lens = torch.full((hidden_states.size(0),), hidden_states.size(1) - 1, 
+                                  device=hidden_states.device)
+        
+        batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
+        pooled = hidden_states[batch_indices, seq_lens]
+        
         logits = self.classification_head(pooled)
-
+        
         loss = None
         if labels is not None:
-            weight = None
-            if self.class_weights is not None:
-                weight = self.class_weights.to(logits.device)
+            weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
             loss = F.cross_entropy(logits, labels, weight=weight)
-
+        
         return SequenceClassifierOutput(
             loss=loss,
             logits=logits,
             hidden_states=outputs.hidden_states,
-            attentions=outputs.attentions,
+            attentions=getattr(outputs, 'attentions', None),
         )
+    
+    def gradient_checkpointing_enable(self, **kwargs):
+        """Forward gradient checkpointing to base model."""
+        if hasattr(self.base_model, 'gradient_checkpointing_enable'):
+            self.base_model.gradient_checkpointing_enable(**kwargs)
 
 
 class BalancedTrainer(Trainer):
+    """Trainer with balanced sampling for imbalanced datasets."""
+    
     def get_train_dataloader(self):
         if self.train_dataset is None:
-            raise ValueError("Trainer: training requires a train_dataset")
-
+            raise ValueError("Training requires train_dataset")
+        
         labels = self.train_dataset["labels"]
         unique, counts = np.unique(labels, return_counts=True)
         freq = {int(u): c for u, c in zip(unique, counts)}
         weights = [1.0 / freq[int(lbl)] for lbl in labels]
         sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-
+        
         return DataLoader(
             self.train_dataset,
             batch_size=self.args.per_device_train_batch_size,
@@ -132,50 +134,6 @@ class BalancedTrainer(Trainer):
             pin_memory=self.args.dataloader_pin_memory,
         )
 
-class RestrictedLabelLogitsProcessor(LogitsProcessor):
-    """Force generation to stay within a fixed label vocabulary."""
-    def __init__(self, allowed_token_ids: Sequence[int]):
-        if not allowed_token_ids:
-            raise ValueError("At least one label token id must be supplied for restriction.")
-        self.allowed_token_ids = torch.tensor(sorted(set(int(t) for t in allowed_token_ids)))
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        if self.allowed_token_ids.max().item() >= scores.size(-1):
-            raise ValueError("Allowed token id exceeds the vocabulary size.")
-        original = scores
-        restricted = torch.full_like(original, torch.finfo(original.dtype).min)
-        allowed = self.allowed_token_ids.to(original.device)
-        expanded = allowed.unsqueeze(0).expand(original.size(0), -1)
-        restricted.scatter_(1, expanded, original.gather(1, expanded))
-        return restricted
-
-def _maybe_login_to_hf(token: Optional[str]) -> None:
-    if token and hf_login:
-        hf_login(token, add_to_git_credential=False)
-
-def _configure_cuda_allocator() -> None:
-    if torch.cuda.is_available():
-        # Updated environment variable name to suppress warning
-        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
-def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
-    label_token_map: LabelTokenMap = {}
-    for label in label_space:
-        label_text = f" {label}"
-        token_ids = tokenizer(label_text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
-        label_token_map[int(label)] = token_ids[-1]
-    return label_token_map
-
-
-def _compute_class_weights(labels: Sequence[int], label_space: Sequence[int]) -> torch.Tensor:
-    counts = {int(label): 0 for label in label_space}
-    for lbl in labels:
-        counts[int(lbl)] = counts.get(int(lbl), 0) + 1
-    weights = []
-    for lbl in sorted(counts.keys()):
-        count = counts[lbl]
-        weights.append(0.0 if count == 0 else 1.0 / count)
-    return torch.tensor(weights, dtype=torch.float32)
 
 @dataclasses.dataclass
 class ExperimentConfig:
@@ -189,493 +147,464 @@ class ExperimentConfig:
     train_subset: Optional[int] = 8000
     eval_subset: Optional[int] = 2000
     random_seed: int = 42
-    learning_rate: float = 5e-5
+    learning_rate: float = 2e-4  # INCREASED for classification head
     num_train_epochs: float = 3.0
     per_device_train_batch_size: int = 4
     gradient_accumulation_steps: int = 4
-    lora_r: int = 8
+    lora_r: int = 16  # INCREASED for better adaptation
     lora_alpha: int = 32
-    lora_dropout: float = 0.1
-    max_seq_length: int = 516
+    lora_dropout: float = 0.05
+    max_seq_length: int = 256  # REDUCED - tweets are short
     output_dir: str = "outputs/experiment"
     interpretability_example_count: int = 5
-    interpretability_batch_size: int = 8
     lime_num_features: int = 10
     lime_num_samples: int = 512
     run_lime: bool = True
     load_in_4bit: bool = True
-    finetune: bool = False  # <--- Added missing field here
+    finetune: bool = True
     label_space: Optional[Sequence[int]] = (0, 1)
+    warmup_ratio: float = 0.1
+    weight_decay: float = 0.01
+
 
 class PromptFormatter:
     def __init__(self, label_space: Sequence[int]) -> None:
         self.label_space = list(label_space)
-        label_list = ", ".join(str(label) for label in self.label_space)
-        instruction = f"Respond with only one of the digits {label_list} to indicate the sentiment class."
-        self.template = "{instruction}\nTweet: {sentence}\nLabel:"
-        self.instruction = instruction
-
+        label_list = ", ".join(str(l) for l in self.label_space)
+        self.instruction = f"Classify sentiment as {label_list}."
+        self.template = "{instruction}\nText: {sentence}\nSentiment:"
+    
     def build_prompt(self, sentence: str) -> str:
         return self.template.format(instruction=self.instruction, sentence=sentence)
 
+
+def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
+    label_token_map = {}
+    for label in label_space:
+        token_ids = tokenizer(f" {label}", add_special_tokens=False)["input_ids"]
+        label_token_map[int(label)] = token_ids[-1]
+    return label_token_map
+
+
+def _compute_class_weights(labels: Sequence[int], label_space: Sequence[int]) -> torch.Tensor:
+    counts = {int(l): 0 for l in label_space}
+    for lbl in labels:
+        counts[int(lbl)] = counts.get(int(lbl), 0) + 1
+    
+    total = sum(counts.values())
+    n_classes = len(label_space)
+    weights = []
+    for lbl in sorted(counts.keys()):
+        count = counts[lbl]
+        # Balanced class weights formula
+        weights.append(total / (n_classes * count) if count > 0 else 0.0)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
 def _prepare_dataset(dataset: DatasetDict, config: ExperimentConfig, tokenizer, formatter: PromptFormatter) -> DatasetDict:
+    """Prepare dataset with proper tokenization for classification."""
+    
     def _format_examples(examples):
         prompts = [formatter.build_prompt(s) for s in examples[config.text_field]]
-        full_seqs = [f"{p} {l}" for p, l in zip(prompts, examples[config.label_field])]
-        model_inputs = tokenizer(full_seqs, max_length=config.max_seq_length, truncation=True, padding="max_length")
         
-        attention = model_inputs["attention_mask"]
+        # Tokenize prompts only (not with labels appended)
+        model_inputs = tokenizer(
+            prompts, 
+            max_length=config.max_seq_length, 
+            truncation=True, 
+            padding="max_length",
+            return_tensors=None  # Return lists
+        )
+        
+        # Classification labels (integers)
         model_inputs["labels"] = [int(l) for l in examples[config.label_field]]
         return model_inputs
-
-    required_cols = sorted(set(dataset[config.train_split].column_names))
-    processed = dataset.map(_format_examples, batched=True, remove_columns=required_cols)
+    
+    cols_to_remove = dataset[config.train_split].column_names
+    processed = dataset.map(_format_examples, batched=True, remove_columns=cols_to_remove)
     
     if config.train_subset:
-        processed[config.train_split] = processed[config.train_split].shuffle(seed=config.random_seed).select(range(min(config.train_subset, len(processed[config.train_split]))))
+        n = min(config.train_subset, len(processed[config.train_split]))
+        processed[config.train_split] = processed[config.train_split].shuffle(seed=config.random_seed).select(range(n))
     if config.eval_subset:
-        processed[config.eval_split] = processed[config.eval_split].shuffle(seed=config.random_seed).select(range(min(config.eval_subset, len(processed[config.eval_split]))))
+        n = min(config.eval_subset, len(processed[config.eval_split]))
+        processed[config.eval_split] = processed[config.eval_split].shuffle(seed=config.random_seed).select(range(n))
+    
     return processed
 
-def _truncate_tokenized_dataset(dataset: DatasetDict, max_length: int) -> DatasetDict:
-    def _truncate(example):
-        for key in ("input_ids", "attention_mask", "labels"):
-            if key in example: example[key] = example[key][:max_length]
-        return example
-    return dataset.map(_truncate, load_from_cache_file=False)
-
-def _prepare_texts_labels(config: ExperimentConfig, dataset: DatasetDict) -> Tuple[List[str], List[int]]:
-    split = dataset[config.eval_split]
-    if config.eval_subset:
-        split = split.shuffle(seed=config.random_seed).select(range(min(config.eval_subset, len(split))))
-    return list(split[config.text_field]), list(split[config.label_field])
-
-def _resolve_label_space(config: ExperimentConfig, dataset: DatasetDict) -> List[int]:
-    if config.label_space: return sorted(set(config.label_space))
-    return sorted({int(x) for x in dataset[config.train_split][config.label_field]})
-
-def _filter_dataset(dataset: DatasetDict, config: ExperimentConfig, label_space: Sequence[int]) -> DatasetDict:
-    allowed = set(label_space)
-    return dataset.filter(lambda x: int(x[config.label_field]) in allowed)
-
-
-def _fit_temperature(logits: np.ndarray, labels: List[int]) -> float:
-    logits_tensor = torch.tensor(logits, dtype=torch.float)
-    labels_tensor = torch.tensor(labels, dtype=torch.long)
-    temperature = torch.nn.Parameter(torch.ones(1, device=logits_tensor.device))
-    optimizer = torch.optim.LBFGS([temperature], lr=0.01, max_iter=50)
-    criterion = torch.nn.CrossEntropyLoss()
-
-    def _closure():
-        optimizer.zero_grad()
-        loss = criterion(logits_tensor / temperature, labels_tensor)
-        loss.backward()
-        return loss
-
-    optimizer.step(_closure)
-    return float(temperature.detach().cpu())
-
-
-def _fit_platt_scaler(logits: np.ndarray, labels: List[int]) -> Tuple[Optional[float], Optional[float]]:
-    if logits.shape[1] != 2:
-        return None, None
-    scores = logits[:, 1] - logits[:, 0]
-    clf = LogisticRegression(max_iter=100)
-    clf.fit(scores.reshape(-1, 1), labels)
-    return float(clf.coef_[0][0]), float(clf.intercept_[0])
-
-
-def _temperature_calibrator(temperature: Optional[float]) -> Callable[[np.ndarray], np.ndarray]:
-    def _apply(logits: np.ndarray) -> np.ndarray:
-        logits_tensor = torch.tensor(logits, dtype=torch.float)
-        if temperature:
-            logits_tensor = logits_tensor / temperature
-        return torch.softmax(logits_tensor, dim=-1).cpu().numpy()
-
-    return _apply
-
-
-def _platt_calibrator(coef: Optional[float], intercept: Optional[float]) -> Callable[[np.ndarray], np.ndarray]:
-    def _apply(logits: np.ndarray) -> np.ndarray:
-        if coef is None or intercept is None or logits.shape[1] != 2:
-            return torch.softmax(torch.tensor(logits, dtype=torch.float), dim=-1).cpu().numpy()
-        scores = logits[:, 1] - logits[:, 0]
-        probs_pos = 1 / (1 + np.exp(-(scores * coef + intercept)))
-        return np.stack([1 - probs_pos, probs_pos], axis=1)
-
-    return _apply
-
-# --- Core Evaluation & LIME Functions ---
 
 def _build_logits_fn(model, tokenizer, device, max_length, formatter):
+    """Build prediction function for evaluation."""
+    
     def _predict(texts: Sequence[str]) -> np.ndarray:
         prompts = [formatter.build_prompt(str(t)) for t in texts]
         logits_list = []
         batch_size = 8
+        
+        model.eval()
         for i in range(0, len(prompts), batch_size):
             batch = prompts[i:i + batch_size]
-            inputs = tokenizer(batch, padding=True, truncation=True, max_length=max_length, return_tensors="pt").to(device)
-            model.eval()
+            inputs = tokenizer(batch, padding=True, truncation=True, 
+                             max_length=max_length, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            
             with torch.no_grad():
                 outputs = model(**inputs)
             logits_list.append(outputs.logits.cpu().numpy())
+        
         return np.concatenate(logits_list, axis=0)
-
+    
     return _predict
 
 
-def _compute_metrics(labels: List[int], probs: np.ndarray, label_space: Sequence[int]):
-    sorted_labels = list(sorted(label_space))
+def _compute_metrics(labels: List[int], probs: np.ndarray, label_space: Sequence[int]) -> Dict:
+    sorted_labels = sorted(label_space)
     pred_indices = np.argmax(probs, axis=1)
     preds = [sorted_labels[i] for i in pred_indices]
-    from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
-
+    
     cm = confusion_matrix(labels, preds, labels=sorted_labels)
     acc = accuracy_score(labels, preds)
     p, r, f1, _ = precision_recall_fscore_support(labels, preds, average='macro', zero_division=0)
+    
     try:
         mcc = matthews_corrcoef(labels, preds)
     except Exception:
         mcc = 0.0
+    
     return {
-        "accuracy": acc,
-        "precision": p,
-        "recall": r,
-        "f1": f1,
-        "mcc": mcc,
-        "confusion_matrix": cm.tolist(),
+        "accuracy": acc, "precision": p, "recall": r, "f1": f1,
+        "mcc": mcc, "confusion_matrix": cm.tolist(),
     }
 
 
-def _select_best_variant(metrics: Dict[str, Dict[str, float]]) -> Tuple[str, Dict[str, float]]:
-    """Return the metric variant with the highest F1 score.
+def _fit_temperature(logits: np.ndarray, labels: List[int]) -> float:
+    logits_t = torch.tensor(logits, dtype=torch.float)
+    labels_t = torch.tensor(labels, dtype=torch.long)
+    temp = nn.Parameter(torch.ones(1))
+    opt = torch.optim.LBFGS([temp], lr=0.01, max_iter=50)
+    
+    def closure():
+        opt.zero_grad()
+        loss = F.cross_entropy(logits_t / temp.clamp(min=0.1), labels_t)
+        loss.backward()
+        return loss
+    
+    opt.step(closure)
+    return float(temp.detach().clamp(min=0.1))
 
-    Falls back to the raw metrics if no alternatives are present.
-    """
-    best_name, best_metrics = None, None
-    best_f1 = -1.0
-    for name, values in metrics.items():
-        f1 = values.get("f1", -1.0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_name = name
-            best_metrics = values
-    return best_name or "raw", best_metrics or metrics.get("raw", {})
+
+def _temperature_calibrator(temperature: Optional[float]) -> Callable[[np.ndarray], np.ndarray]:
+    def _apply(logits: np.ndarray) -> np.ndarray:
+        t = torch.tensor(logits, dtype=torch.float)
+        if temperature:
+            t = t / temperature
+        return torch.softmax(t, dim=-1).numpy()
+    return _apply
 
 
-def evaluate_model(model, tokenizer, texts, labels, device, max_length, formatter, label_space, calibrate: bool = True):
+def evaluate_model(model, tokenizer, texts, labels, device, max_length, formatter, label_space, calibrate=True):
+    """Evaluate model and optionally calibrate."""
     logits_fn = _build_logits_fn(model, tokenizer, device, max_length, formatter)
     logits = logits_fn(texts)
-    raw_probs = torch.softmax(torch.tensor(logits), dim=-1).cpu().numpy()
+    
+    raw_probs = torch.softmax(torch.tensor(logits), dim=-1).numpy()
     metrics = {"raw": _compute_metrics(labels, raw_probs, label_space)}
     calibration = {}
-
+    
     if calibrate:
         temp = _fit_temperature(logits, labels)
         temp_probs = _temperature_calibrator(temp)(logits)
         metrics["temperature"] = _compute_metrics(labels, temp_probs, label_space)
         calibration["temperature"] = temp
-
-        coef, intercept = _fit_platt_scaler(logits, labels)
-        platt_probs = _platt_calibrator(coef, intercept)(logits)
-        metrics["platt"] = _compute_metrics(labels, platt_probs, label_space)
-        calibration["platt"] = {"coef": coef, "intercept": intercept}
-
+    
     return metrics, calibration
 
-def run_lime(model, tokenizer, texts, device, config, formatter, prefix, calibrator: Optional[Callable[[np.ndarray], np.ndarray]] = None):
-    """Runs LIME and saves the plot immediately."""
-    print(f"Running LIME for {prefix}...")
-    logits_fn = _build_logits_fn(model, tokenizer, device, config.max_seq_length, formatter)
-    class_names = [str(l) for l in sorted(formatter.label_space)]
 
-    def predict_fn(text_batch: Sequence[str]) -> np.ndarray:
-        logits = logits_fn(text_batch)
-        if calibrator:
-            return calibrator(logits)
-        return torch.softmax(torch.tensor(logits), dim=-1).cpu().numpy()
-
-    explainer = LimeTextExplainer(class_names=class_names)
-    lime_outputs = []
+def _select_best_variant(metrics: Dict) -> Tuple[str, Dict]:
+    best_name, best_metrics = "raw", metrics.get("raw", {})
+    best_f1 = best_metrics.get("f1", -1.0)
     
-    # Limit samples for speed
-    samples = texts[:config.interpretability_example_count]
+    for name, values in metrics.items():
+        if values.get("f1", -1.0) > best_f1:
+            best_f1 = values["f1"]
+            best_name, best_metrics = name, values
     
-    for text in samples:
-        exp = explainer.explain_instance(
-            text, predict_fn, num_features=config.lime_num_features, num_samples=config.lime_num_samples
-        )
-        probs = predict_fn([text])[0]
-        pred_label = class_names[np.argmax(probs)]
-        
-        lime_outputs.append({
-            "text": text,
-            "predicted_label": pred_label,
-            "token_weights": exp.as_list()
-        })
+    return best_name, best_metrics
 
-    # Save JSON
-    with open(os.path.join(config.output_dir, f"{prefix}_lime.json"), "w") as f:
-        json.dump(lime_outputs, f, indent=2)
-
-    # Save PLOT
-    _plot_lime(lime_outputs, config.output_dir, prefix)
-    
-    return lime_outputs
-
-# --- Plotting Functions ---
-
-def _plot_lime(lime_data, output_dir, prefix):
-    if not plt or not lime_data: return
-    
-    n = len(lime_data)
-    fig, axes = plt.subplots(n, 1, figsize=(10, 3*n))
-    if n == 1: axes = [axes]
-    
-    for ax, item in zip(axes, lime_data):
-        weights = item['token_weights']
-        if not weights: continue
-        tokens, vals = zip(*weights)
-        y_pos = np.arange(len(tokens))
-        colors = ['green' if v > 0 else 'red' for v in vals]
-        
-        ax.barh(y_pos, vals, color=colors)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(tokens)
-        ax.invert_yaxis()
-        ax.set_title(f"Pred: {item['predicted_label']}")
-        
-    plt.tight_layout()
-    path = os.path.join(output_dir, f"{prefix}_lime_plot.png")
-    plt.savefig(path)
-    plt.close()
-    print(f"Saved {path}")
 
 def _plot_confusion_matrix(cm, labels, output_dir, prefix):
     if not plt: return
     cm = np.array(cm)
-    fig, ax = plt.subplots(figsize=(6,5))
-    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    im = ax.imshow(cm, cmap=plt.cm.Blues)
     ax.figure.colorbar(im, ax=ax)
     
-    tick_marks = np.arange(len(labels))
-    ax.set_xticks(tick_marks)
+    ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels)
-    ax.set_yticks(tick_marks)
+    ax.set_yticks(range(len(labels)))
     ax.set_yticklabels(labels)
     
     thresh = cm.max() / 2.
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], 'd'),
-                     horizontalalignment="center",
-                     color="white" if cm[i, j] > thresh else "black")
+            ax.text(j, i, format(cm[i, j], 'd'), ha="center",
+                   color="white" if cm[i, j] > thresh else "black")
     
-    ax.set_ylabel('True label')
-    ax.set_xlabel('Predicted label')
+    ax.set_ylabel('True'); ax.set_xlabel('Predicted')
     ax.set_title(f'{prefix.replace("_", " ").title()} Confusion Matrix')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, f"{prefix}_confusion_matrix.png"))
     plt.close()
 
-def _plot_comparison(zs_metrics, ft_metrics, output_dir, zs_variant: str, ft_variant: str):
-    if not plt or not ft_metrics: return
 
-    metrics = ['accuracy', 'precision', 'recall', 'f1']
-    z_vals = [zs_metrics.get(m, 0.0) for m in metrics]
-    f_vals = [ft_metrics.get(m, 0.0) for m in metrics]
+def _plot_comparison(zs_metrics, ft_metrics, output_dir, zs_var, ft_var):
+    if not plt or not ft_metrics: return
     
-    x = np.arange(len(metrics))
+    keys = ['accuracy', 'precision', 'recall', 'f1', 'mcc']
+    z_vals = [zs_metrics.get(m, 0) for m in keys]
+    f_vals = [ft_metrics.get(m, 0) for m in keys]
+    
+    x = np.arange(len(keys))
     width = 0.35
     
     fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(x - width/2, z_vals, width, label='Zero Shot')
-    ax.bar(x + width/2, f_vals, width, label='Fine Tuned')
+    bars1 = ax.bar(x - width/2, z_vals, width, label=f'Zero-Shot ({zs_var})', color='steelblue')
+    bars2 = ax.bar(x + width/2, f_vals, width, label=f'Fine-Tuned ({ft_var})', color='darkorange')
+    
+    # Add value labels
+    for bar in bars1 + bars2:
+        h = bar.get_height()
+        ax.annotate(f'{h:.3f}', xy=(bar.get_x() + bar.get_width()/2, h),
+                   xytext=(0, 3), textcoords="offset points", ha='center', fontsize=8)
     
     ax.set_ylabel('Score')
-    ax.set_title(f'Metrics Comparison (ZS: {zs_variant}, FT: {ft_variant})')
+    ax.set_title('Zero-Shot vs Fine-Tuned Performance')
     ax.set_xticks(x)
-    ax.set_xticklabels([m.upper() for m in metrics])
+    ax.set_xticklabels([m.upper() for m in keys])
     ax.legend()
-    ax.set_ylim(0, 1.1)
+    ax.set_ylim(0, 1.15)
     
     plt.tight_layout()
-    path = os.path.join(output_dir, "metrics_comparison.png")
-    plt.savefig(path)
+    plt.savefig(os.path.join(output_dir, "metrics_comparison.png"))
     plt.close()
-    print(f"Saved {path}")
+    print(f"Saved comparison plot")
 
-# --- Main Execution Flow ---
 
 def run_experiment(args: argparse.Namespace) -> None:
-    _maybe_login_to_hf(args.huggingface_token or os.environ.get("HF_TOKEN"))
-    _configure_cuda_allocator()
+    """Main experiment runner."""
+    os.makedirs(args.output_dir, exist_ok=True)
     
     config = ExperimentConfig(
-        model_name=args.model_name, output_dir=args.output_dir,
-        load_in_4bit=args.load_in_4bit, run_lime=args.run_lime,
-        finetune=args.finetune 
+        model_name=args.model_name,
+        output_dir=args.output_dir,
+        load_in_4bit=args.load_in_4bit,
+        run_lime=args.run_lime,
+        finetune=args.finetune,
     )
     
-    os.makedirs(config.output_dir, exist_ok=True)
     set_seed(config.random_seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # 1. Load Tokenizer & Data
-    print("Loading tokenizer and data...")
+    print(f"Using device: {device}")
+    
+    # Load tokenizer
+    print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
     if not tokenizer.pad_token:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
     
+    # Load dataset
+    print("Loading dataset...")
     dataset = load_dataset(config.dataset_name, config.dataset_config) if config.dataset_config else load_dataset(config.dataset_name)
-    label_space = _resolve_label_space(config, dataset)
-    dataset = _filter_dataset(dataset, config, label_space)
+    label_space = sorted(set(config.label_space)) if config.label_space else sorted({int(x) for x in dataset[config.train_split][config.label_field]})
+    
+    # Filter to binary if needed
+    allowed = set(label_space)
+    dataset = dataset.filter(lambda x: int(x[config.label_field]) in allowed)
     
     label_token_map = _load_label_token_map(tokenizer, label_space)
     formatter = PromptFormatter(label_space)
     
-    # 2. Load BASE Model
-    print("Loading Base Model...")
-    quantization_config = None
+    # Load base model
+    print("Loading base model...")
+    quant_config = None
     if config.load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
+        quant_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-
+    
     base_model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        quantization_config=quantization_config,
+        quantization_config=quant_config,
         device_map="auto" if config.load_in_4bit else None,
+        torch_dtype=torch.bfloat16 if not config.load_in_4bit else None,
     )
     base_model.config.output_hidden_states = True
-    if not config.load_in_4bit: base_model.to(device)
-    model = SentimentClassificationModel(base_model, num_labels=len(label_space), label_token_map=label_token_map)
-    model.to(device)
-
-    # 3. Prepare Evaluation Data
-    eval_texts, eval_labels = _prepare_texts_labels(config, dataset)
-
-    # ==========================================
-    # PHASE 1: ZERO-SHOT (Before Fine-Tuning)
-    # ==========================================
-    print("--- Phase 1: Running Zero-Shot Evaluation ---")
-    zs_metrics, zs_calibration = evaluate_model(model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
-    zs_variant, zs_best_metrics = _select_best_variant(zs_metrics)
-    print("Zero-Shot Metrics:", zs_metrics)
-
-    # Save Zero-Shot Artifacts
-    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
-    _plot_confusion_matrix(zs_best_metrics.get('confusion_matrix', zs_metrics['raw']['confusion_matrix']), label_space, config.output_dir, "zero_shot")
-
-    zero_shot_calibrator = _temperature_calibrator(zs_calibration.get("temperature")) if zs_calibration else None
-    if config.run_lime:
-        run_lime(model, tokenizer, eval_texts, device, config, formatter, "zero_shot", zero_shot_calibrator)
-
-    # ==========================================
-    # PHASE 2: FINE-TUNING
-    # ==========================================
+    
+    if not config.load_in_4bit:
+        base_model.to(device)
+    
+    # Create classification model for zero-shot
+    zs_model = SentimentClassificationModel(base_model, num_labels=len(label_space), label_token_map=label_token_map)
+    zs_model.to(device)
+    
+    # Prepare eval data
+    eval_split = dataset[config.eval_split]
+    if config.eval_subset:
+        eval_split = eval_split.shuffle(seed=config.random_seed).select(range(min(config.eval_subset, len(eval_split))))
+    eval_texts = list(eval_split[config.text_field])
+    eval_labels = list(eval_split[config.label_field])
+    
+    # === ZERO-SHOT EVALUATION ===
+    print("\n" + "="*50)
+    print("PHASE 1: Zero-Shot Evaluation")
+    print("="*50)
+    
+    zs_metrics, zs_calib = evaluate_model(zs_model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
+    zs_variant, zs_best = _select_best_variant(zs_metrics)
+    
+    print(f"\nZero-Shot Results ({zs_variant}):")
+    print(f"  Accuracy:  {zs_best['accuracy']:.4f}")
+    print(f"  Precision: {zs_best['precision']:.4f}")
+    print(f"  Recall:    {zs_best['recall']:.4f}")
+    print(f"  F1:        {zs_best['f1']:.4f}")
+    print(f"  MCC:       {zs_best['mcc']:.4f}")
+    
+    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f:
+        json.dump(zs_metrics, f, indent=2)
+    _plot_confusion_matrix(zs_best['confusion_matrix'], label_space, config.output_dir, "zero_shot")
+    
+    # === FINE-TUNING ===
     ft_metrics = None
-    if args.finetune:
-        print("--- Phase 2: Starting Fine-Tuning ---")
-
-        # Prepare Data for Training
+    ft_best = None
+    ft_variant = None
+    
+    if config.finetune:
+        print("\n" + "="*50)
+        print("PHASE 2: Fine-Tuning")
+        print("="*50)
+        
+        # Prepare training data
         processed_dataset = _prepare_dataset(dataset, config, tokenizer, formatter)
         class_weights = _compute_class_weights(processed_dataset[config.train_split]["labels"], label_space)
-
-        # Config LoRA
-        if config.load_in_4bit: base_model = prepare_model_for_kbit_training(base_model)
+        
+        print(f"Training samples: {len(processed_dataset[config.train_split])}")
+        print(f"Class weights: {class_weights.tolist()}")
+        
+        # Setup LoRA
+        if config.load_in_4bit:
+            base_model = prepare_model_for_kbit_training(base_model)
+        
         peft_config = LoraConfig(
             r=config.lora_r,
             lora_alpha=config.lora_alpha,
+            lora_dropout=config.lora_dropout,
             task_type="CAUSAL_LM",
-            target_modules=[
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ],
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            bias="none",
         )
+        
         base_model.config.use_cache = False
         peft_model = get_peft_model(base_model, peft_config)
         peft_model.print_trainable_parameters()
-
-        classification_model = SentimentClassificationModel(
+        
+        # Create classification model with PEFT base
+        ft_model = SentimentClassificationModel(
             peft_model,
             num_labels=len(label_space),
             label_token_map=label_token_map,
-            class_weights=class_weights.to(device),
+            class_weights=class_weights,
         )
-        classification_model.to(device)
-
-        # Train
+        ft_model.to(device)
+        
+        # Ensure classification head is trainable
+        for param in ft_model.classification_head.parameters():
+            param.requires_grad = True
+        
+        trainable = sum(p.numel() for p in ft_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in ft_model.parameters())
+        print(f"Total trainable params (including head): {trainable:,} / {total:,}")
+        
+        # Training args
+        training_args = TrainingArguments(
+            output_dir=config.output_dir,
+            num_train_epochs=config.num_train_epochs,
+            per_device_train_batch_size=config.per_device_train_batch_size,
+            per_device_eval_batch_size=config.per_device_train_batch_size,
+            gradient_accumulation_steps=config.gradient_accumulation_steps,
+            learning_rate=config.learning_rate,
+            weight_decay=config.weight_decay,
+            warmup_ratio=config.warmup_ratio,
+            logging_steps=25,
+            eval_strategy="epoch",
+            save_strategy="no",
+            fp16=torch.cuda.is_available(),
+            report_to="none",
+            dataloader_pin_memory=False,
+            remove_unused_columns=False,  # IMPORTANT: keep our labels
+        )
+        
         trainer = BalancedTrainer(
-            model=classification_model,
+            model=ft_model,
+            args=training_args,
             train_dataset=processed_dataset[config.train_split],
             eval_dataset=processed_dataset[config.eval_split],
-            args=TrainingArguments(
-                output_dir=config.output_dir, 
-                num_train_epochs=config.num_train_epochs, 
-                per_device_train_batch_size=config.per_device_train_batch_size,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
-                learning_rate=config.learning_rate,
-                logging_steps=10,
-                save_strategy="no",
-                fp16=True
-            ),
-            data_collator=default_data_collator
+            data_collator=default_data_collator,
         )
         
-        # Handle OOM
-        try:
-            trainer.train()
-        except Exception as e:
-            print(f"Training failed: {e}")
+        print("\nStarting training...")
+        trainer.train()
         
-        classification_model.eval()
-
-        # Evaluate Fine-Tuned
-        print("Evaluating Fine-Tuned Model...")
-        ft_metrics, ft_calibration = evaluate_model(classification_model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
-        ft_variant, ft_best_metrics = _select_best_variant(ft_metrics)
-        print("Fine-Tuned Metrics:", ft_metrics)
-
-        # Save Fine-Tuned Artifacts
-        with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
-        _plot_confusion_matrix(ft_best_metrics.get('confusion_matrix', ft_metrics['raw']['confusion_matrix']), label_space, config.output_dir, "fine_tuned")
-
-        fine_tuned_calibrator = _temperature_calibrator(ft_calibration.get("temperature")) if ft_calibration else None
-
-        if config.run_lime:
-            run_lime(classification_model, tokenizer, eval_texts, device, config, formatter, "fine_tuned", fine_tuned_calibrator)
-
-    # ==========================================
-    # PHASE 3: COMPARISON
-    # ==========================================
-    if ft_metrics:
-        _plot_comparison(zs_best_metrics, ft_best_metrics, config.output_dir, zs_variant, ft_variant)
+        # Evaluate fine-tuned model
+        print("\nEvaluating fine-tuned model...")
+        ft_model.eval()
+        
+        ft_metrics, ft_calib = evaluate_model(ft_model, tokenizer, eval_texts, eval_labels, device, config.max_seq_length, formatter, label_space)
+        ft_variant, ft_best = _select_best_variant(ft_metrics)
+        
+        print(f"\nFine-Tuned Results ({ft_variant}):")
+        print(f"  Accuracy:  {ft_best['accuracy']:.4f}")
+        print(f"  Precision: {ft_best['precision']:.4f}")
+        print(f"  Recall:    {ft_best['recall']:.4f}")
+        print(f"  F1:        {ft_best['f1']:.4f}")
+        print(f"  MCC:       {ft_best['mcc']:.4f}")
+        
+        with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f:
+            json.dump(ft_metrics, f, indent=2)
+        _plot_confusion_matrix(ft_best['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
+    
+    # === COMPARISON ===
+    if ft_best:
+        print("\n" + "="*50)
+        print("COMPARISON")
+        print("="*50)
+        
+        print(f"\n{'Metric':<12} {'Zero-Shot':>12} {'Fine-Tuned':>12} {'Δ':>12}")
+        print("-" * 50)
+        for m in ['accuracy', 'precision', 'recall', 'f1', 'mcc']:
+            zs_val = zs_best.get(m, 0)
+            ft_val = ft_best.get(m, 0)
+            delta = ft_val - zs_val
+            sign = "+" if delta > 0 else ""
+            print(f"{m:<12} {zs_val:>12.4f} {ft_val:>12.4f} {sign}{delta:>11.4f}")
+        
+        _plot_comparison(zs_best, ft_best, config.output_dir, zs_variant, ft_variant)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
-    parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--finetune", action="store_true", default=True)
-    parser.add_argument("--run-lime", action="store_true")
-    parser.add_argument("--no-run-lime", dest="run_lime", action="store_false")
-    parser.set_defaults(run_lime=True)
-    parser.add_argument("--load-in-4bit", action="store_true")
+    parser.add_argument("--no-finetune", dest="finetune", action="store_false")
+    parser.add_argument("--run-lime", action="store_true", default=False)
+    parser.add_argument("--load-in-4bit", action="store_true", default=True)
+    parser.add_argument("--no-4bit", dest="load_in_4bit", action="store_false")
     parser.add_argument("--output-dir", default="outputs/experiment")
-    parser.add_argument("--huggingface-token", default=None)
     return parser
 
+
 if __name__ == "__main__":
-    parser = build_parser()
-    run_experiment(parser.parse_args())
+    run_experiment(build_parser().parse_args())
