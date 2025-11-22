@@ -8,7 +8,6 @@ import argparse
 import json
 import os
 import time
-from dataclasses import dataclass
 from typing import Callable, Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
 
 import numpy as np
@@ -40,16 +39,6 @@ from transformers import (
     set_seed,
 )
 from transformers.modeling_outputs import SequenceClassifierOutput
-
-if hasattr(_transformers_outputs, "SequenceClassifierOutput"):
-    SequenceClassifierOutput = _transformers_outputs.SequenceClassifierOutput
-else:
-    @dataclass
-    class SequenceClassifierOutput:  # type: ignore[misc]
-        loss: torch.Tensor | None = None
-        logits: torch.Tensor | None = None
-        hidden_states: Optional[Tuple[torch.Tensor, ...]] | None = None
-        attentions: Optional[Tuple[torch.Tensor, ...]] | None = None
 
 try:
     from huggingface_hub import login as hf_login
