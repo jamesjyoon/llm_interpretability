@@ -394,8 +394,19 @@ def run_experiment(args: argparse.Namespace) -> None:
     """Main experiment runner."""
     os.makedirs(args.output_dir, exist_ok=True)
     
+    # Handle HuggingFace login if token provided
+    token = args.huggingface_token or os.environ.get("HF_TOKEN")
+    if token:
+        try:
+            from huggingface_hub import login as hf_login
+            hf_login(token, add_to_git_credential=False)
+        except Exception:
+            pass
+    
     config = ExperimentConfig(
         model_name=args.model_name,
+        dataset_name=args.dataset_name,
+        dataset_config=args.dataset_config,
         output_dir=args.output_dir,
         load_in_4bit=args.load_in_4bit,
         run_lime=args.run_lime,
@@ -597,12 +608,15 @@ def run_experiment(args: argparse.Namespace) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
+    parser.add_argument("--dataset-config", default=None)
     parser.add_argument("--finetune", action="store_true", default=True)
     parser.add_argument("--no-finetune", dest="finetune", action="store_false")
     parser.add_argument("--run-lime", action="store_true", default=False)
     parser.add_argument("--load-in-4bit", action="store_true", default=True)
     parser.add_argument("--no-4bit", dest="load_in_4bit", action="store_false")
     parser.add_argument("--output-dir", default="outputs/experiment")
+    parser.add_argument("--huggingface-token", default=None)
     return parser
 
 
