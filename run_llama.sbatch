@@ -29,6 +29,8 @@ python llama_3.2_1B_lime.py \
     --model-name meta-llama/Llama-3.2-1B \
     --dataset-name mteb/tweet_sentiment_extraction \
     --dataset-config default \
+    --finetune \
+    --load-in-4bit \
     --output-dir outputs/llama_sentiment_1B \
 
 echo "=== Job finished at $(date) ==="
