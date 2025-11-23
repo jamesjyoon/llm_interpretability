@@ -50,7 +50,12 @@ class SentimentClassificationModel(nn.Module):
         if hidden_size is None:
             raise ValueError("Base model must expose `hidden_size`.")
         
+        # Determine dtype from base model
+        self.model_dtype = next(base_model.parameters()).dtype
+        
         self.classification_head = nn.Linear(hidden_size, num_labels)
+        # Cast classification head to match base model dtype
+        self.classification_head = self.classification_head.to(self.model_dtype)
         self.class_weights = class_weights
         
         # Initialize from label token embeddings if available
@@ -59,7 +64,7 @@ class SentimentClassificationModel(nn.Module):
                 token_ids = [label_token_map[k] for k in sorted(label_token_map.keys())]
                 with torch.no_grad():
                     lm_head = base_model.lm_head if hasattr(base_model, 'lm_head') else base_model.base_model.lm_head
-                    self.classification_head.weight.copy_(lm_head.weight[token_ids])
+                    self.classification_head.weight.copy_(lm_head.weight[token_ids].to(self.model_dtype))
                     nn.init.zeros_(self.classification_head.bias)
             except Exception as e:
                 print(f"Could not initialize from lm_head: {e}")
@@ -90,6 +95,9 @@ class SentimentClassificationModel(nn.Module):
         
         batch_indices = torch.arange(hidden_states.size(0), device=hidden_states.device)
         pooled = hidden_states[batch_indices, seq_lens]
+        
+        # Ensure pooled matches classification head dtype
+        pooled = pooled.to(self.classification_head.weight.dtype)
         
         logits = self.classification_head(pooled)
         
