@@ -1,13 +1,12 @@
-transformers>=4.40.0
-datasets>=2.18.0
-peft>=0.10.0
-accelerate>=0.29.0
-bitsandbytes>=0.43.0
-shap>=0.45.0
+# requirements.txt
 torch>=2.1.0
-matplotlib>=3.8.0
-scipy>=1.10.0
-scikit-learn>=1.3.0
-lime>=0.2.0
-alibi
-captum
+transformers>=4.38.0
+datasets
+accelerate
+peft
+bitsandbytes
+scikit-learn
+matplotlib
+lime
+tqdm
+captum>=0.6.0
