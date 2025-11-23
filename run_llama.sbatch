@@ -29,7 +29,6 @@ python llama_3.2_1B_lime.py \
   --model meta-llama/Llama-3.2-1B \
   --train-size 8000 \
   --epochs 3 \
-  --lime-examples 10 \
   --output-dir outputs/llama3.2_lime
 
 echo "=== Job finished at $(date) ==="
