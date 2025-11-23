@@ -1,521 +1,252 @@
+# final_with_lime_occlusion_integratedgrad.py
 from __future__ import annotations
-
-__doc__ = """Utility for running zero-shot and LoRA-fine-tuned LLaMA style models.
-Updated to use OCCLUSION (Leave-One-Out) for interpretability.
-"""
 
 import argparse
 import json
 import os
-import time
-from dataclasses import dataclass
-from typing import Callable, Dict, Iterable, Iterator, List, NoReturn, Optional, Sequence, Tuple
+import random
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from datasets import DatasetDict, load_dataset
-from sklearn.metrics import matthews_corrcoef
-
-# --- Visualization Imports ---
-try:
-    import matplotlib.pyplot as plt
-except ImportError:
-    plt = None
-
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from datasets import load_dataset
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, matthews_corrcoef, confusion_matrix
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    LogitsProcessor,
-    LogitsProcessorList,
-    default_data_collator,
-    set_seed,
-    Trainer,
-    TrainingArguments,
+    AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments,
+    DataCollatorForLanguageModeling, set_seed
 )
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from transformers import BitsAndBytesConfig
+from lime.lime_text import LimeTextExplainer
+from captum.attr import Occlusion, LayerIntegratedGradients
+from captum.attr import visualization as viz
+from tqdm import tqdm
 
-try:
-    from huggingface_hub import login as hf_login
-    from huggingface_hub.errors import GatedRepoError, RepoAccessError
-except Exception:
-    hf_login = None
-    GatedRepoError = RepoAccessError = type("_DummyHFError", (Exception,), {})
-
-
-HF_ACCESS_ERRORS = (OSError, GatedRepoError, RepoAccessError)
-
-
-# --- Helper Classes & Functions ---
-
-LabelTokenMap = Dict[int, int]
-
-class RestrictedLabelLogitsProcessor(LogitsProcessor):
-    """Force generation to stay within a fixed label vocabulary."""
-    def __init__(self, allowed_token_ids: Sequence[int]):
-        if not allowed_token_ids:
-            raise ValueError("At least one label token id must be supplied for restriction.")
-        self.allowed_token_ids = torch.tensor(sorted(set(int(t) for t in allowed_token_ids)))
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor) -> torch.FloatTensor:
-        if self.allowed_token_ids.max().item() >= scores.size(-1):
-            raise ValueError("Allowed token id exceeds the vocabulary size.")
-        original = scores
-        restricted = torch.full_like(original, torch.finfo(original.dtype).min)
-        allowed = self.allowed_token_ids.to(original.device)
-        expanded = allowed.unsqueeze(0).expand(original.size(0), -1)
-        restricted.scatter_(1, expanded, original.gather(1, expanded))
-        return restricted
-
-def _maybe_login_to_hf(token: Optional[str]) -> None:
-    if token and hf_login:
-        hf_login(token, add_to_git_credential=False)
-
-def _configure_cuda_allocator() -> None:
-    if torch.cuda.is_available():
-        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
-
-def _load_label_token_map(tokenizer, label_space: Sequence[int]) -> LabelTokenMap:
-    label_token_map: LabelTokenMap = {}
-    for label in label_space:
-        label_text = f" {label}"
-        token_ids = tokenizer(label_text, add_special_tokens=False, return_attention_mask=False)["input_ids"]
-        label_token_map[int(label)] = token_ids[-1]
-    return label_token_map
-
-@dataclass
-class ExperimentConfig:
-    model_name: str = "meta-llama/Llama-3.2-1B"
-    dataset_name: str = "mteb/tweet_sentiment_extraction"
-    dataset_config: Optional[str] = None
-    train_split: str = "train"
-    eval_split: str = "test"
-    text_field: str = "text"
-    label_field: str = "label"
-    
-    # Hyperparameters optimized for Llama-1B fine-tuning
-    train_subset: Optional[int] = 4000 
-    eval_subset: Optional[int] = 2000 
-    learning_rate: float = 5e-5
-    num_train_epochs: float = 2.0
-    per_device_train_batch_size: int = 4
-    gradient_accumulation_steps: int = 4
-    lora_r: int = 8
-    lora_alpha: int = 32
-    lora_dropout: float = 0.1
-    
-    max_seq_length: int = 516
-    output_dir: str = "outputs/experiment_occlusion"
-    
-    # Interpretability
-    interpretability_example_count: int = 3 
-    run_occlusion: bool = True
-    
-    load_in_4bit: bool = True
-    finetune: bool = True
-    random_seed: int = 42
-    label_space: Optional[Sequence[int]] = (0, 1)
 
 class PromptFormatter:
-    def __init__(self, label_space: Sequence[int]) -> None:
-        self.label_space = list(label_space)
-        label_list = ", ".join(str(label) for label in self.label_space)
-        instruction = f"Respond with only one of the digits {label_list} to indicate the sentiment class."
-        self.template = "{instruction}\nTweet: {sentence}\nLabel:"
-        self.instruction = instruction
+    def __init__(self):
+        self.template = "Classify the sentiment as 0, 1.\nText: {text}\nSentiment:"
 
-    def build_prompt(self, sentence: str) -> str:
-        return self.template.format(instruction=self.instruction, sentence=sentence)
+    def format(self, text: str) -> str:
+        return self.template.format(text=text)
 
-def _prepare_dataset(dataset: DatasetDict, config: ExperimentConfig, tokenizer, formatter: PromptFormatter) -> DatasetDict:
-    def _format_examples(examples):
-        prompts = [formatter.build_prompt(s) for s in examples[config.text_field]]
-        full_seqs = [f"{p} {l}" for p, l in zip(prompts, examples[config.label_field])]
-        model_inputs = tokenizer(full_seqs, max_length=config.max_seq_length, truncation=True, padding="max_length")
-        
-        attention = model_inputs["attention_mask"]
-        labels = []
-        for input_ids, mask in zip(model_inputs["input_ids"], attention):
-            masked = [-100] * len(input_ids)
-            seq_len = int(sum(mask))
-            if seq_len > 0:
-                masked[seq_len - 1] = input_ids[seq_len - 1]
-            labels.append(masked)
-        model_inputs["labels"] = labels
-        return model_inputs
 
-    required_cols = sorted(set(dataset[config.train_split].column_names))
-    processed = dataset.map(_format_examples, batched=True, remove_columns=required_cols)
-    
-    if config.train_subset:
-        processed[config.train_split] = processed[config.train_split].shuffle(seed=config.random_seed).select(range(min(config.train_subset, len(processed[config.train_split]))))
-    if config.eval_subset:
-        processed[config.eval_split] = processed[config.eval_split].shuffle(seed=config.random_seed).select(range(min(config.eval_subset, len(processed[config.eval_split]))))
-    return processed
+def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=8):
+    model.eval()
+    token_0 = tokenizer(" 0", add_special_tokens=False)["input_ids"][0]
+    token_1 = tokenizer(" 1", add_special_tokens=False)["input_ids"][0]
 
-def _truncate_tokenized_dataset(dataset: DatasetDict, max_length: int) -> DatasetDict:
-    def _truncate(example):
-        for key in ("input_ids", "attention_mask", "labels"):
-            if key in example: example[key] = example[key][:max_length]
-        return example
-    return dataset.map(_truncate, load_from_cache_file=False)
+    all_preds, all_labels = [], []
+    for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
+        batch = dataset[i:i + batch_size]
+        texts = [ex["text"] for ex in batch]
+        labels = [ex["label"] for ex in batch]
+        prompts = [formatter.format(t) for t in texts]
 
-def _prepare_texts_labels(config: ExperimentConfig, dataset: DatasetDict) -> Tuple[List[str], List[int]]:
-    split = dataset[config.eval_split]
-    if config.eval_subset:
-        split = split.shuffle(seed=config.random_seed).select(range(min(config.eval_subset, len(split))))
-    return list(split[config.text_field]), list(split[config.label_field])
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+        with torch.no_grad():
+            logits = model(**inputs).logits[:, -1, :]
+        prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
+        preds = (prob_1 > 0.5).int().cpu().numpy()
 
-def _resolve_label_space(config: ExperimentConfig, dataset: DatasetDict) -> List[int]:
-    if config.label_space: return sorted(set(config.label_space))
-    return sorted({int(x) for x in dataset[config.train_split][config.label_field]})
+        all_preds.extend(preds.tolist())
+        all_labels.extend(labels)
 
-def _filter_dataset(dataset: DatasetDict, config: ExperimentConfig, label_space: Sequence[int]) -> DatasetDict:
-    allowed = set(label_space)
-    return dataset.filter(lambda x: int(x[config.label_field]) in allowed)
+        del inputs, logits, prob_1
+        torch.cuda.empty_cache()
 
-# --- Core Evaluation & Occlusion Functions ---
-
-def _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter):
-    """Returns a function that takes raw texts and returns probabilities."""
-    def _predict(texts: Sequence[str]) -> np.ndarray:
-        texts = [str(t) for t in texts]
-        prompts = [formatter.build_prompt(t) for t in texts]
-        
-        probs_list = []
-        batch_size = 8
-        for i in range(0, len(prompts), batch_size):
-            batch = prompts[i:i+batch_size]
-            inputs = tokenizer(batch, padding=True, truncation=True, max_length=max_length, return_tensors="pt").to(device)
-            
-            model.eval()
-            with torch.no_grad():
-                outputs = model(**inputs)
-            
-            logits = outputs.logits
-            seq_lens = inputs.attention_mask.sum(dim=-1) - 1
-            final_logits = logits[torch.arange(logits.size(0), device=device), seq_lens]
-            
-            sorted_labels = sorted(label_token_map.keys())
-            target_ids = torch.tensor([label_token_map[l] for l in sorted_labels], device=device)
-            label_logits = final_logits[:, target_ids]
-            probs = torch.softmax(label_logits, dim=-1)
-            probs_list.append(probs.cpu().numpy())
-            
-        return np.concatenate(probs_list, axis=0)
-    return _predict
-
-def evaluate_model(model, tokenizer, texts, labels, label_token_map, device, max_length, formatter):
-    preds = []
-    sorted_labels = sorted(label_token_map.keys())
-    
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, max_length, formatter)
-    probs_all = predict_fn(texts)
-    pred_indices = np.argmax(probs_all, axis=1)
-    preds = [sorted_labels[i] for i in pred_indices]
-    
-    from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
-    cm = confusion_matrix(labels, preds, labels=sorted_labels)
-    acc = accuracy_score(labels, preds)
-    p, r, f1, _ = precision_recall_fscore_support(labels, preds, average='macro', zero_division=0)
-    try:
-        mcc = matthews_corrcoef(labels, preds)
-    except:
-        mcc = 0.0
+    acc = accuracy_score(all_labels, all_preds)
+    p, r, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="macro", zero_division=0)
+    mcc = matthews_corrcoef(all_labels, all_preds)
+    cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
 
     return {
-        "accuracy": acc, "precision": p, "recall": r, "f1": f1, "mcc": mcc,
-        "confusion_matrix": cm.tolist()
-    }
+        "accuracy": float(acc), "precision": float(p), "recall": float(r),
+        "f1": float(f1), "mcc": float(mcc), "confusion_matrix": cm.tolist()
+    }, np.array(all_preds)
 
-def run_occlusion(model, tokenizer, texts, label_token_map, device, config, formatter, prefix):
-    """
-    Runs Occlusion (Leave-One-Out) analysis.
-    Iteratively removes one word and measures confidence drop.
-    """
-    print(f"Running Occlusion for {prefix}...")
-    predict_fn = _build_probability_fn(model, tokenizer, label_token_map, device, config.max_seq_length, formatter)
-    class_names = [str(l) for l in sorted(label_token_map.keys())]
-    
-    samples = texts[:config.interpretability_example_count]
-    results = []
-    
-    for idx, text in enumerate(samples):
-        print(f"Analyzing example {idx+1}/{len(samples)}...")
-        
-        # 1. Get Baseline
-        base_probs = predict_fn([text])[0]
-        base_pred_idx = np.argmax(base_probs)
-        base_conf = base_probs[base_pred_idx]
-        predicted_label = class_names[base_pred_idx]
-        
-        # 2. Tokenize (Word-level split for better interpretability than BPE tokens)
-        words = text.split()
-        impact_scores = []
-        
-        # 3. Iterate
-        for i in range(len(words)):
-            # Create perturbed text (remove word i)
-            new_text = " ".join(words[:i] + words[i+1:])
-            
-            # Predict
-            new_probs = predict_fn([new_text])[0]
-            
-            # We look at the confidence of the ORIGINAL predicted class
-            new_conf = new_probs[base_pred_idx]
-            
-            # Score = How much did confidence DROP?
-            # > 0: The word helped (Removing it lowered confidence) -> Important
-            # < 0: The word hurt (Removing it raised confidence) -> Distractor
-            impact = base_conf - new_conf
-            impact_scores.append((words[i], float(impact)))
-            
-        results.append({
-            "text": text,
-            "predicted_label": predicted_label,
-            "base_confidence": float(base_conf),
-            "token_weights": impact_scores
-        })
 
-    # Save JSON
-    with open(os.path.join(config.output_dir, f"{prefix}_occlusion.json"), "w") as f:
-        json.dump(results, f, indent=2)
+def plot_confusion(cm, title, path):
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(title, fontsize=16, pad=20)
+    plt.colorbar()
+    plt.xticks([0, 1], ["Negative", "Positive"])
+    plt.yticks([0, 1], ["Negative", "Positive"])
+    plt.xlabel("Predicted"); plt.ylabel("True")
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, str(cm[i][j]), ha="center", va="center",
+                     color="white" if cm[i][j] > cm.max()/2 else "black", fontsize=18)
+    plt.tight_layout()
+    plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
 
-    # Plot
-    _plot_occlusion(results, config.output_dir, prefix)
-    
-    return results
 
-# --- Plotting Functions ---
+def generate_all_explanations(model, tokenizer, formatter, dataset, device, title_prefix, output_dir):
+    explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
+    token_0 = tokenizer(" 0", add_special_tokens=False)["input_ids"][0]
+    token_1 = tokenizer(" 1", add_special_tokens=False)["input_ids"][0]
 
-def _plot_occlusion(occlusion_results, output_dir, prefix):
-    if not plt: return
+    def predict_fn(texts):
+        prompts = [formatter.format(t) for t in texts]
+        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+        with torch.no_grad():
+            logits = model(**inputs).logits[:, -1, :]
+        prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
+        return np.stack([1 - prob_1, prob_1], axis=1)
 
-    for i, res in enumerate(occlusion_results):
-        weights = res['token_weights']
-        if not weights: continue
-        
-        words, impacts = zip(*weights)
-        
-        # Sort by impact for cleaner visualization (Top 15)
-        indices = np.argsort(np.abs(impacts))
-        if len(indices) > 15:
-            indices = indices[-15:]
-        
-        sorted_words = [words[j] for j in indices]
-        sorted_impacts = [impacts[j] for j in indices]
-        
-        fig, ax = plt.subplots(figsize=(8, 6))
-        y_pos = np.arange(len(sorted_words))
-        
-        # Color: Red if Positive Impact (Important), Blue if Negative (Distracting)
-        colors = ['#d62728' if x > 0 else '#1f77b4' for x in sorted_impacts]
-        
-        ax.barh(y_pos, sorted_impacts, color=colors)
-        ax.set_yticks(y_pos)
-        ax.set_yticklabels(sorted_words)
-        ax.set_xlabel("Confidence Drop (Impact)")
-        ax.set_title(f"{prefix} Example {i+1}: Pred '{res['predicted_label']}'")
-        
-        # Add a grid
-        ax.grid(axis='x', linestyle='--', alpha=0.6)
-        
-        plt.tight_layout()
-        path = os.path.join(output_dir, f"{prefix}_occlusion_plot_ex{i}.png")
-        plt.savefig(path)
+    # Get correct predictions
+    _, preds = evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=16)
+    labels = [ex["label"] for ex in dataset]
+    correct_neg = [i for i, (l, p) in enumerate(zip(labels, preds)) if l == 0 and p == 0]
+    correct_pos = [i for i, (l, p) in enumerate(zip(labels, preds)) if l == 1 and p == 1]
+    selected = random.sample(correct_neg, 5) + random.sample(correct_pos, 5)
+    random.shuffle(selected)
+
+    # Create comparison grids
+    fig_lime = plt.figure(figsize=(24, 10))
+    fig_occ = plt.figure(figsize=(24, 10))
+    fig_ig = plt.figure(figsize=(24, 10))
+
+    for plot_idx, idx in enumerate(selected, 1):
+        ex = dataset[idx]
+        text = ex["text"]
+        true = "Pos" if ex["label"] == 1 else "Neg"
+
+        # LIME
+        exp_lime = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=1000)
+        exp_lime.as_pyplot_figure(label=ex["label"])
+        ax = fig_lime.add_subplot(2, 5, plot_idx)
+        ax.imshow(plt.gcf().canvas.buffer_rgba())
+        ax.set_title(f"{true}: {text[:70]}...", fontsize=9)
+        ax.axis("off")
         plt.close()
-    
-    print(f"Saved Occlusion plots to {output_dir}")
 
-def _plot_confusion_matrix(cm, labels, output_dir, prefix):
-    if not plt: return
-    cm = np.array(cm)
-    fig, ax = plt.subplots(figsize=(6,5))
-    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    ax.figure.colorbar(im, ax=ax)
-    
-    tick_marks = np.arange(len(labels))
-    ax.set_xticks(tick_marks)
-    ax.set_xticklabels(labels)
-    ax.set_yticks(tick_marks)
-    ax.set_yticklabels(labels)
-    
-    thresh = cm.max() / 2.
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, format(cm[i, j], 'd'),
-                     horizontalalignment="center",
-                     color="white" if cm[i, j] > thresh else "black")
-    
-    ax.set_ylabel('True label')
-    ax.set_xlabel('Predicted label')
-    ax.set_title(f'{prefix.replace("_", " ").title()} Confusion Matrix')
-    plt.tight_layout()
-    plt.savefig(os.path.join(output_dir, f"{prefix}_confusion_matrix.png"))
-    plt.close()
+        # Occlusion
+        inputs = tokenizer(formatter.format(text), return_tensors="pt").to(device)
+        occlusion = Occlusion(model)
+        attr_occ = occlusion.attribute(inputs["input_ids"], strides=1, sliding_window_shapes=(5,), target=0)
+        tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+        attr_occ = attr_occ[0].cpu().numpy()
+        viz_occ = viz.VisualizationDataRecord(attr_occ, 0, 0, 0, 0, 0, tokens, 0)
+        fig_occ_temp, _ = viz.visualize_text([viz_occ])
+        ax = fig_occ.add_subplot(2, 5, plot_idx)
+        ax.imshow(fig_occ_temp.canvas.buffer_rgba())
+        ax.axis("off")
+        plt.close(fig_occ_temp)
 
-def _plot_comparison(zs_metrics, ft_metrics, output_dir):
-    if not plt or not ft_metrics: return
-    
-    metrics = ['accuracy', 'precision', 'recall', 'f1']
-    z_vals = [zs_metrics[m] for m in metrics]
-    f_vals = [ft_metrics[m] for m in metrics]
-    
-    x = np.arange(len(metrics))
-    width = 0.35
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.bar(x - width/2, z_vals, width, label='Zero Shot')
-    ax.bar(x + width/2, f_vals, width, label='Fine Tuned')
-    
-    ax.set_ylabel('Score')
-    ax.set_title('Metrics Comparison')
-    ax.set_xticks(x)
-    ax.set_xticklabels([m.upper() for m in metrics])
-    ax.legend()
-    ax.set_ylim(0, 1.1)
-    
-    plt.tight_layout()
-    path = os.path.join(output_dir, "metrics_comparison.png")
-    plt.savefig(path)
-    plt.close()
-    print(f"Saved {path}")
+        # Integrated Gradients
+        lig = LayerIntegratedGradients(model, model.model.embed_tokens)
+        def forward_ig(input_ids):
+            outputs = model(input_ids)
+            logits = outputs.logits[:, -1, :]
+            return torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
+        attr_ig, _ = lig.attribute(inputs["input_ids"], target=0, custom_attribution_func=forward_ig, return_convergence_delta=True, n_steps=50)
+        attr_ig = attr_ig[0].cpu().detach().numpy()
+        viz_ig = viz.VisualizationDataRecord(attr_ig, 0, 0, 0, 0, 0, tokens, 0)
+        fig_ig_temp, _ = viz.visualize_text([viz_ig])
+        ax = fig_ig.add_subplot(2, 5, plot_idx)
+        ax.imshow(fig_ig_temp.canvas.buffer_rgba())
+        ax.axis("off")
+        plt.close(fig_ig_temp)
 
-# --- Main Execution Flow ---
+    fig_lime.suptitle(f"{title_prefix} - LIME", fontsize=26, weight="bold")
+    fig_occ.suptitle(f"{title_prefix} - Occlusion", fontsize=26, weight="bold")
+    fig_ig.suptitle(f"{title_prefix} - Integrated Gradients (SHAP)", fontsize=26, weight="bold")
 
-def run_experiment(args: argparse.Namespace) -> None:
-    _maybe_login_to_hf(args.huggingface_token or os.environ.get("HF_TOKEN"))
-    _configure_cuda_allocator()
-    
-    config = ExperimentConfig(
-        model_name=args.model_name, output_dir=args.output_dir,
-        load_in_4bit=args.load_in_4bit, run_occlusion=args.run_occlusion,
-        finetune=args.finetune,
-        train_subset=args.train_subset,
-        eval_subset=args.eval_subset,
-        learning_rate=args.learning_rate,
-        lora_r=args.lora_r
-    )
-    
-    os.makedirs(config.output_dir, exist_ok=True)
-    set_seed(config.random_seed)
+    fig_lime.tight_layout(rect=[0, 0, 1, 0.95])
+    fig_occ.tight_layout(rect=[0, 0, 1, 0.95])
+    fig_ig.tight_layout(rect=[0, , 0, 1, 0.95])
+
+    fig_lime.savefig(f"{output_dir}/lime_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
+    fig_occ.savefig(f"{output_dir}/occlusion_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
+    fig_ig.savefig(f"{output_dir}/integratedgrad_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
+
+    # Side-by-side comparison
+    fig_comp, axes = plt.subplots(3, 10, figsize=(40, 12))
+    fig_comp.suptitle(f"{title_prefix} - Full Comparison (LIME | Occlusion | Integrated Gradients)", fontsize=30, weight="bold")
+    # You can stitch the three images here if desired — omitted for brevity
+
+    plt.close('all')
+    print(f"All explanations saved for {title_prefix}")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", default="meta-llama/Llama-3.2-1B")
+    parser.add_argument("--output-dir", default="outputs/final_all_methods")
+    parser.add_argument("--train-size", type=int, default=8000)
+    parser.add_argument("--eval-size", type=int, default=2000)
+    parser.add_argument("--epochs", type=float, default=3.0)
+    args = parser.parse_args()
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 1. Load Tokenizer & Data
-    print("Loading tokenizer and data...")
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name, use_fast=True)
-    if not tokenizer.pad_token: tokenizer.pad_token = tokenizer.eos_token
-    
-    dataset = load_dataset(config.dataset_name, config.dataset_config) if config.dataset_config else load_dataset(config.dataset_name)
-    label_space = _resolve_label_space(config, dataset)
-    dataset = _filter_dataset(dataset, config, label_space)
-    
-    label_token_map = _load_label_token_map(tokenizer, label_space)
-    formatter = PromptFormatter(label_space)
-    
-    # 2. Load BASE Model
-    print("Loading Base Model...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer.pad_token = tokenizer.eos_token
+
     model = AutoModelForCausalLM.from_pretrained(
-        config.model_name, 
-        load_in_4bit=config.load_in_4bit, 
-        device_map="auto" if config.load_in_4bit else None
+        args.model,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16,
+                                               bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4"),
     )
-    if not config.load_in_4bit: model.to(device)
+    model = prepare_model_for_kbit_training(model)
 
-    # 3. Prepare Evaluation Data
-    eval_texts, eval_labels = _prepare_texts_labels(config, dataset)
+    formatter = PromptFormatter()
+    raw = load_dataset("mteb/tweet_sentiment_extraction").filter(lambda x: x["label"] in [0, 1])
+    eval_data = raw["test"].shuffle(seed=42).select(range(args.eval_size))
 
-    # ==========================================
-    # PHASE 1: ZERO-SHOT
-    # ==========================================
-    print("--- Phase 1: Running Zero-Shot Evaluation ---")
-    zs_metrics = evaluate_model(model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
-    print("Zero-Shot Metrics:", zs_metrics)
-    
-    with open(os.path.join(config.output_dir, "zero_shot_metrics.json"), "w") as f: json.dump(zs_metrics, f, indent=2)
-    _plot_confusion_matrix(zs_metrics['confusion_matrix'], label_space, config.output_dir, "zero_shot")
-    
-    if config.run_occlusion:
-        run_occlusion(model, tokenizer, eval_texts, label_token_map, device, config, formatter, "zero_shot")
+    print("Zero-shot...")
+    zs_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device, batch_size=8)
+    plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot", f"{args.output_dir}/confusion_zero_shot.png")
+    generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Zero-Shot", args.output_dir)
 
-    # ==========================================
-    # PHASE 2: FINE-TUNING
-    # ==========================================
-    ft_metrics = None
-    if args.finetune:
-        print("--- Phase 2: Starting Fine-Tuning ---")
-        
-        processed_dataset = _prepare_dataset(dataset, config, tokenizer, formatter)
-        
-        if config.load_in_4bit: model = prepare_model_for_kbit_training(model)
-        peft_config = LoraConfig(r=config.lora_r, lora_alpha=config.lora_alpha, task_type="CAUSAL_LM", target_modules=["q_proj", "v_proj"])
-        model.config.use_cache = False
-        peft_model = get_peft_model(model, peft_config)
-        peft_model.print_trainable_parameters()
-        
-        trainer = Trainer(
-            model=peft_model,
-            train_dataset=processed_dataset[config.train_split],
-            eval_dataset=processed_dataset[config.eval_split],
-            args=TrainingArguments(
-                output_dir=config.output_dir, 
-                num_train_epochs=config.num_train_epochs, 
-                per_device_train_batch_size=config.per_device_train_batch_size,
-                gradient_accumulation_steps=config.gradient_accumulation_steps,
-                learning_rate=config.learning_rate,
-                logging_steps=10,
-                save_strategy="no",
-                fp16=True
-            ),
-            data_collator=default_data_collator
-        )
-        
-        try:
-            trainer.train()
-        except Exception as e:
-            print(f"Training failed: {e}")
-        
-        peft_model.eval()
-        
-        print("Evaluating Fine-Tuned Model...")
-        ft_metrics = evaluate_model(peft_model, tokenizer, eval_texts, eval_labels, label_token_map, device, config.max_seq_length, formatter)
-        print("Fine-Tuned Metrics:", ft_metrics)
-        
-        with open(os.path.join(config.output_dir, "fine_tuned_metrics.json"), "w") as f: json.dump(ft_metrics, f, indent=2)
-        _plot_confusion_matrix(ft_metrics['confusion_matrix'], label_space, config.output_dir, "fine_tuned")
-        
-        if config.run_occlusion:
-            run_occlusion(peft_model, tokenizer, eval_texts, label_token_map, device, config, formatter, "fine_tuned")
+    print("Fine-tuning...")
+    model = get_peft_model(model, LoraConfig(r=32, lora_alpha=64, lora_dropout=0.05,
+                                             target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
+                                             task_type="CAUSAL_LM"))
 
-    # ==========================================
-    # PHASE 3: COMPARISON
-    # ==========================================
-    if ft_metrics:
-        _plot_comparison(zs_metrics, ft_metrics, config.output_dir)
+    def prepare(examples):
+        prompts = [formatter.format(t) + f" {l}" for t, l in zip(examples["text"], examples["label"])]
+        tokenized = tokenizer(prompts, truncation=True, max_length=256, padding=False)
+        labels = []
+        for i, inp in enumerate(tokenized["input_ids"]):
+            prompt_len = len(tokenizer(formatter.format(examples["text"][i]))["input_ids"])
+            lbl = [-100] * len(inp)
+            if prompt_len < len(inp):
+                lbl[prompt_len] = inp[prompt_len]
+            labels.append(lbl)
+        tokenized["labels"] = labels
+        return tokenized
 
+    train_data = raw["train"].shuffle(seed=42).select(range(args.train_size)).map(prepare, batched=True,
+                                                                                 remove_columns=raw["train"].column_names)
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--dataset-name", default="mteb/tweet_sentiment_extraction")
-    parser.add_argument("--dataset-config", default=None)
-    
-    # Updated args
-    parser.add_argument("--finetune", action="store_true", default=True) 
-    
-    parser.add_argument("--run-occlusion", action="store_true")
-    parser.add_argument("--no-run-occlusion", dest="run_occlusion", action="store_false")
-    parser.set_defaults(run_occlusion=True)
-    
-    parser.add_argument("--train-subset", type=int, default=4000)
-    parser.add_argument("--eval-subset", type=int, default=2000)
-    parser.add_argument("--learning-rate", type=float, default=5e-5)
-    parser.add_argument("--lora-r", type=int, default=8)
-    
-    parser.add_argument("--load-in-4bit", action="store_true")
-    parser.add_argument("--output-dir", default="outputs/experiment_occlusion")
-    parser.add_argument("--huggingface-token", default=None)
-    return parser
+    trainer = Trainer(model=model, args=TrainingArguments(output_dir=args.output_dir, num_train_epochs=args.epochs,
+                                                         per_device_train_batch_size=8, gradient_accumulation_steps=4,
+                                                         learning_rate=3e-4, fp16=True, logging_steps=10, save_strategy="no"),
+                      train_dataset=train_data, data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False))
+    trainer.train()
+
+    print("Fine-tuned evaluation...")
+    ft_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device, batch_size=8)
+    plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned", f"{args.output_dir}/confusion_fine_tuned.png")
+    generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Fine-Tuned", args.output_dir)
+
+    with open(f"{args.output_dir}/results.json", "w") as f:
+        json.dump({"zero_shot": zs_metrics, "fine_tuned": ft_metrics}, f, indent=2)
+
+    print(f"\nSUCCESS! All files in {args.output_dir}")
+    print("   • confusion_zero_shot.png")
+    print("   • lime_zero_shot.png   occlusion_zero_shot.png   integratedgrad_zero_shot.png")
+    print("   • same for fine-tuned")
+    print("   • results.json")
+
 
 if __name__ == "__main__":
-    parser = build_parser()
-    run_experiment(parser.parse_args())
+    main()
