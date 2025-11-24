@@ -1,6 +1,5 @@
-# final_working_all_methods.py
-# Zero-shot + LoRA fine-tuning + LIME explanations on Llama-3.2-1B (4-bit)
-# Tested and working on PACE (V100) — no OOM, no bfloat16 errors, correct predictions
+# final_working_llama_3_2_1B_lime.py
+# Zero-shot + LoRA fine-tuning + correct LIME on Llama-3.2-1B (4-bit)
 
 from __future__ import annotations
 
@@ -32,10 +31,10 @@ class PromptFormatter:
         return self.template.format(text=text)
 
 
+# Correct & safe predict function for LIME + evaluation
 def make_predict_fn(model, tokenizer, formatter, device):
-    # Correct token IDs (no leading space!)
-    token_0 = tokenizer("0", add_special_tokens=False)["input_ids"][0]   # → 29871
-    token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]   # → 29896
+    token_0 = tokenizer("0", add_special_tokens=False)["input_ids"][0]
+    token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]
 
     def predict_fn(texts):
         if isinstance(texts, str):
@@ -47,9 +46,9 @@ def make_predict_fn(model, tokenizer, formatter, device):
             inputs = tokenizer(prompts, return_tensors="pt", padding=True,
                              truncation=True, max_length=256).to(device)
             with torch.no_grad():
-                logits = model(**inputs).logits[:, -1, :].float()  # ← .float() fixes bfloat16 error
-            prob_1 = torch.softmax(logits[:, [token_0AD_token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
-            probs.extend(prob_1)
+                logits = model(**inputs).logits[:, -1, :].float()          # .float() → fixes bfloat16 error
+            prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
+            probs.extend(prob_1.cpu().numpy())
             del inputs, logits
             torch.cuda.empty_cache()
         p = np.array(probs)
@@ -59,7 +58,6 @@ def make_predict_fn(model, tokenizer, formatter, device):
 
 def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=8):
     model.eval()
-    # Use correct tokens without space
     token_0 = tokenizer("0", add_special_tokens=False)["input_ids"][0]
     token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]
 
@@ -75,7 +73,7 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
                            truncation=True, max_length=256).to(device)
 
         with torch.no_grad():
-            logits = model(**inputs).logits[:, -1, :].float()  # ← .float() here too!
+            logits = model(**inputs).logits[:, -1, :].float()
         prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
         preds = (prob_1 > 0.5).int().cpu().numpy()
 
@@ -91,24 +89,19 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
     cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
 
     return {
-        "accuracy": float(acc),
-        "precision": float(p),
-        "recall": float(r),
-        "f1": float(f1),
-        "mcc": float(mcc),
-        "confusion_matrix": cm.tolist()
+        "accuracy": float(acc), "precision": float(p), "recall": float(r),
+        "f1": float(f1), "mcc": float(mcc), "confusion_matrix": cm.tolist()
     }, np.array(all_preds)
 
 
 def plot_confusion(cm, title, path):
     plt.figure(figsize=(6, 5))
-    plt.imshow(cm, cmap="Blues", vmin=0, vmax=1200)
+    plt.imshow(cm, cmap="Blues")
     plt.title(title, fontsize=16, pad=20)
     plt.colorbar()
     plt.xticks([0, 1], ["Negative", "Positive"])
     plt.yticks([0, 1], ["Negative", "Positive"])
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
+    plt.xlabel("Predicted"); plt.ylabel("True")
     for i in range(2):
         for j in range(2):
             plt.text(j, i, str(cm[i][j]), ha="center", va="center",
@@ -128,12 +121,11 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
     correct_neg = [i for i, (l, p) in enumerate(zip(labels, preds)) if l == 0 and p == 0]
     correct_pos = [i for i, (l, p) in enumerate(zip(labels, preds)) if l == 1 and p == 1]
 
-    selected_neg = random.sample(correct_neg, min(5, len(correct_neg)))
-    selected_pos = random.sample(correct_pos, min(5, len(correct_pos)))
-    selected = selected_neg + selected_pos
+    selected = (random.sample(correct_neg, min(5, len(correct_neg))) +
+                random.sample(correct_pos, min(5, len(correct_pos))))
     random.shuffle(selected)
 
-    fig_lime = plt.figure(figsize=(24, 10))
+    fig = plt.figure(figsize=(24, 10))
 
     for plot_idx, idx in enumerate(selected, 1):
         text = dataset[idx]["text"]
@@ -141,17 +133,17 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
 
         exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=500)
         temp_fig = exp.as_pyplot_figure()
-        ax = fig_lime.add_subplot(2, 5, plot_idx)
+        ax = fig.add_subplot(2, 5, plot_idx)
         ax.imshow(temp_fig.canvas.buffer_rgba())
         ax.set_title(f"{true_label}: {text[:60]}...", fontsize=9)
         ax.axis("off")
         plt.close(temp_fig)
 
-    fig_lime.suptitle(f"{title_prefix} - LIME Explanations", fontsize=26, weight="bold")
-    fig_lime.tight_layout(rect=[0, 0, 1, 0.95])
-    fig_lime.savefig(f"{output_dir}/lime_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
+    fig.suptitle(f"{title_prefix} - LIME Explanations", fontsize=26, weight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(f"{output_dir}/lime_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
     plt.close('all')
-    print(f"LIME explanations saved for {title_prefix}")
+    print(f"LIME grid saved: {title_prefix}")
 
 
 def main():
@@ -167,7 +159,7 @@ def main():
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Loading tokenizer and 4-bit model...")
+    print("Loading tokenizer & 4-bit model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -184,24 +176,22 @@ def main():
     )
 
     formatter = PromptFormatter()
-    raw = load_dataset("mteb/tweet_sentiment_extraction")
-    raw = raw.filter(lambda x: x["label"] in [0, 1])
+    raw = load_dataset("mteb/tweet_sentiment_extraction").filter(lambda x: x["label"] in [0, 1])
     eval_data = raw["test"].shuffle(seed=42).select(range(args.eval_size))
 
     # Zero-shot
     print("Zero-shot evaluation...")
     zs_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device)
-    plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot", f"{args.output_dir}/confusion_zero_shot.png")
+    plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot",
+                   f"{args.output_dir}/confusion_zero_shot.png")
     generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Zero-Shot", args.output_dir)
 
-    # Fine-tuning with LoRA
+    # Fine-tuning
     print("Fine-tuning with LoRA...")
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, LoraConfig(
-        r=32,
-        lora_alpha=64,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        r=32, lora_alpha=64, lora_dropout=0.05,
+        target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
         task_type="CAUSAL_LM"
     ))
 
@@ -210,7 +200,7 @@ def main():
         tokenized = tokenizer(prompts, truncation=True, max_length=256, padding=False)
         labels = []
         for i, inp in enumerate(tokenized["input_ids"]):
-            prompt_len = len(tokenizer(formatter.format(examples["text"][i]), add_special_tokens=False)["input_ids"]) + 1
+            prompt_len = len(tokenizer(formatter.format(examples["text"][i]))["input_ids"])
             lbl = [-100] * len(inp)
             if prompt_len < len(inp):
                 lbl[prompt_len] = inp[prompt_len]
@@ -238,22 +228,18 @@ def main():
     )
     trainer.train()
 
-    # Fine-tuned evaluation
+    # Fine-tuned
     print("Fine-tuned evaluation...")
     ft_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device)
-    plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned", f"{args.output_dir}/confusion_fine_tuned.png")
+    plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned",
+                   f"{args.output_dir}/confusion_fine_tuned.png")
     generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Fine-Tuned", args.output_dir)
 
-    # Save results
     with open(f"{args.output_dir}/results.json", "w") as f:
         json.dump({"zero_shot": zs_metrics, "fine_tuned": ft_metrics}, f, indent=2)
 
-    print("ALL DONE! Results saved to:", args.output_dir)
-    print("   • confusion_zero_shot.png")
-    print("   • confusion_fine_tuned.png")
-    print("   • lime_zero-shot.png")
-    print("   • lime_fine-tuned.png")
-    print("   • results.json")
+    print("\nALL DONE! Check your output folder:")
+    print(f"   {args.output_dir}/")
 
 
 if __name__ == "__main__":
