@@ -1,6 +1,3 @@
-# llama_3.2_1B_final_working.py
-# Zero-shot + LoRA + LIME (fully working on PACE, V100, no errors)
-
 from __future__ import annotations
 
 import argparse
