@@ -38,12 +38,14 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
 
     all_preds, all_labels = [], []
     for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
-        batch = dataset[i:i + batch_size]
+        end = min(i + batch_size, len(dataset))
+        batch = [dataset[j] for j in range(i, end)]   # ← guaranteed list of dicts
         texts = [ex["text"] for ex in batch]
         labels = [ex["label"] for ex in batch]
-        prompts = [formatter.format(t) for t in texts]
 
+        prompts = [formatter.format(t) for t in texts]
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+
         with torch.no_grad():
             logits = model(**inputs).logits[:, -1, :]
         prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
@@ -54,6 +56,7 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
 
         del inputs, logits, prob_1
         torch.cuda.empty_cache()
+
 
     acc = accuracy_score(all_labels, all_preds)
     p, r, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="macro", zero_division=0)
