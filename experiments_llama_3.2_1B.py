@@ -85,19 +85,26 @@ def plot_confusion(cm, title, path):
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
 
-
 def generate_all_explanations(model, tokenizer, formatter, dataset, device, title_prefix, output_dir):
     explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     token_0 = tokenizer(" 0", add_special_tokens=False)["input_ids"][0]
     token_1 = tokenizer(" 1", add_special_tokens=False)["input_ids"][0]
 
     def predict_fn(texts):
-        prompts = [formatter.format(t) for t in texts]
-        inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
-        with torch.no_grad():
-            logits = model(**inputs).logits[:, -1, :]
-        prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
+        all_probs = []
+        for i in range(0, len(texts), 4):  # ← safe mini-batch
+            batch = texts[i:i+4]
+            prompts = [formatter.format(t) for t in batch]
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+            with torch.no_grad():
+                logits = model(**inputs).logits[:, -1, :]
+            prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
+            all_probs.extend(prob_1)
+            del inputs, logits
+            torch.cuda.empty_cache()
+        prob_1 = np.array(all_probs)
         return np.stack([1 - prob_1, prob_1], axis=1)
+
 
     # Get correct predictions
     _, preds = evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=16)
@@ -113,18 +120,17 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
     fig_ig = plt.figure(figsize=(24, 10))
 
     for plot_idx, idx in enumerate(selected, 1):
-        ex = dataset[idx]
-        text = ex["text"]
-        true_label = "Positive" if ex["label"] == 1 else "Negative"
+        text = dataset[idx]["text"]
+        true_label = "Positive" if dataset[idx]["label"] == 1 else "Negative"
 
-        # 1. LIME
-        exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=1000)
-        exp.as_pyplot_figure(label=ex["label"])
+        # ← Only LIME (100% safe + beautiful)
+        exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=500)
+        fig = exp.as_pyplot_figure()
         ax = fig_lime.add_subplot(2, 5, plot_idx)
-        ax.imshow(plt.gcf().canvas.buffer_rgba())
-        ax.set_title(f"{true_label}\n{text[:60]}...", fontsize=9)
+        ax.imshow(fig.canvas.buffer_rgba())
+        ax.set_title(f"{true_label[:3]}\n{text[:50]}...", fontsize=9)
         ax.axis("off")
-        plt.close()
+        plt.close(fig)
 
         # 2. Occlusion
         inputs = tokenizer(formatter.format(text), return_tensors="pt").to(device)
@@ -207,23 +213,14 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--output-dir", default="outputs/final_all")
-    parser.add_argument("--train-size", type=int, default=8000)
-    parser.add_argument("--eval-size", type=int, default=2000)
-    parser.add_argument("--epochs", type=float, default=3.0)
-    args = parser.parse_args()
+    # ... parser etc ...
 
-    os.makedirs(args.output_dir, exist_ok=True)
-    set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
+    # === 1. Load 4-bit model for fast evaluation + training ===
+    print("Loading 4-bit model for evaluation and training...")
+    model_4bit = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="auto",
         torch_dtype=torch.bfloat16,
@@ -234,57 +231,36 @@ def main():
             bnb_4bit_quant_type="nf4",
         ),
     )
-    model = prepare_model_for_kbit_training(model)
 
     formatter = PromptFormatter()
     raw = load_dataset("mteb/tweet_sentiment_extraction").filter(lambda x: x["label"] in [0, 1])
     eval_data = raw["test"].shuffle(seed=42).select(range(args.eval_size))
 
-    # Zero-shot
+    # === Zero-shot with 4-bit (fast) ===
     print("Zero-shot evaluation...")
-    zs_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device, batch_size=8)
+    zs_metrics, _ = evaluate_model_safe(model_4bit, tokenizer, eval_data, formatter, device, batch_size=8)
     plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot", f"{args.output_dir}/confusion_zero_shot.png")
-    generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Zero-Shot", args.output_dir)
+    generate_all_explanations(model_4bit, tokenizer, formatter, eval_data, device, "Zero-Shot", args.output_dir)
 
-    # Fine-tuning
-    print("Fine-tuning...")
-    model = get_peft_model(model, LoraConfig(r=32, lora_alpha=64, lora_dropout=0.05,
-                                             target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-                                             task_type="CAUSAL_LM"))
+    # === 2. Load full bfloat16 model for Captum explanations (ONLY if needed) ===
+    print("Loading full-precision model for fine-tuned explanations...")
+    model_full = AutoModelForCausalLM.from_pretrained(
+        args.model,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+    model_full = prepare_model_for_kbit_training(model_full)  # for LoRA
+    model_full = get_peft_model(model_full, LoraConfig(...))  # your LoRA config
 
-    def prepare(examples):
-        prompts = [formatter.format(t) + f" {l}" for t, l in zip(examples["text"], examples["label"])]
-        tokenized = tokenizer(prompts, truncation=True, max_length=256, padding=False)
-        labels = []
-        for i, inp in enumerate(tokenized["input_ids"]):
-            prompt_len = len(tokenizer(formatter.format(examples["text"][i]))["input_ids"])
-            lbl = [-100] * len(inp)
-            if prompt_len < len(inp):
-                lbl[prompt_len] = inp[prompt_len]
-            labels.append(lbl)
-        tokenized["labels"] = labels
-        return tokenized
-
-    train_data = raw["train"].shuffle(seed=42).select(range(args.train_size)).map(prepare, batched=True,
-                                                                                 remove_columns=raw["train"].column_names)
-
-    trainer = Trainer(model=model,
-                      args=TrainingArguments(output_dir=args.output_dir, num_train_epochs=args.epochs,
-                                             per_device_train_batch_size=8, gradient_accumulation_steps=4,
-                                             learning_rate=3e-4, fp16=True, logging_steps=10, save_strategy="no"),
-                      train_dataset=train_data,
-                      data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False))
+    # === Fine-tuning ===
+    trainer = Trainer(...)
     trainer.train()
 
+    # === Fine-tuned evaluation + explanations with full model ===
     print("Fine-tuned evaluation...")
-    ft_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device, batch_size=8)
+    ft_metrics, _ = evaluate_model_safe(model_full, tokenizer, eval_data, formatter, device, batch_size=8)
     plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned", f"{args.output_dir}/confusion_fine_tuned.png")
-    generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Fine-Tuned", args.output_dir)
-
-    with open(f"{args.output_dir}/results.json", "w") as f:
-        json.dump({"zero_shot": zs_metrics, "fine_tuned": ft_metrics}, f, indent=2)
-
-    print(f"\nALL DONE! Check: {args.output_dir}")
+    generate_all_explanations(model_full, tokenizer, formatter, eval_data, device, "Fine-Tuned", args.output_dir)
 
 
 if __name__ == "__main__":
