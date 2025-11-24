@@ -4,7 +4,6 @@ import argparse
 import json
 import os
 import random
-
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -119,31 +118,32 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
                 random.sample(correct_pos, min(5, len(correct_pos))))
     random.shuffle(selected)
 
-    fig, axes = plt.subplots(2, 5, figsize=(24, 10))
+    fig, axes = plt.subplots(2, 5, figsize=(25, 10))
     axes = axes.flatten()
 
-    for plot_idx, idx in enumerate(selected, 1):
+    for plot_idx in range(len(selected)):
+        idx = selected[plot_idx]
         text = dataset[idx]["text"]
         true_label = "Pos" if dataset[idx]["label"] == 1 else "Neg"
 
         exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=500)
 
-        # Save LIME plot to temp file then read back (100% works with any matplotlib)
-        temp_path = f"/tmp/lime_temp_{plot_idx}.png"
+        # Save to temp file and read back — 100% works
+        temp_path = f"/tmp/lime_temp_{plot_idx + 1}.png"
         exp.as_pyplot_figure()
-        plt.savefig(temp_path, dpi=150, bbox_inches='tight')
+        plt.savefig(temp_path, dpi=150, bbox_inches='tight', facecolor='white')
         plt.close()
 
         img = plt.imread(temp_path)
-        axes[plot_idx-1].imshow(img)
-        axes[plot_idx-1].set_title(f"{true_label}: {text[:60]}...", fontsize=9)
-        axes[plot_idx-1].axis("off")
+        axes[plot_idx].imshow(img)
+        axes[plot_idx].set_title(f"{true_label}: {text[:60]}...", fontsize=10, pad=10)
+        axes[plot_idx].axis("off")
 
-        # Clean up temp file
+        # Clean up
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
-    plt.suptitle(f"{title_prefix} - LIME Explanations", fontsize=26, weight="bold")
+    plt.suptitle(f"{title_prefix} - LIME Explanations", fontsize=28, weight="bold", y=0.98)
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     os.makedirs(output_dir, exist_ok=True)
     plt.savefig(f"{output_dir}/lime_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
@@ -164,7 +164,7 @@ def main():
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Loading tokenizer & 4-bit model...")
+    print("Loading model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -184,15 +184,13 @@ def main():
     raw = load_dataset("mteb/tweet_sentiment_extraction").filter(lambda x: x["label"] in [0, 1])
     eval_data = raw["test"].shuffle(seed=42).select(range(args.eval_size))
 
-    # Zero-shot
     print("Zero-shot evaluation...")
     zs_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device)
     plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot",
                    f"{args.output_dir}/confusion_zero_shot.png")
     generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Zero-Shot", args.output_dir)
 
-    # Fine-tuning
-    print("Fine-tuning with LoRA...")
+    print("Starting LoRA fine-tuning...")
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, LoraConfig(
         r=32, lora_alpha=64, lora_dropout=0.05,
@@ -242,7 +240,8 @@ def main():
     with open(f"{args.output_dir}/results.json", "w") as f:
         json.dump({"zero_shot": zs_metrics, "fine_tuned": ft_metrics}, f, indent=2)
 
-    print("\nSUCCESS! All files saved to:", args.output_dir)
+    print("\nSUCCESS! All done.")
+    print(f"Results saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
