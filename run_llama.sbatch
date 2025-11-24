@@ -11,15 +11,12 @@
 
 module purge
 module load anaconda3
-# Load conda properly on PACE compute nodes
-source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
 # Final safety install (won't hurt if already done)
 pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
 
-echo "Starting final experiment with LIME + Occlusion + Integrated Gradients..."
-python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
+python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_lime.py \
     --model meta-llama/Llama-3.2-1B \
     --output-dir /storage/ice1/6/3/jyoon370/llm-interpretability/outputs/final_run_$(date +%m%d_%H%M) \
     --train-size 8000 \
