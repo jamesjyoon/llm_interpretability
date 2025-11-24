@@ -1,6 +1,3 @@
-# final_working_llama_3_2_1B_lime.py
-# Zero-shot + LoRA fine-tuning + correct LIME on Llama-3.2-1B (4-bit)
-
 from __future__ import annotations
 
 import argparse
@@ -110,7 +107,6 @@ def plot_confusion(cm, title, path):
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
 
-
 def generate_all_explanations(model, tokenizer, formatter, dataset, device, title_prefix, output_dir):
     explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     predict_fn = make_predict_fn(model, tokenizer, formatter, device)
@@ -125,26 +121,33 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
                 random.sample(correct_pos, min(5, len(correct_pos))))
     random.shuffle(selected)
 
-    fig = plt.figure(figsize=(24, 10))
+    fig, axes = plt.subplots(2, 5, figsize=(24, 10))
+    axes = axes.flatten()
 
-    for plot_idx, idx in enumerate(selected, 1):
+    for ax, idx in zip(axes, selected):
         text = dataset[idx]["text"]
         true_label = "Pos" if dataset[idx]["label"] == 1 else "Neg"
 
         exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=500)
-        temp_fig = exp.as_pyplot_figure()
-        ax = fig.add_subplot(2, 5, plot_idx)
-        ax.imshow(temp_fig.canvas.buffer_rgba())
+        
+        # Save individual LIME plot to temp file then load back
+        temp_path = f"/tmp/lime_temp_{plot_idx}.png"
+        exp.save_html(temp_path.replace(".png", ".html"))
+        exp.as_pyplot_figure()
+        plt.savefig(temp_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        img = plt.imread(temp_path)
+        ax.imshow(img)
         ax.set_title(f"{true_label}: {text[:60]}...", fontsize=9)
         ax.axis("off")
-        plt.close(temp_fig)
 
-    fig.suptitle(f"{title_prefix} - LIME Explanations", fontsize=26, weight="bold")
-    fig.tight_layout(rect=[0, 0, 1, 0.95])
-    fig.savefig(f"{output_dir}/lime_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
+    plt.suptitle(f"{title_prefix} - LIME Explanations", fontsize=26, weight="bold")
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(f"{output_dir}/lime_{title_prefix.lower().replace(' ', '_')}.png", dpi=200)
     plt.close('all')
     print(f"LIME grid saved: {title_prefix}")
-
 
 def main():
     parser = argparse.ArgumentParser()
