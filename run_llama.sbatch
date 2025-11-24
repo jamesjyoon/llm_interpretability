@@ -1,36 +1,28 @@
 #!/bin/bash
-#SBATCH --job-name=llama-1B
-#SBATCH --account=coc
-#SBATCH --qos=coc-ice
+#SBATCH --job-name=llama-1B-final
 #SBATCH --partition=coc-gpu
+#SBATCH --qos=coc-ice
 #SBATCH --gres=gpu:v100:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=48G
-#SBATCH --time=02:00:00
-#SBATCH --output=logs/llama-1B.%j.out
+#SBATCH --time=04:00:00
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
 
-echo "=== Job starting at $(date) on $(hostname) ==="
-
-# 1. Load Anaconda and activate your env (by path)
 module purge
 module load anaconda3
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate /storage/ice1/6/3/jyoon370/llm-interpretability/envs/llm-1B
+# Activate your now-fixed, quota-safe environment
+conda activate llm1b
 
-echo "Python: $(which python)"
-python -c "import torch; print('torch version:', torch.__version__); print('cuda?', torch.cuda.is_available())"
-echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
+# Final safety install (won't hurt if already done)
+pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
 
-# 2. Go to project directory
-cd /storage/ice1/6/3/jyoon370/llm-interpretability
+echo "Starting final experiment with LIME + Occlusion + Integrated Gradients..."
+python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
+    --model meta-llama/Llama-3.2-1B \
+    --output-dir /storage/ice1/6/3/jyoon370/llm-interpretability/outputs/final_run_$(date +%m%d_%H%M) \
+    --train-size 8000 \
+    --eval-size 2000 \
+    --epochs 3
 
-# 3. Run your experiment script (adjust args if needed)
-python experiments_llama_3.2_1B.py \
-  --model meta-llama/Llama-3.2-1B \
-  --train-size 8000 \
-  --epochs 3 \
-  --output-dir outputs/llama_3.2_1B
-
-echo "=== Job finished at $(date) ==="
-
-
+echo "ALL DONE! Check outputs/ for your explanation figures"
