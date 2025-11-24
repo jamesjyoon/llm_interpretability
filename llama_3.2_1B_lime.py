@@ -47,11 +47,10 @@ def make_predict_fn(model, tokenizer, device):
         return np.stack([1-p, p], axis=1)
     return predict_fn
 
-
 def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=8):
     model.eval()
-    token_0 = tokenizer(" 0", add_special_tokens=False)["input_ids"][0]
-    token_1 = tokenizer(" 1", add_special_tokens=False)["input_ids"][0]
+    token_0 = tokenizer("0", add_special_tokens=False)["input_ids"][0]   # ← no space!
+    token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]   # ← no space!
 
     all_preds, all_labels = [], []
     for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating"):
@@ -64,7 +63,7 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
         inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
 
         with torch.no_grad():
-            logits = model(**inputs).logits[:, -1, :]
+            logits = model(**inputs).logits[:, -1, :].float()  # ← .float() here too!
         prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
         preds = (prob_1 > 0.5).int().cpu().numpy()
 
@@ -73,6 +72,8 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
 
         del inputs, logits, prob_1
         torch.cuda.empty_cache()
+
+    # ... metrics same ...
 
     acc = accuracy_score(all_labels, all_preds)
     p, r, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="macro", zero_division=0)
@@ -101,14 +102,11 @@ def plot_confusion(cm, title, path):
     plt.savefig(path, dpi=200, bbox_inches="tight")
     plt.close()
 
-
 def generate_all_explanations(model, tokenizer, formatter, dataset, device, title_prefix, output_dir):
     explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
-    token_0 = tokenizer(" 0", add_special_tokens=False)["input_ids"][0]
-    token_1 = tokenizer(" 1", add_special_tokens=False)["input_ids"][0]
-    predict_fn = make_predict_fn(model, tokenizer, device)
-
+    predict_fn = make_predict_fn(model, tokenizer, formatter, device)  
     _, preds = evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=16)
+    
     labels = [ex["label"] for ex in dataset]
     correct_neg = [i for i, (l, p) in enumerate(zip(labels, preds)) if l == 0 and p == 0]
     correct_pos = [i for i, (l, p) in enumerate(zip(labels,  preds)) if l == 1 and p == 1]
