@@ -11,7 +11,8 @@
 
 module purge
 module load anaconda3
-# Activate your now-fixed, quota-safe environment
+# Load conda properly on PACE compute nodes
+source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
 # Final safety install (won't hurt if already done)
