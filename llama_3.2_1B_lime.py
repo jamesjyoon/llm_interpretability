@@ -28,6 +28,25 @@ class PromptFormatter:
     def format(self, text: str) -> str:
         return self.template.format(text=text)
 
+def make_predict_fn(model, tokenizer, device):
+    token_0 = tokenizer("0", add_special_tokens=False)["input_ids"][0]
+    token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]
+    def predict_fn(texts):
+        probs = []
+        for i in range(0, len(texts), 4):
+            batch = texts[i:i+4]
+            prompts = [formatter.format(t) for t in batch]
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True,
+                             truncation=True, max_length=256).to(device)
+            with torch.no_grad():
+                logits = model(**inputs).logits[:, -1, :].float()
+            prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
+            probs.extend(prob_1)
+            del inputs, logits; torch.cuda.empty_cache()
+        p = np.array(probs)
+        return np.stack([1-p, p], axis=1)
+    return predict_fn
+
 
 def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=8):
     model.eval()
@@ -87,20 +106,7 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
     explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     token_0 = tokenizer(" 0", add_special_tokens=False)["input_ids"][0]
     token_1 = tokenizer(" 1", add_special_tokens=False)["input_ids"][0]
-
-    def predict_fn(texts):
-        all_probs = []
-        for i in range(0, len(texts), 4):
-            batch = texts[i:i+4]
-            prompts = [formatter.format(t) for t in batch]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
-            with torch.no_grad():
-                logits = model(**inputs).logits[:, -1, :]
-            prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
-            all_probs.extend(prob_1)
-            del inputs, logits
-            torch.cuda.empty_cache()
-        return np.stack([1 - np.array(all_probs), np.array(all_probs)], axis=1)
+    predict_fn = make_predict_fn(model, tokenizer, device)
 
     _, preds = evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size=16)
     labels = [ex["label"] for ex in dataset]
