@@ -9,6 +9,12 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
+module purge
+module load anaconda3
+conda activate llm1b
+
+# Final safety install (won't hurt if already done)
+pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
 # CRITICAL: Correct way to activate conda on PACE compute nodes
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
