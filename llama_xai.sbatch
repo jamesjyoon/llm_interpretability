@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=llama-1B-xai
+#SBATCH --job-name=llama-final
 #SBATCH --partition=coc-gpu
 #SBATCH --qos=coc-ice
 #SBATCH --gres=gpu:v100:1
@@ -9,20 +9,15 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-module purge
-module load anaconda3
-conda activate llm1b
-
-# Final safety install (won't hurt if already done)
-pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
-# CRITICAL: Correct way to activate conda on PACE compute nodes
+# FIXED: Correct path to your NEW Miniconda
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
-# Install/update all packages (safe + fast)
-pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
+# Verify
+echo "Python: $(which python)"
+python -c "import torch; print('PyTorch OK:', torch.cuda.is_available())"
 
-echo "Starting XAI experiment..."
+# Run your script
 python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
     --model-name meta-llama/Llama-3.2-1B \
     --train-size 8000 \
