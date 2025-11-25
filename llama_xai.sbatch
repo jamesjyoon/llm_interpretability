@@ -9,14 +9,14 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-module purge
-module load anaconda3
+# Activate conda
+source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
-# Final safety install (won't hurt if already done)
-pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
+# Quick check
+python -c "import torch; print('GPU:', torch.cuda.get_device_name(0))"
 
-# Run your script
+# Run your experiment
 python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
     --model-name meta-llama/Llama-3.2-1B \
     --train-size 8000 \
@@ -25,4 +25,3 @@ python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.
     --finetune \
     --run-lime \
     --load-in-4bit
-
