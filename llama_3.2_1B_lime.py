@@ -1,6 +1,3 @@
-# llama_3.2_1B_sst2_final_cli_fixed.py
-# FINAL VERSION — EVERYTHING WORKS
-
 from __future__ import annotations
 
 import argparse
