@@ -1,3 +1,6 @@
+# llama_3.2_1B_sst2_final_cli_fixed.py
+# FINAL VERSION — EVERYTHING WORKS
+
 from __future__ import annotations
 
 import argparse
@@ -19,12 +22,62 @@ from lime.lime_text import LimeTextExplainer
 from tqdm import tqdm
 
 
+# ======================= HELPER FUNCTIONS =======================
+
+def plot_confusion(cm, title, path):
+    plt.figure(figsize=(6, 5))
+    plt.imshow(cm, cmap="Blues", vmin=0)
+    plt.title(title, fontsize=16, pad=20)
+    plt.colorbar()
+    plt.xticks([0, 1], ["Negative", "Positive"])
+    plt.yticks([0, 1], ["Negative", "Positive"])
+    plt.xlabel("Predicted"); plt.ylabel("True")
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, str(cm[i][j]), ha="center", va="center",
+                     color="white" if cm[i][j] > cm.max()/2 else "black", fontsize=18)
+    plt.tight_layout()
+    plt.savefig(path, dpi=200, bbox_inches="tight")
+    plt.close()
+
+
+def plot_metrics_comparison(zs_metrics, ft_metrics, output_dir):
+    metrics = ['accuracy', 'f1', 'mcc']
+    zs_vals = [zs_metrics[m] for m in metrics]
+    ft_vals = [ft_metrics[m] for m in metrics]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.bar(x - width/2, zs_vals, width, label='Zero-Shot', color='#1f77b4', edgecolor='black')
+    ax.bar(x + width/2, ft_vals, width, label='Fine-Tuned', color='#ff7f0e', edgecolor='black')
+
+    ax.set_ylabel('Score', fontsize=14)
+    ax.set_title('Zero-Shot vs Fine-Tuned Performance', fontsize=18, weight='bold')
+    ax.set_xticks(x)
+    ax.set_xticklabels(['Accuracy', 'F1-Score', 'MCC'])
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=12)
+
+    for i, (v1, v2) in enumerate(zip(zs_vals, ft_vals)):
+        ax.text(i - width/2, v1 + 0.02, f'{v1:.3f}', ha='center', fontsize=11)
+        ax.text(i + width/2, v2 + 0.02, f'{v2:.3f}', ha='center', fontsize=11)
+
+    plt.tight_layout()
+    path = f"{output_dir}/metrics_comparison_bar_chart.png"
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Bar chart saved: {path}")
+
+
+# ======================= MAIN SCRIPT =======================
+
 def main():
-    parser = argparse.ArgumentParser(description="Llama-3.2-1B Sentiment Analysis (SST-2) + LIME")
+    parser = argparse.ArgumentParser(description="Llama-3.2-1B + SST-2 + LIME + Bar Chart")
     parser.add_argument("--model-name", type=str, default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--dataset-name", type=str, default="stanfordnlp/sst2")
     parser.add_argument("--dataset-config", type=str, default=None)
-    parser.add_argument("--finetune", action="store_true", help="Run fine-tuning")
+    parser.add_argument("--finetune", action="store_true", default=True)
     parser.add_argument("--no-finetune", dest="finetune", action="store_false")
     parser.add_argument("--run-lime", action="store_true", default=True)
     parser.add_argument("--load-in-4bit", action="store_true", default=True)
@@ -32,22 +85,15 @@ def main():
     parser.add_argument("--output-dir", type=str, default="outputs/sst2_run")
     parser.add_argument("--huggingface-token", type=str, default=None)
     parser.add_argument("--train-size", type=int, default=8000)
-    parser.add_argument("--eval-size", type=int, default=872)   # SST-2 validation size
     parser.add_argument("--epochs", type=float, default=3.0)
 
-    parser.set_defaults(finetune=True)
     args = parser.parse_args()
-
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(42)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"Loading model: {args.model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_name,
-        token=args.huggingface_token,
-        use_fast=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token, use_fast=True)
     tokenizer.pad_token = tokenizer.eos_token
 
     quantization_config = None
@@ -73,10 +119,11 @@ def main():
 
     formatter = PromptFormatter()
 
+    # Load dataset
     dataset = load_dataset(args.dataset_name, args.dataset_config) if args.dataset_config else load_dataset(args.dataset_name)
     eval_data = dataset["validation"]
 
-    # === Predict function ===
+    # Prediction function
     def make_predict_fn(model, tokenizer, device):
         token_0 = tokenizer("0", add_special_tokens=False)["input_ids"][0]
         token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]
@@ -99,52 +146,55 @@ def main():
         predict_fn = make_predict_fn(model, tokenizer, device)
         texts = data["sentence"]
         labels = data["label"]
-        probs = []
-        for i in tqdm(range(0, len(texts), 8), desc="Evaluating"):
-            batch_probs = predict_fn(texts[i:i+8])[:, 1]
-            probs.extend(batch_probs)
-        preds = (np.array(probs) > 0.5).astype(int)
+        preds = (np.array([predict_fn([t])[0, 1] for t in tqdm(texts, desc="Evaluating")]) > 0.5).astype(int)
         acc = accuracy_score(labels, preds)
         p, r, f1, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
         mcc = matthews_corrcoef(labels, preds)
         cm = confusion_matrix(labels, preds, labels=[0, 1])
-        return {"accuracy": round(acc, 4), "f1": round(f1, 4), "mcc": round(mcc, 4), "confusion_matrix": cm.tolist()}, preds
+        return {
+            "accuracy": round(float(acc), 4),
+            "precision": round(float(p), 4),
+            "recall": round(float(r), 4),
+            "f1": round(float(f1), 4),
+            "mcc": round(float(mcc), 4),
+            "confusion_matrix": cm.tolist()
+        }, preds
 
     # Zero-shot
-    print("\nZERO-SHOT")
+    print("\nZERO-SHOT EVALUATION")
     zs_metrics, _ = evaluate(model, tokenizer, eval_data, device)
-    print(f"Zero-Shot → Acc: {zs_metrics['accuracy']:.4f}  F1: {zs_metrics['f1']:.4f}  MCC: {zs_metrics['mcc']:.4f}")
-
-    # Save zero-shot results
+    print(f"Zero-Shot → Accuracy: {zs_metrics['accuracy']:.4f} | F1: {zs_metrics['f1']:.4f} | MCC: {zs_metrics['mcc']:.4f}")
     plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot", f"{args.output_dir}/confusion_zero_shot.png")
 
+    results = {"zero_shot": zs_metrics}
+
     if args.run_lime:
-        from lime.lime_text import LimeTextExplainer
         explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
         predict_fn = make_predict_fn(model, tokenizer, device)
         _, preds = evaluate(model, tokenizer, eval_data, device)
-        correct = [i for i, (l, p) in enumerate(zip(eval_data["label"], preds)) if l == p]
-        selected = random.sample(correct, 10)
+        correct_idx = [i for i, (l, p) in enumerate(zip(eval_data["label"], preds)) if l == p]
+        selected = random.sample(correct_idx, min(10, len(correct_idx)))
 
         fig, axes = plt.subplots(2, 5, figsize=(25, 10))
-        for idx, ax_idx in enumerate(selected):
+        axes = axes.flatten()
+        for plot_idx, idx in enumerate(selected):
             text = eval_data[idx]["sentence"]
             exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=500)
-            temp_path = f"/tmp/lime_{idx}.png"
+            temp_path = f"/tmp/lime_zs_{plot_idx}.png"
             exp.as_pyplot_figure()
-            plt.savefig(temp_path, dpi=150, bbox_inches='tight'); plt.close()
+            plt.savefig(temp_path, dpi=150, bbox_inches='tight', facecolor='white')
+            plt.close()
             img = plt.imread(temp_path)
-            axes[idx//5, idx%5].imshow(img)
-            axes[idx//5, idx%5].set_title(f"{text[:70]}...", fontsize=9)
-            axes[idx//5, idx%5].axis("off")
+            axes[plot_idx].imshow(img)
+            axes[plot_idx].set_title(f"{text[:70]}...", fontsize=9)
+            axes[plot_idx].axis("off")
             os.remove(temp_path)
-        plt.suptitle("Zero-Shot - LIME Explanations", fontsize=28)
+        plt.suptitle("Zero-Shot - LIME Explanations", fontsize=28, weight="bold")
         plt.tight_layout()
         plt.savefig(f"{args.output_dir}/lime_zero_shot.png", dpi=200)
         plt.close()
 
-    results = {"zero_shot": zs_metrics}
-
+    # Fine-tuning
     if args.finetune:
         print("\nFINE-TUNING WITH LoRA...")
         model = prepare_model_for_kbit_training(model)
@@ -191,56 +241,42 @@ def main():
 
         print("\nFINE-TUNED EVALUATION")
         ft_metrics, _ = evaluate(model, tokenizer, eval_data, device)
-        print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f}  F1: {ft_metrics['f1']:.4f}  MCC: {ft_metrics['mcc']:.4f}")
+        print(f"Fine-Tuned → Accuracy: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
         results["fine_tuned"] = ft_metrics
-
         plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned", f"{args.output_dir}/confusion_fine_tuned.png")
 
         if args.run_lime:
             fig, axes = plt.subplots(2, 5, figsize=(25, 10))
+            axes = axes.flatten()
             _, preds = evaluate(model, tokenizer, eval_data, device)
-            correct = [i for i, (l, p) in enumerate(zip(eval_data["label"], preds)) if l == p]
-            selected = random.sample(correct, 10)
-            for idx, ax_idx in enumerate(selected):
+            correct_idx = [i for i, (l, p) in enumerate(zip(eval_data["label"], preds)) if l == p]
+            selected = random.sample(correct_idx, min(10, len(correct_idx)))
+            for plot_idx, idx in enumerate(selected):
                 text = eval_data[idx]["sentence"]
                 exp = explainer.explain_instance(text, predict_fn, num_features=10, num_samples=500)
-                temp_path = f"/tmp/lime_ft_{idx}.png"
-                exp.as_pyplot_figure(); plt.savefig(temp_path, dpi=150, bbox_inches='tight'); plt.close()
+                temp_path = f"/tmp/lime_ft_{plot_idx}.png"
+                exp.as_pyplot_figure()
+                plt.savefig(temp_path, dpi=150, bbox_inches='tight', facecolor='white')
+                plt.close()
                 img = plt.imread(temp_path)
-                axes[idx//5, idx%5].imshow(img)
-                axes[idx//5, idx%5].set_title(f"{text[:70]}...", fontsize=9)
-                axes[idx//5, idx%5].axis("off")
+                axes[plot_idx].imshow(img)
+                axes[plot_idx].set_title(f"{text[:70]}...", fontsize=9)
+                axes[plot_idx].axis("off")
                 os.remove(temp_path)
-            plt.suptitle("Fine-Tuned - LIME Explanations", fontsize=28)
+            plt.suptitle("Fine-Tuned - LIME Explanations", fontsize=28, weight="bold")
             plt.tight_layout()
             plt.savefig(f"{args.output_dir}/lime_fine_tuned.png", dpi=200)
             plt.close()
 
-    # Bar chart comparison
+    # Final bar chart
     if "fine_tuned" in results:
-        metrics = ['accuracy', 'f1', 'mcc']
-        zs = [results["zero_shot"][m] for m in metrics]
-        ft = [results["fine_tuned"][m] for m in metrics]
-        x = np.arange(len(metrics))
-        width = 0.35
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.bar(x - width/2, zs, width, label='Zero-Shot', color='#1f77b4')
-        ax.bar(x + width/2, ft, width, label='Fine-Tuned', color='#ff7f0e')
-        ax.set_ylabel('Score'); ax.set_title('Zero-Shot vs Fine-Tuned')
-        ax.set_xticks(x); ax.set_xticklabels(['Accuracy', 'F1', 'MCC'])
-        ax.legend()
-        for i, (v1, v2) in enumerate(zip(zs, ft)):
-            ax.text(i - width/2, v1 + 0.01, f'{v1:.3f}', ha='center')
-            ax.text(i + width/2, v2 + 0.01, f'{v2:.3f}', ha='center')
-        plt.tight_layout()
-        plt.savefig(f"{args.output_dir}/comparison_bar_chart.png", dpi=200)
-        plt.close()
+        plot_metrics_comparison(results["zero_shot"], results["fine_tuned"], args.output_dir)
 
     # Save JSON
     with open(f"{args.output_dir}/results.json", "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"\nAll done! Output: {args.output_dir}/")
+    print(f"\nSUCCESS! All outputs saved to: {args.output_dir}/")
 
 
 if __name__ == "__main__":
