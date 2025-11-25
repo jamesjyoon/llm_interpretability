@@ -17,7 +17,7 @@ conda activate llm1b
 pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
 
 echo "Starting XAI experiment..."
-python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1b.py \
+python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
     --model-name meta-llama/Llama-3.2-1B \
     --train-size 8000 \
     --epochs 3 \
