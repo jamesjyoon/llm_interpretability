@@ -17,10 +17,11 @@ conda activate llm1b
 pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
 
 python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_lime.py \
-    --model meta-llama/Llama-3.2-1B \
-    --output-dir /storage/ice1/6/3/jyoon370/llm-interpretability/outputs/final_run_$(date +%m%d_%H%M) \
-    --train-size 8000 \
-    --eval-size 2000 \
-    --epochs 3
+  --model-name meta-llama/Llama-3.2-1B \
+  --train-size 8000 \
+  --epochs 3 \
+  --output-dir /storage/ice1/6/3/jyoon370/llm-interpretability/outputs/my_run_$(date +%m%d_%H%M) \
+  --finetune \
+  --run-lime \
+  --load-in-4bit
 
-echo "ALL DONE! Check outputs/ for your explanation figures"
