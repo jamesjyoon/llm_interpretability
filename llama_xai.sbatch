@@ -9,13 +9,12 @@
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
-# FIXED: Correct path to your NEW Miniconda
-source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
+module purge
+module load anaconda3
 conda activate llm1b
 
-# Verify
-echo "Python: $(which python)"
-python -c "import torch; print('PyTorch OK:', torch.cuda.is_available())"
+# Final safety install (won't hurt if already done)
+pip install -r /storage/ice1/6/3/jyoon370/llm-interpretability/requirements.txt --quiet --no-cache-dir
 
 # Run your script
 python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
