@@ -1,5 +1,4 @@
-# llama_3.2_1B_sst2_final.py
-# Zero-shot + LoRA + LIME on SST-2 (clean binary sentiment)
+# llama_3.2_1B_sst2_final_with_bar_chart.py
 
 from __future__ import annotations
 
@@ -84,14 +83,18 @@ def evaluate_model_safe(model, tokenizer, dataset, formatter, device, batch_size
     cm = confusion_matrix(all_labels, all_preds, labels=[0, 1])
 
     return {
-        "accuracy": float(acc), "precision": float(p), "recall": float(r),
-        "f1": float(f1), "mcc": float(mcc), "confusion_matrix": cm.tolist()
+        "accuracy": round(float(acc), 4),
+        "precision": round(float(p), 4),
+        "recall": round(float(r), 4),
+        "f1": round(float(f1), 4),
+        "mcc": round(float(mcc), 4),
+        "confusion_matrix": cm.tolist()
     }, np.array(all_preds)
 
 
 def plot_confusion(cm, title, path):
     plt.figure(figsize=(6, 5))
-    plt.imshow(cm, cmap="Blues", vmin=0)
+    plt.imshow(cm, cmap="Blues")
     plt.title(title, fontsize=16, pad=20)
     plt.colorbar()
     plt.xticks([0, 1], ["Negative", "Positive"])
@@ -146,12 +149,45 @@ def generate_all_explanations(model, tokenizer, formatter, dataset, device, titl
     print(f"LIME grid saved: {title_prefix}")
 
 
+def plot_metrics_comparison(zs_metrics, ft_metrics, output_dir):
+    metrics = ['accuracy', 'f1', 'mcc']
+    zs_values = [zs_metrics[m] for m in metrics]
+    ft_values = [ft_metrics[m] for m in metrics]
+
+    x = np.arange(len(metrics))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars1 = ax.bar(x - width/2, zs_values, width, label='Zero-Shot', color='#1f77b4', edgecolor='black')
+    bars2 = ax.bar(x + width/2, ft_values, width, label='Fine-Tuned', color='#ff7f0e', edgecolor='black')
+
+    ax.set_ylabel('Score', fontsize=14)
+    ax.set_title('Zero-Shot vs Fine-Tuned Performance Comparison', fontsize=18, weight='bold', pad=20)
+    ax.set_xticks(x)
+    ax.set_xticklabels(['Accuracy', 'F1-Score', 'MCC'])
+    ax.set_ylim(0, 1)
+    ax.legend(fontsize=12)
+
+    # Add value labels on top of bars
+    for bar in bars1 + bars2:
+        height = bar.get_height()
+        ax.annotate(f'{height:.3f}',
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 3), textcoords="offset points",
+                    ha='center', va='bottom', fontsize=11)
+
+    plt.tight_layout()
+    path = f"{output_dir}/metrics_comparison_bar_chart.png"
+    plt.savefig(path, dpi=200, bbox_inches='tight')
+    plt.close()
+    print(f"Bar chart saved: {path}")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--output-dir", type=str, default="outputs/sst2_final")
     parser.add_argument("--train-size", type=int, default=8000)
-    parser.add_argument("--eval-size", type=int, default=872)  # SST-2 validation size
     parser.add_argument("--epochs", type=float, default=3.0)
     args = parser.parse_args()
 
@@ -168,7 +204,7 @@ def main():
         device_map="auto",
         torch_dtype=torch.bfloat16,
         quantization_config=BitsAndBytesConfig(
-            load and load_in_4bit=True,
+            load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
@@ -177,17 +213,15 @@ def main():
 
     formatter = PromptFormatter()
     dataset = load_dataset("stanfordnlp/sst2")
+    eval_data = dataset["validation"]  # 872 examples
 
-    eval_data = dataset["validation"].shuffle(seed=42)
-    train_data_raw = dataset["train"].shuffle(seed=42).select(range(args.train_size))
-
-    print("Zero-shot evaluation...")
+    print("\nZERO-SHOT EVALUATION")
     zs_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device)
-    plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot",
-                   f"{args.output_dir}/confusion_zero_shot.png")
+    print(f"Zero-Shot → Acc: {zs_metrics['accuracy']:.4f} | F1: {zs_metrics['f1']:.4f} | MCC: {zs_metrics['mcc']:.4f}")
+    plot_confusion(np.array(zs_metrics["confusion_matrix"]), "Zero-Shot", f"{args.output_dir}/confusion_zero_shot.png")
     generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Zero-Shot", args.output_dir)
 
-    print("Starting LoRA fine-tuning...")
+    print("\nSTARTING LoRA FINE-TUNING...")
     model = prepare_model_for_kbit_training(model)
     model = get_peft_model(model, LoraConfig(
         r=32, lora_alpha=64, lora_dropout=0.05,
@@ -208,7 +242,8 @@ def main():
         tokenized["labels"] = labels
         return tokenized
 
-    train_dataset = train_data_raw.map(tokenize_function, batched=True, remove_columns=train_data_raw.column_names)
+    train_dataset = dataset["train"].shuffle(seed=42).select(range(args.train_size))
+    train_dataset = train_dataset.map(tokenize_function, batched=True, remove_columns=train_dataset.column_names)
 
     trainer = Trainer(
         model=model,
@@ -229,16 +264,34 @@ def main():
     )
     trainer.train()
 
-    print("Fine-tuned evaluation...")
+    print("\nFINE-TUNED EVALUATION")
     ft_metrics, _ = evaluate_model_safe(model, tokenizer, eval_data, formatter, device)
-    plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned",
-                   f"{args.output_dir}/confusion_fine_tuned.png")
+    print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
+    plot_confusion(np.array(ft_metrics["confusion_matrix"]), "Fine-Tuned", f"{args.output_dir}/confusion_fine_tuned.png")
     generate_all_explanations(model, tokenizer, formatter, eval_data, device, "Fine-Tuned", args.output_dir)
 
-    with open(f"{args.output_dir}/results.json", "w") as f:
-        json.dump({"zero_shot": zs_metrics, "fine_tuned": ft_metrics}, f, indent=2)
+    # COMPARISON BAR CHART
+    plot_metrics_comparison(zs_metrics, ft_metrics, args.output_dir)
 
-    print("\nALL DONE! Results in:", args.output_dir)
+    # SAVE RESULTS
+    results = {
+        "zero_shot": zs_metrics,
+        "fine_tuned": ft_metrics
+    }
+    with open(f"{args.output_dir}/results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
+    # Pretty print in terminal
+    print("\n" + "="*60)
+    print("FINAL RESULTS")
+    print("="*60)
+    print(f"{'Metric':<12} {'Zero-Shot':<12} {'Fine-Tuned':<12} {'Gain'}")
+    print("-"*60)
+    for m in ['accuracy', 'f1', 'mcc']:
+        gain = ft_metrics[m] - zs_metrics[m]
+        print(f"{m.capitalize():<12} {zs_metrics[m]:<12.4f} {ft_metrics[m]:<12.4f} +{gain:.4f}")
+    print("="*60)
+    print(f"All files saved to: {args.output_dir}/")
 
 
 if __name__ == "__main__":
