@@ -1,5 +1,4 @@
 # llama_3.2_1B_sst2_FINAL_WORKING.py
-# 100% tested on PACE — runs perfectly
 
 from __future__ import annotations
 
