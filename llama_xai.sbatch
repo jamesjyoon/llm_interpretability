@@ -19,4 +19,5 @@ python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.
     --output-dir outputs/run_$(date +%m%d_%H%M) \
     --finetune \
     --run-lime \
+    --run-xai \
     --load-in-4bit
