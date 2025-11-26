@@ -1,6 +1,3 @@
-# final_ultimate_xai_paper_script.py
-# EVERYTHING IN ONE FILE — Just run and get your paper results!
-
 import argparse
 import json
 import os
@@ -9,26 +6,26 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from datasets import load_dataset
-from sklearn.metrics import accuracy_score, precision_recall_fscore_support, matthews_corrcoef, confusion_matrix
-from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments,
-    DataCollatorForLanguageModeling, set_seed
-)
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, matthews_corrcoef
+from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling, set_seed
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from transformers import BitsAndBytesConfig
 from lime.lime_text import LimeTextExplainer
-from captum.attr import LayerIntegratedGradients
 import shap
+from captum.attr import LayerIntegratedGradients
+from captum.attr import visualization as viz
 from tqdm import tqdm
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
-    parser.add_argument("--output-dir", default="outputs/ultimate_xai_results")
+    parser.add_argument("--output-dir", default="outputs/final_xai")
     parser.add_argument("--train-size", type=int, default=8000)
     parser.add_argument("--epochs", type=float, default=3.0)
     parser.add_argument("--finetune", action="store_true", default=True)
+    parser.add_argument("--run-xai", action="store_true", default=True)
+    parser.add_argument("--load-in-4bit", action="store_true", default=True)
     parser.add_argument("--huggingface-token", type=str, default=None)
     args = parser.parse_args()
 
@@ -37,20 +34,24 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("Loading model...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
+
+    quantization_config = None
+    if args.load_in_4bit:
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
 
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         token=args.huggingface_token,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        ),
+        quantization_config=quantization_config,
     )
 
     def format_prompt(text):
@@ -82,13 +83,7 @@ def main():
         acc = accuracy_score(labels, preds)
         p, r, f1, _ = precision_recall_fscore_support(labels, preds, average="macro", zero_division=0)
         mcc = matthews_corrcoef(labels, preds)
-        return {
-            "accuracy": round(float(acc), 4),
-            "precision": round(float(p), 4),
-            "recall": round(float(r), 4),
-            "f1": round(float(f1), 4),
-            "mcc": round(float(mcc), 4)
-        }, preds
+        return {"accuracy": round(float(acc), 4), "f1": round(float(f1), 4), "mcc": round(float(mcc), 4)}, preds
 
     dataset = load_dataset("stanfordnlp/sst2")
     eval_data = dataset["validation"]
@@ -140,83 +135,67 @@ def main():
         print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
         results["fine_tuned"] = ft_metrics
 
-    # XAI Evaluation (LIME + KernelSHAP + IG)
-    print("\nXAI EVALUATION...")
-    xai_results = {}
+    # XAI EVALUATION + PLOTS (NO OOM!)
+    if args.run_xai:
+        print("\nXAI EVALUATION + HEATMAPS...")
+        correct = [i for i, (l, p) in enumerate(zip(eval_data["label"], zs_preds if not args.finetune else _)) if l == p]
+        sample_idx = random.sample(correct, min(10, len(correct)))
+        sample_texts = [eval_data[i]["sentence"] for i in sample_idx]
 
-    # LIME
-    explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
-    correct = [i for i, (l, p) in enumerate(zip(eval_data["label"], zs_preds if not args.finetune else _)) if l == p]
-    sample_idx = random.sample(correct, min(50, len(correct)))
-    sample_texts = [eval_data[i]["sentence"] for i in sample_idx]
+        # LIME
+        explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
+        for i, text in enumerate(sample_texts):
+            exp = explainer.explain_instance(text, predict_proba, num_features=10, num_samples=500)
+            exp.as_pyplot_figure()
+            plt.savefig(f"{args.output_dir}/lime_{i}.png", dpi=150, bbox_inches='tight')
+            plt.close()
 
-    lime_fid, lime_del, lime_stab = [], [], []
-    for text in tqdm(sample_texts[:30], desc="LIME"):
-        exp = explainer.explain_instance(text, predict_proba, num_features=10, num_samples=500)
-        # Fidelity
-        top_words = [w for w, _ in exp.as_list()[:10]]
-        masked = " ".join(["[MASK]" if w in top_words else w for w in text.split()])
-        lime_fid.append(abs(predict_proba([text])[0,1] - predict_proba([masked])[0,1]))
-        # Deletion AUC
-        words = text.split()
-        probs = [predict_proba([text])[0,1]]
-        current = words.copy()
-        for w in [w for w,_ in exp.as_list()]:
-            if w in current: current.remove(w)
-            new = " ".join(current) if current else "[MASK]"
-            probs.append(predict_proba([new])[0,1])
-        lime_del.append(np.trapz(probs, dx=1/len(words)))
-        # Stability
-        sets = [set([w for w,_ in explainer.explain_instance(text, predict_proba, num_features=10, num_samples=500).as_list()[:10]]) for _ in range(3)]
-        sims = [len(a&b)/len(a|b) for i,a in enumerate(sets) for b in sets[i+1:]]
-        lime_stab.append(np.mean(sims) if sims else 0)
+        # KernelSHAP (safe)
+        background = shap.kmeans(predict_proba, 10).data
+        kshap = shap.KernelExplainer(predict_proba, background)
+        for i, text in enumerate(sample_texts):
+            shap_vals = kshap.shap_values(text, nsamples=100)
+            shap.force_plot(kshap.expected_value[1], shap_vals[1], text, show=False, matplotlib=True)
+            plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches='tight')
+            plt.close()
 
-    xai_results["LIME"] = {
-        "Fidelity": round(np.mean(lime_fid), 3),
-        "Deletion_AUC": round(np.mean(lime_del), 3),
-        "Stability": round(np.mean(lime_stab), 3)
-    }
+        # Integrated Gradients (safe)
+        lig = LayerIntegratedGradients(model, model.model.embed_tokens)
+        def ig_forward(input_ids):
+            outputs = model(input_ids)
+            logits = outputs.logits[:, -1, :]
+            return torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
 
-    # KernelSHAP (fast version)
-    background = shap.kmeans(predict_proba, 10).data
-    kshap = shap.KernelExplainer(predict_proba, background)
-    kshap_vals = kshap.shap_values(sample_texts[:10], nsamples=100)
-    xai_results["KernelSHAP"] = {"Fidelity": 0.44, "Deletion_AUC": 0.48, "Stability": 0.65}
+        for i, text in enumerate(sample_texts):
+            inputs = tokenizer(format_prompt(text), return_tensors="pt").to(device)
+            attr, _ = lig.attribute(inputs["input_ids"], target=0, custom_attribution_func=ig_forward, n_steps=20)
+            attr = attr.sum(dim=-1).squeeze(0).cpu().numpy()
+            tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
+            fig, _ = viz.visualize_text([viz.VisualizationDataRecord(attr, 0, 0, 0, 0, np.sum(attr), tokens, 0)])
+            fig.savefig(f"{args.output_dir}/ig_{i}.png", dpi=150, bbox_inches='tight')
+            plt.close(fig)
 
-    # Integrated Gradients
-    lig = LayerIntegratedGradients(model, model.model.embed_tokens)
-    xai_results["Integrated_Gradients"] = {"Fidelity": 0.52, "Deletion_AUC": 0.61, "Stability": 0.88}
+        print("All heatmaps saved!")
 
     # Bar chart
-    methods = list(xai_results.keys())
-    metrics = ["Fidelity", "Deletion_AUC", "Stability"]
-    x = np.arange(len(metrics))
-    width = 0.25
+    if "fine_tuned" in results:
+        metrics = ["accuracy", "f1", "mcc"]
+        x = np.arange(len(metrics))
+        width = 0.35
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.bar(x - width/2, [results["zero_shot"][m] for m in metrics], width, label='Zero-Shot', color='#1f77b4')
+        ax.bar(x + width/2, [results["fine_tuned"][m] for m in metrics], width, label='Fine-Tuned', color='#ff7f0e')
+        ax.set_ylabel('Score'); ax.set_title('Zero-Shot vs Fine-Tuned')
+        ax.set_xticks(x); ax.set_xticklabels(metrics)
+        ax.legend()
+        plt.tight_layout()
+        plt.savefig(f"{args.output_dir}/comparison_bar_chart.png", dpi=200)
+        plt.close()
 
-    fig, ax = plt.subplots(figsize=(12, 7))
-    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']
-    for i, method in enumerate(methods):
-        vals = [xai_results[method][m] for m in metrics]
-        ax.bar(x + i*width, vals, width, label=method, color=colors[i], edgecolor='black')
-        for j, v in enumerate(vals):
-            ax.text(x[j] + i*width, v + 0.02, f'{v:.2f}', ha='center', fontsize=11)
-
-    ax.set_ylabel('Score'); ax.set_title('XAI Method Comparison', fontsize=16, weight='bold')
-    ax.set_xticks(x + width); ax.set_xticklabels(metrics)
-    ax.set_ylim(0, 1); ax.legend()
-    plt.tight_layout()
-    plt.savefig(f"{args.output_dir}/xai_comparison_bar_chart.png", dpi=300)
-    plt.close()
-
-    # Save all
-    final_results = {"model_performance": results, "xai_evaluation": xai_results}
-    with open(f"{args.output_dir}/final_results.json", "w") as f:
-        json.dump(final_results, f, indent=2)
+    with open(f"{args.output_dir}/results.json", "w") as f:
+        json.dump(results, f, indent=2)
 
     print(f"\nALL DONE! Results in: {args.output_dir}/")
-    print("   • final_results.json")
-    print("   • xai_comparison_bar_chart.png")
-    print("   • confusion matrices + LIME plots")
 
 
 if __name__ == "__main__":
