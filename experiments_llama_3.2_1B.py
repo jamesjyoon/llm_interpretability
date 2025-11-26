@@ -72,15 +72,15 @@ def main():
     def predict_proba(texts):
         if isinstance(texts, str): texts = [texts]
         probs = []
+        # Determine the device dynamically from the model
+        current_model_device = model.device # This will be the device where the model's first parameter is
         for i in range(0, len(texts), 4):
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-            # Don't manually move to device - model is already on correct device via device_map
-            if not args.load_in_4bit:
-                inputs = inputs.to(device)
-            else:
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
+            # Move inputs to the model's actual device
+            inputs = {k: v.to(current_model_device) for k, v in inputs.items()}
             
             with torch.no_grad():
                 logits = model(**inputs).logits[:, -1, :].float()
@@ -178,6 +178,8 @@ def main():
         # Integrated Gradients (safe)
         lig = LayerIntegratedGradients(model, model.model.embed_tokens)
         def ig_forward(input_ids):
+            # Ensure model is in eval mode if not already
+            model.eval() 
             outputs = model(input_ids)
             logits = outputs.logits[:, -1, :]
             return torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
@@ -185,10 +187,9 @@ def main():
         for i, text in enumerate(sample_texts):
             prompt = format_prompt(text)
             inputs = tokenizer(prompt, return_tensors="pt")
-            if not args.load_in_4bit:
-                inputs = inputs.to(device)
-            else:
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
+            # Move inputs to the model's actual device
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
             
             attr, _ = lig.attribute(inputs["input_ids"], target=0, return_convergence_delta=False, n_steps=20)
             attr = attr.sum(dim=-1).squeeze(0).cpu().numpy()
@@ -196,8 +197,6 @@ def main():
             fig, _ = viz.visualize_text([viz.VisualizationDataRecord(attr, 0, 0, 0, 0, np.sum(attr), tokens, 0)])
             fig.savefig(f"{args.output_dir}/ig_{i}.png", dpi=150, bbox_inches='tight')
             plt.close(fig)
-
-        print("All heatmaps saved!")
 
     # Bar chart
     if "fine_tuned" in results:
