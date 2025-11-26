@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--train-size", type=int, default=8000)
     parser.add_argument("--epochs", type=float, default=3.0)
     parser.add_argument("--finetune", action="store_true", default=True)
-    parser.add_argument("--run-xai", action="store_true", default=True)
+    parser.add_argument("--run-lime", action="store_true", default=True)
     parser.add_argument("--load-in-4bit", action="store_true", default=True)
     parser.add_argument("--huggingface-token", type=str, default=None)
     args = parser.parse_args()
