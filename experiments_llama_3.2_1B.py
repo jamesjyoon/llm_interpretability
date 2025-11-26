@@ -38,7 +38,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
 
-    quantization_config = None
+    # Configure model loading based on quantization
     if args.load_in_4bit:
         quantization_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -47,21 +47,21 @@ def main():
             bnb_4bit_quant_type="nf4",
         )
         
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_name,
-        token=args.huggingface_token,
-        torch_dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        ),
-        device_map="auto",
-        low_cpu_mem_usage=True,
-        offload_folder="/tmp/offload",      
-        offload_state_dict=True,          
-    )
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            token=args.huggingface_token,
+            quantization_config=quantization_config,
+            device_map="auto",  # This handles device placement automatically
+            low_cpu_mem_usage=True,
+        )
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_name,
+            token=args.huggingface_token,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            low_cpu_mem_usage=True,
+        )
 
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
@@ -75,7 +75,13 @@ def main():
         for i in range(0, len(texts), 4):
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
+            # Don't manually move to device - model is already on correct device via device_map
+            if not args.load_in_4bit:
+                inputs = inputs.to(device)
+            else:
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
             with torch.no_grad():
                 logits = model(**inputs).logits[:, -1, :].float()
             prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
@@ -140,14 +146,15 @@ def main():
         trainer.train()
 
         print("\nFINE-TUNED")
-        ft_metrics, _ = evaluate(model, eval_data)
+        ft_metrics, ft_preds = evaluate(model, eval_data)
         print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
         results["fine_tuned"] = ft_metrics
 
     # XAI EVALUATION + PLOTS (NO OOM!)
     if args.run_xai:
         print("\nXAI EVALUATION + HEATMAPS...")
-        correct = [i for i, (l, p) in enumerate(zip(eval_data["label"], zs_preds if not args.finetune else _)) if l == p]
+        preds_for_xai = ft_preds if args.finetune else zs_preds
+        correct = [i for i, (l, p) in enumerate(zip(eval_data["label"], preds_for_xai)) if l == p]
         sample_idx = random.sample(correct, min(10, len(correct)))
         sample_texts = [eval_data[i]["sentence"] for i in sample_idx]
 
@@ -160,11 +167,11 @@ def main():
             plt.close()
 
         # KernelSHAP (safe)
-        background = shap.kmeans(predict_proba, 10).data
-        kshap = shap.KernelExplainer(predict_proba, background)
+        background = random.sample(list(eval_data["sentence"]), 10)
+        kshap = shap.KernelExplainer(lambda x: predict_proba(x), background)
         for i, text in enumerate(sample_texts):
-            shap_vals = kshap.shap_values(text, nsamples=100)
-            shap.force_plot(kshap.expected_value[1], shap_vals[1], text, show=False, matplotlib=True)
+            shap_vals = kshap.shap_values([text], nsamples=100)
+            shap.force_plot(kshap.expected_value[1], shap_vals[1][0], text, show=False, matplotlib=True)
             plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches='tight')
             plt.close()
 
@@ -176,8 +183,14 @@ def main():
             return torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
 
         for i, text in enumerate(sample_texts):
-            inputs = tokenizer(format_prompt(text), return_tensors="pt").to(device)
-            attr, _ = lig.attribute(inputs["input_ids"], target=0, custom_attribution_func=ig_forward, n_steps=20)
+            prompt = format_prompt(text)
+            inputs = tokenizer(prompt, return_tensors="pt")
+            if not args.load_in_4bit:
+                inputs = inputs.to(device)
+            else:
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            
+            attr, _ = lig.attribute(inputs["input_ids"], target=0, return_convergence_delta=False, n_steps=20)
             attr = attr.sum(dim=-1).squeeze(0).cpu().numpy()
             tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
             fig, _ = viz.visualize_text([viz.VisualizationDataRecord(attr, 0, 0, 0, 0, np.sum(attr), tokens, 0)])
