@@ -59,7 +59,7 @@ def main():
     ),
     device_map="auto",
     low_cpu_mem_usage=True,   
-)
+    )
 
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
