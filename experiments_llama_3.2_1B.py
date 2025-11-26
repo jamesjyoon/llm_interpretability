@@ -46,19 +46,21 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         )
-
+        
     model = AutoModelForCausalLM.from_pretrained(
-    args.model_name,
-    token=args.huggingface_token,
-    torch_dtype=torch.bfloat16,
-    quantization_config=BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4",
-    ),
-    device_map="auto",
-    low_cpu_mem_usage=True,   
+        args.model_name,
+        token=args.huggingface_token,
+        torch_dtype=torch.bfloat16,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        ),
+        device_map="auto",
+        low_cpu_mem_usage=True,
+        offload_folder="/tmp/offload",      
+        offload_state_dict=True,          
     )
 
     def format_prompt(text):
