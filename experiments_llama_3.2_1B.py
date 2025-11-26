@@ -50,7 +50,6 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         token=args.huggingface_token,
-        device_map="auto",
         torch_dtype=torch.bfloat16,
         quantization_config=quantization_config,
     )
