@@ -1,14 +1,16 @@
-torch>=2.1.0
-torchvision
-torchaudio
-transformers>=4.38.0
+torch==2.3.0+cu118
+torchvision==0.18.0+cu118
+torchaudio==2.3.0+cu118
+--index-url https://download.pytorch.org/whl/cu118
+
+transformers==4.44.2
 datasets
 accelerate
-peft
+peft==0.13.2
 bitsandbytes
 scikit-learn
 matplotlib
 lime
 tqdm
-captum>=0.6.0
-shap>=0.42.0
+captum==0.8.0
+shap
