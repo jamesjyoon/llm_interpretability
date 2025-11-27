@@ -48,40 +48,14 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         ),
-        device_map=None,           # ← NO AUTO MAPPING
+        device_map="auto",
         low_cpu_mem_usage=True,    # ← LOAD ON CPU FIRST
     )
 
     # Manually move to GPU 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = model.to(device)
-
-    print(f"Model loaded on {device}")
-    # Configure model loading based on quantization
-    if args.load_in_4bit:
-        quantization_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        )
-        
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            token=args.huggingface_token,
-            quantization_config=quantization_config,
-            device_map="auto",  # This handles device placement automatically
-            low_cpu_mem_usage=True,
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model_name,
-            token=args.huggingface_token,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            low_cpu_mem_usage=True,
-        )
-
+   
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
 
