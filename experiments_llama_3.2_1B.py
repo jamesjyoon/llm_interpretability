@@ -51,6 +51,9 @@ def main():
         low_cpu_mem_usage=True,
     )
 
+    # Get the device where the model is loaded
+    model_device = next(model.parameters()).device
+
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
 
@@ -65,8 +68,8 @@ def main():
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-            # move inputs to same device as the model
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            # Move inputs to the correct device
+            inputs = {k: v.to(model_device) for k, v in inputs.items()}
             with torch.no_grad():
                 logits = model(**inputs).logits[:, -1, :].float()
             prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
@@ -135,6 +138,9 @@ def main():
         )
         trainer.train()
 
+        # Update model_device after fine-tuning in case it changed
+        model_device = next(model.parameters()).device
+
         print("\nFINE-TUNED")
         ft_metrics, ft_preds = evaluate(model, eval_data)
         print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
@@ -171,7 +177,7 @@ def main():
         for i, text in enumerate(sample_texts):
             prompt = format_prompt(text)
             inputs = tokenizer(prompt, return_tensors="pt")
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            inputs = {k: v.to(model_device) for k, v in inputs.items()}
             attr, _ = lig.attribute(inputs["input_ids"], target=0, return_convergence_delta=False, n_steps=20)
             attr = attr.sum(dim=-1).squeeze(0).cpu().numpy()
             tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
