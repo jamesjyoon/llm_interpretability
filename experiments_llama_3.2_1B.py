@@ -33,11 +33,10 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(42)
 
-    
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
 
-    print("Loading 4-bit model (safe way)...")
+    print("Loading 4-bit model ...")
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         token=args.huggingface_token,
@@ -49,9 +48,9 @@ def main():
             bnb_4bit_quant_type="nf4",
         ),
         device_map="auto",
-        low_cpu_mem_usage=True,    # ← LOAD ON CPU FIRST
+        low_cpu_mem_usage=True,
     )
-   
+
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
 
@@ -59,12 +58,15 @@ def main():
     token_1 = tokenizer("1", add_special_tokens=False)["input_ids"][0]
 
     def predict_proba(texts):
-        if isinstance(texts, str): texts = [texts]
+        if isinstance(texts, str):
+            texts = [texts]
         probs = []
         for i in range(0, len(texts), 4):
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
+            # move inputs to same device as the model
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
             with torch.no_grad():
                 logits = model(**inputs).logits[:, -1, :].float()
             prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
@@ -90,21 +92,26 @@ def main():
     print("\nZERO-SHOT")
     zs_metrics, zs_preds = evaluate(model, eval_data)
     print(f"Zero-Shot → Acc: {zs_metrics['accuracy']:.4f} | F1: {zs_metrics['f1']:.4f} | MCC: {zs_metrics['mcc']:.4f}")
-
     results = {"zero_shot": zs_metrics}
 
     if args.finetune:
         print("\nFINE-TUNING...")
         model = prepare_model_for_kbit_training(model)
-        model = get_peft_model(model, LoraConfig(r=32, lora_alpha=64, lora_dropout=0.05,
-            target_modules=["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"],
-            task_type="CAUSAL_LM"))
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=32,
+                lora_alpha=64,
+                lora_dropout=0.05,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+                task_type="CAUSAL_LM",
+            ),
+        )
 
         def tokenize(examples):
             prompts = [format_prompt(t) for t in examples["sentence"]]
             full = [p + f" {l}" for p, l in zip(prompts, examples["label"])]
-            tok = tokenizer(full, truncation=True, max_length=256, padding=False)
-            return tok
+            return tokenizer(full, truncation=True, max_length=256, padding=False)
 
         train_ds = dataset["train"].shuffle(seed=42).select(range(args.train_size))
         train_ds = train_ds.map(tokenize, batched=True, remove_columns=train_ds.column_names)
@@ -133,7 +140,7 @@ def main():
         print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
         results["fine_tuned"] = ft_metrics
 
-    # XAI EVALUATION + PLOTS 
+    # XAI evaluation
     if args.run_xai:
         print("\nXAI EVALUATION + HEATMAPS...")
         preds_for_xai = ft_preds if args.finetune else zs_preds
@@ -146,39 +153,30 @@ def main():
         for i, text in enumerate(sample_texts):
             exp = explainer.explain_instance(text, predict_proba, num_features=10, num_samples=500)
             exp.as_pyplot_figure()
-            plt.savefig(f"{args.output_dir}/lime_{i}.png", dpi=150, bbox_inches='tight')
+            plt.savefig(f"{args.output_dir}/lime_{i}.png", dpi=150, bbox_inches="tight")
             plt.close()
 
-        # KernelSHAP 
+        # KernelSHAP
         background = random.sample(list(eval_data["sentence"]), 10)
-        kshap = shap.KernelExplainer(lambda x: predict_proba(x), background)
+        kshap = shap.KernelExplainer(predict_proba, background)
         for i, text in enumerate(sample_texts):
             shap_vals = kshap.shap_values([text], nsamples=100)
             shap.force_plot(kshap.expected_value[1], shap_vals[1][0], text, show=False, matplotlib=True)
-            plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches='tight')
+            plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches="tight")
             plt.close()
 
-        # Integrated Gradients 
+        # Integrated Gradients
         lig = LayerIntegratedGradients(model, model.model.embed_tokens)
-        def ig_forward(input_ids):
-            # Ensure model is in eval mode if not already
-            model.eval() 
-            outputs = model(input_ids)
-            logits = outputs.logits[:, -1, :]
-            return torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1]
 
         for i, text in enumerate(sample_texts):
             prompt = format_prompt(text)
             inputs = tokenizer(prompt, return_tensors="pt")
-            
-            # Move inputs to the model's actual device
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
-            
             attr, _ = lig.attribute(inputs["input_ids"], target=0, return_convergence_delta=False, n_steps=20)
             attr = attr.sum(dim=-1).squeeze(0).cpu().numpy()
             tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
             fig, _ = viz.visualize_text([viz.VisualizationDataRecord(attr, 0, 0, 0, 0, np.sum(attr), tokens, 0)])
-            fig.savefig(f"{args.output_dir}/ig_{i}.png", dpi=150, bbox_inches='tight')
+            fig.savefig(f"{args.output_dir}/ig_{i}.png", dpi=150, bbox_inches="tight")
             plt.close(fig)
 
     # Bar chart
@@ -187,10 +185,12 @@ def main():
         x = np.arange(len(metrics))
         width = 0.35
         fig, ax = plt.subplots(figsize=(10, 6))
-        ax.bar(x - width/2, [results["zero_shot"][m] for m in metrics], width, label='Zero-Shot', color='#1f77b4')
-        ax.bar(x + width/2, [results["fine_tuned"][m] for m in metrics], width, label='Fine-Tuned', color='#ff7f0e')
-        ax.set_ylabel('Score'); ax.set_title('Zero-Shot vs Fine-Tuned')
-        ax.set_xticks(x); ax.set_xticklabels(metrics)
+        ax.bar(x - width / 2, [results["zero_shot"][m] for m in metrics], width, label="Zero-Shot", color="#1f77b4")
+        ax.bar(x + width / 2, [results["fine_tuned"][m] for m in metrics], width, label="Fine-Tuned", color="#ff7f0e")
+        ax.set_ylabel("Score")
+        ax.set_title("Zero-Shot vs Fine-Tuned")
+        ax.set_xticks(x)
+        ax.set_xticklabels(metrics)
         ax.legend()
         plt.tight_layout()
         plt.savefig(f"{args.output_dir}/comparison_bar_chart.png", dpi=200)
