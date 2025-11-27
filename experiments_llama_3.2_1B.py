@@ -51,9 +51,6 @@ def main():
         low_cpu_mem_usage=True,
     )
 
-    # Get the device where the model is loaded
-    model_device = next(model.parameters()).device
-
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
 
@@ -68,13 +65,13 @@ def main():
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-            # Move inputs to the correct device
-            inputs = {k: v.to(model_device) for k, v in inputs.items()}
+            # Don't manually move to device - let the model handle it
             with torch.no_grad():
-                logits = model(**inputs).logits[:, -1, :].float()
+                outputs = model(**inputs)
+                logits = outputs.logits[:, -1, :].float()
             prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
             probs.extend(prob_1)
-            del inputs, logits
+            del inputs, outputs, logits
             torch.cuda.empty_cache()
         return np.stack([1 - np.array(probs), np.array(probs)], axis=1)
 
@@ -138,9 +135,6 @@ def main():
         )
         trainer.train()
 
-        # Update model_device after fine-tuning in case it changed
-        model_device = next(model.parameters()).device
-
         print("\nFINE-TUNED")
         ft_metrics, ft_preds = evaluate(model, eval_data)
         print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
@@ -155,6 +149,7 @@ def main():
         sample_texts = [eval_data[i]["sentence"] for i in sample_idx]
 
         # LIME
+        print("Running LIME explanations...")
         explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
         for i, text in enumerate(sample_texts):
             exp = explainer.explain_instance(text, predict_proba, num_features=10, num_samples=500)
@@ -163,6 +158,7 @@ def main():
             plt.close()
 
         # KernelSHAP
+        print("Running SHAP explanations...")
         background = random.sample(list(eval_data["sentence"]), 10)
         kshap = shap.KernelExplainer(predict_proba, background)
         for i, text in enumerate(sample_texts):
@@ -171,19 +167,10 @@ def main():
             plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches="tight")
             plt.close()
 
-        # Integrated Gradients
-        lig = LayerIntegratedGradients(model, model.model.embed_tokens)
-
-        for i, text in enumerate(sample_texts):
-            prompt = format_prompt(text)
-            inputs = tokenizer(prompt, return_tensors="pt")
-            inputs = {k: v.to(model_device) for k, v in inputs.items()}
-            attr, _ = lig.attribute(inputs["input_ids"], target=0, return_convergence_delta=False, n_steps=20)
-            attr = attr.sum(dim=-1).squeeze(0).cpu().numpy()
-            tokens = tokenizer.convert_ids_to_tokens(inputs["input_ids"][0])
-            fig, _ = viz.visualize_text([viz.VisualizationDataRecord(attr, 0, 0, 0, 0, np.sum(attr), tokens, 0)])
-            fig.savefig(f"{args.output_dir}/ig_{i}.png", dpi=150, bbox_inches="tight")
-            plt.close(fig)
+        # Integrated Gradients - skip for quantized models as it's incompatible
+        print("Skipping Integrated Gradients (incompatible with 4-bit quantization)")
+        # Note: Integrated Gradients requires full precision gradients
+        # which are not available with 4-bit quantization
 
     # Bar chart
     if "fine_tuned" in results:
