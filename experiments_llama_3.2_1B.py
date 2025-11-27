@@ -51,10 +51,6 @@ def main():
         device_map="auto",
         low_cpu_mem_usage=True,    # ← LOAD ON CPU FIRST
     )
-
-    # Manually move to GPU 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = model.to(device)
    
     def format_prompt(text):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
