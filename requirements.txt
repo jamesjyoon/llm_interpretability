@@ -7,7 +7,7 @@ transformers==4.44.2
 datasets
 accelerate
 peft==0.13.2
-bitsandbytes
+bitsandbytes>=0.43.0  
 scikit-learn
 matplotlib
 lime
