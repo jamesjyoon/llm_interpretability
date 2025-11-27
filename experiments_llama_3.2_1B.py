@@ -32,12 +32,31 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(42)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    print("Loading model...")
+    
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
 
+    print("Loading 4-bit model (safe way)...")
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model_name,
+        token=args.huggingface_token,
+        torch_dtype=torch.bfloat16,
+        quantization_config=BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        ),
+        device_map=None,           # ← NO AUTO MAPPING
+        low_cpu_mem_usage=True,    # ← LOAD ON CPU FIRST
+    )
+
+    # Manually move to GPU 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+
+    print(f"Model loaded on {device}")
     # Configure model loading based on quantization
     if args.load_in_4bit:
         quantization_config = BitsAndBytesConfig(
@@ -72,16 +91,10 @@ def main():
     def predict_proba(texts):
         if isinstance(texts, str): texts = [texts]
         probs = []
-        # Determine the device dynamically from the model
-        current_model_device = model.device # This will be the device where the model's first parameter is
         for i in range(0, len(texts), 4):
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
-            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-            
-            # Move inputs to the model's actual device
-            inputs = {k: v.to(current_model_device) for k, v in inputs.items()}
-            
+            inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256).to(device)
             with torch.no_grad():
                 logits = model(**inputs).logits[:, -1, :].float()
             prob_1 = torch.softmax(logits[:, [token_0, token_1]], dim=-1)[:, 1].cpu().numpy()
@@ -150,7 +163,7 @@ def main():
         print(f"Fine-Tuned → Acc: {ft_metrics['accuracy']:.4f} | F1: {ft_metrics['f1']:.4f} | MCC: {ft_metrics['mcc']:.4f}")
         results["fine_tuned"] = ft_metrics
 
-    # XAI EVALUATION + PLOTS (NO OOM!)
+    # XAI EVALUATION + PLOTS 
     if args.run_xai:
         print("\nXAI EVALUATION + HEATMAPS...")
         preds_for_xai = ft_preds if args.finetune else zs_preds
@@ -166,7 +179,7 @@ def main():
             plt.savefig(f"{args.output_dir}/lime_{i}.png", dpi=150, bbox_inches='tight')
             plt.close()
 
-        # KernelSHAP (safe)
+        # KernelSHAP 
         background = random.sample(list(eval_data["sentence"]), 10)
         kshap = shap.KernelExplainer(lambda x: predict_proba(x), background)
         for i, text in enumerate(sample_texts):
@@ -175,7 +188,7 @@ def main():
             plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches='tight')
             plt.close()
 
-        # Integrated Gradients (safe)
+        # Integrated Gradients 
         lig = LayerIntegratedGradients(model, model.model.embed_tokens)
         def ig_forward(input_ids):
             # Ensure model is in eval mode if not already
