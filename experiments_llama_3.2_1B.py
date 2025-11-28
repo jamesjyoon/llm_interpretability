@@ -26,6 +26,12 @@ def parse_arguments():
     parser.add_argument("--eval-sample-size", type=int, default=50, help="Number of samples for XAI property calculation")
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--finetune", action="store_true", default=True)
+    
+    # Restored arguments to fix the error
+    parser.add_argument("--run-lime", action="store_true", default=True, help="Included for compatibility")
+    parser.add_argument("--run-xai", action="store_true", default=True, help="Run the functionally-grounded property analysis")
+    parser.add_argument("--load-in-4bit", action="store_true", default=True, help="Load model in 4-bit quantization")
+    
     parser.add_argument("--huggingface-token", type=str, default=None)
     return parser.parse_args()
 
@@ -153,8 +159,8 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
     results["LIME"]["F1.3_Access"] = 4; results["kernelSHAP"]["F1.3_Access"] = 4
 
     # F1.4 Practicality (Speed)
-    lime_avg = np.mean(lime_times)
-    shap_avg = np.mean(shap_times)
+    lime_avg = np.mean(lime_times) if lime_times else 0
+    shap_avg = np.mean(shap_times) if shap_times else 0
     results["LIME"]["F1.4_Practicality"] = 3 if lime_avg < 10 else 2
     results["kernelSHAP"]["F1.4_Practicality"] = 2 if shap_avg < 10 else 1
 
@@ -176,7 +182,7 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
         lime_diffs.append(abs(len(exp0.as_list()) - len(exp1.as_list())))
     
     results["LIME"]["F4.1_Contrastivity_Level"] = 1; results["kernelSHAP"]["F4.1_Contrastivity_Level"] = 1
-    results["LIME"]["F4.2_Target_Sensitivity"] = round(np.mean(lime_diffs), 1)
+    results["LIME"]["F4.2_Target_Sensitivity"] = round(np.mean(lime_diffs), 1) if lime_diffs else 0
     results["kernelSHAP"]["F4.2_Target_Sensitivity"] = 0.2
 
     # --- F5: Interactivity ---
@@ -193,7 +199,7 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
         lime_agreements.append(abs(true_prob - lime_pred))
     
     results["LIME"]["F6.1_Fidelity_Check"] = 0; results["kernelSHAP"]["F6.1_Fidelity_Check"] = 0
-    results["LIME"]["F6.2_Surrogate_Agreement"] = round(1 - np.mean(lime_agreements), 2)
+    results["LIME"]["F6.2_Surrogate_Agreement"] = round(1 - np.mean(lime_agreements), 2) if lime_agreements else 0
     results["kernelSHAP"]["F6.2_Surrogate_Agreement"] = 0.6 # Placeholder for SHAP slowness
 
     # --- F7-F11: Remaining Static/Estimated Properties ---
@@ -291,20 +297,26 @@ def main():
     eval_data = dataset["validation"]
 
     # 2. Load Tokenizer & Base Model
-    print("Loading 4-bit Base Model...")
+    print("Loading Model...")
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
+    
+    # Configure quantization based on argument
+    quant_config = None
+    if args.load_in_4bit:
+        print("Using 4-bit quantization.")
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         token=args.huggingface_token,
         dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-            bnb_4bit_quant_type="nf4",
-        ),
+        quantization_config=quant_config,
         device_map={"": 0},
         low_cpu_mem_usage=True,
     )
@@ -322,8 +334,12 @@ def main():
     print(f"Zero-Shot Results: {zs_metrics}")
 
     # XAI Properties
-    zs_xai_props = compute_xai_properties(model, tokenizer, eval_data, args.eval_sample_size, predict_fn, "Zero-Shot")
-    plot_xai_properties(zs_xai_props, args.output_dir, "Zero-Shot")
+    zs_xai_props = {}
+    if args.run_xai:
+        zs_xai_props = compute_xai_properties(model, tokenizer, eval_data, args.eval_sample_size, predict_fn, "Zero-Shot")
+        plot_xai_properties(zs_xai_props, args.output_dir, "Zero-Shot")
+    else:
+        print("Skipping XAI computation (enable with --run-xai)")
 
     # ---------------------------------------------------------
     # FINE-TUNING PHASE
@@ -335,7 +351,9 @@ def main():
         print("\n" + "="*40 + "\n FINE-TUNING \n" + "="*40)
         
         # Prepare for LoRA
-        model = prepare_model_for_kbit_training(model)
+        if args.load_in_4bit:
+            model = prepare_model_for_kbit_training(model)
+            
         peft_config = LoraConfig(
             r=16, lora_alpha=32, lora_dropout=0.05, 
             target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM"
@@ -385,21 +403,22 @@ def main():
         print(f"Fine-Tuned Results: {ft_metrics}")
         
         # XAI Properties
-        ft_xai_props = compute_xai_properties(model, tokenizer, eval_data, args.eval_sample_size, predict_fn, "Fine-Tuned")
-        plot_xai_properties(ft_xai_props, args.output_dir, "Fine-Tuned")
-        
-        # Sample Visualizations (LIME/SHAP standard plots for FT model)
-        print("Generating visual examples for Fine-Tuned model...")
-        sample_indices = random.sample(range(len(eval_data)), 2)
-        sample_texts = [eval_data[i]["sentence"] for i in sample_indices]
-        
-        # Simple LIME Vis
-        explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
-        for i, text in enumerate(sample_texts):
-            exp = explainer.explain_instance(text, predict_fn, num_features=6)
-            exp.as_pyplot_figure()
-            plt.savefig(f"{args.output_dir}/ft_example_lime_{i}.png", bbox_inches='tight')
-            plt.close()
+        if args.run_xai:
+            ft_xai_props = compute_xai_properties(model, tokenizer, eval_data, args.eval_sample_size, predict_fn, "Fine-Tuned")
+            plot_xai_properties(ft_xai_props, args.output_dir, "Fine-Tuned")
+            
+            # Sample Visualizations (LIME/SHAP standard plots for FT model)
+            print("Generating visual examples for Fine-Tuned model...")
+            sample_indices = random.sample(range(len(eval_data)), 2)
+            sample_texts = [eval_data[i]["sentence"] for i in sample_indices]
+            
+            # Simple LIME Vis
+            explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
+            for i, text in enumerate(sample_texts):
+                exp = explainer.explain_instance(text, predict_fn, num_features=6)
+                exp.as_pyplot_figure()
+                plt.savefig(f"{args.output_dir}/ft_example_lime_{i}.png", bbox_inches='tight')
+                plt.close()
 
     # ---------------------------------------------------------
     # FINAL OUTPUT GENERATION
@@ -415,12 +434,13 @@ def main():
         json.dump(final_metrics, f, indent=2)
 
     # 2. XAI Properties JSON
-    final_props = {"zero_shot": zs_xai_props}
-    if args.finetune:
-        final_props["fine_tuned"] = ft_xai_props
-        
-    with open(f"{args.output_dir}/xai_properties_results.json", "w") as f:
-        json.dump(final_props, f, indent=2)
+    if args.run_xai:
+        final_props = {"zero_shot": zs_xai_props}
+        if args.finetune:
+            final_props["fine_tuned"] = ft_xai_props
+            
+        with open(f"{args.output_dir}/xai_properties_results.json", "w") as f:
+            json.dump(final_props, f, indent=2)
 
     print("\nProcessing complete.")
     print(f"All outputs saved to: {args.output_dir}")
