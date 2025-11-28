@@ -37,6 +37,8 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
 
     print("Loading 4-bit model ...")
+    # Load model with explicit device_map to avoid dispatch issues
+    device_map = {"": 0}  # Load entire model on GPU 0
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         token=args.huggingface_token,
@@ -47,7 +49,7 @@ def main():
             bnb_4bit_use_double_quant=True,
             bnb_4bit_quant_type="nf4",
         ),
-        device_map="auto",
+        device_map=device_map,
         low_cpu_mem_usage=True,
     )
 
@@ -166,11 +168,6 @@ def main():
             shap.force_plot(kshap.expected_value[1], shap_vals[1][0], text, show=False, matplotlib=True)
             plt.savefig(f"{args.output_dir}/shap_{i}.png", dpi=150, bbox_inches="tight")
             plt.close()
-
-        # Integrated Gradients - skip for quantized models as it's incompatible
-        print("Skipping Integrated Gradients (incompatible with 4-bit quantization)")
-        # Note: Integrated Gradients requires full precision gradients
-        # which are not available with 4-bit quantization
 
     # Bar chart
     if "fine_tuned" in results:
