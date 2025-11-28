@@ -42,7 +42,7 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(
         args.model_name,
         token=args.huggingface_token,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         quantization_config=BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_compute_dtype=torch.bfloat16,
@@ -67,7 +67,8 @@ def main():
             batch = texts[i:i+4]
             prompts = [format_prompt(t) for t in batch]
             inputs = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=256)
-            # Don't manually move to device - let the model handle it
+            # Move inputs to GPU 0 (where model is loaded)
+            inputs = {k: v.to("cuda:0") for k, v in inputs.items()}
             with torch.no_grad():
                 outputs = model(**inputs)
                 logits = outputs.logits[:, -1, :].float()
