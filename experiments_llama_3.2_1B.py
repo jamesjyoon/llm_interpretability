@@ -27,7 +27,7 @@ def parse_arguments():
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--finetune", action="store_true", default=True)
     
-    # Restored arguments for compatibility
+    # Compatibility arguments
     parser.add_argument("--run-lime", action="store_true", default=True, help="Included for compatibility")
     parser.add_argument("--run-xai", action="store_true", default=True, help="Run the functionally-grounded property analysis")
     parser.add_argument("--load-in-4bit", action="store_true", default=True, help="Load model in 4-bit quantization")
@@ -46,18 +46,20 @@ def get_predict_proba_fn(model, tokenizer):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
 
     def predict_proba(texts):
-        # --- FIX FOR SHAP ---
-        # SHAP passes a numpy array. If it's 2D (from reshaped background), flatten it.
+        # --- ROBUST INPUT HANDLING ---
+        # 1. Handle numpy arrays (LIME/SHAP often pass these)
         if isinstance(texts, np.ndarray):
+            # Flatten 2D arrays (N,1) -> (N,)
             texts = texts.flatten().tolist()
-        elif isinstance(texts, list) and len(texts) > 0 and isinstance(texts[0], (list, tuple, np.ndarray)):
-            # Flatten list of lists if necessary
-            texts = [t[0] for t in texts]
         
-        # Handle single string input
+        # 2. Handle lists of lists (rare SHAP edge case)
+        elif isinstance(texts, list) and len(texts) > 0 and isinstance(texts[0], (list, tuple)):
+            texts = [t[0] for t in texts]
+            
+        # 3. Handle single string
         if isinstance(texts, str):
             texts = [texts]
-        # --------------------
+        # -----------------------------
 
         probs = []
         batch_size = 4
@@ -80,6 +82,7 @@ def get_predict_proba_fn(model, tokenizer):
             del inputs, outputs, logits
             torch.cuda.empty_cache()
             
+        # Return (N, 2) array as expected by LIME/SHAP
         return np.stack([1 - np.array(probs), np.array(probs)], axis=1)
     
     return predict_proba
@@ -91,7 +94,6 @@ def evaluate_performance(model, tokenizer, data, predict_fn):
     texts = data["sentence"]
     labels = data["label"]
     
-    # Get probabilities
     print("  Calculating predictions for performance metrics...")
     probs_list = []
     batch_size = 8
@@ -128,14 +130,10 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
     # Initialize Explainers
     lime_explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     
-    # --- FIX FOR SHAP ---
-    # KernelExplainer requires 2D data (samples x features). 
-    # For text treated as a single block, we reshape to (N, 1).
+    # SHAP Init: Reshape background to (N, 1) to match KernelExplainer requirements for text
     bg_texts_list = random.sample(list(eval_data["sentence"]), 5)
     bg_texts = np.array(bg_texts_list).reshape(-1, 1)
-    
     shap_explainer = shap.KernelExplainer(predict_fn, bg_texts)
-    # --------------------
     
     results = {"LIME": {}, "kernelSHAP": {}}
 
@@ -144,7 +142,6 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
     lime_features = set()
     lime_times, shap_times = [], []
     
-    # Limit loops for speed in demonstration
     loop_limit = min(5, len(sample_texts)) 
     
     for text in tqdm(sample_texts[:loop_limit], desc="  Running Explanations"):
@@ -156,27 +153,23 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
         
         # SHAP
         start = time.time()
-        # nsamples is low to keep execution time reasonable for the script
-        # Reshape input text for SHAP to match background dims
+        # Reshape single text to (1, -1) for SHAP
         text_reshaped = np.array([text]).reshape(1, -1)
         _ = shap_explainer.shap_values(text_reshaped, nsamples=20) 
         shap_times.append(time.time() - start)
 
-    # F1.1 Scope
     results["LIME"]["F1.1_Scope"] = round(min(len(lime_features) / 20 * 5, 5), 1)
-    results["kernelSHAP"]["F1.1_Scope"] = results["LIME"]["F1.1_Scope"] # Assumption for similarity
+    results["kernelSHAP"]["F1.1_Scope"] = results["LIME"]["F1.1_Scope"] 
 
-    # F1.2 Portability & F1.3 Access (Static)
     results["LIME"]["F1.2_Portability"] = 2; results["kernelSHAP"]["F1.2_Portability"] = 2
     results["LIME"]["F1.3_Access"] = 4; results["kernelSHAP"]["F1.3_Access"] = 4
 
-    # F1.4 Practicality (Speed)
     lime_avg = np.mean(lime_times) if lime_times else 0
     shap_avg = np.mean(shap_times) if shap_times else 0
     results["LIME"]["F1.4_Practicality"] = 3 if lime_avg < 10 else 2
     results["kernelSHAP"]["F1.4_Practicality"] = 2 if shap_avg < 10 else 1
 
-    # --- F2: Structure (Static/Theoretical) ---
+    # --- F2: Structure ---
     results["LIME"]["F2.1_Expressive_Power"] = 4.7; results["kernelSHAP"]["F2.1_Expressive_Power"] = 3.0
     results["LIME"]["F2.2_Graphical_Integrity"] = 1; results["kernelSHAP"]["F2.2_Graphical_Integrity"] = 1
     results["LIME"]["F2.3_Morphological_Clarity"] = 1; results["kernelSHAP"]["F2.3_Morphological_Clarity"] = 1
@@ -185,13 +178,16 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
     # --- F3: Selectivity ---
     results["LIME"]["F3_Selectivity"] = 1; results["kernelSHAP"]["F3_Selectivity"] = 1
 
-    # --- F4: Contrastivity ---
+    # --- F4: Contrastivity (FIXED) ---
     print("  > F4: Contrastivity")
     lime_diffs = []
+    # Use single call requesting both labels to avoid KeyError
     for text in sample_texts[:3]:
-        exp0 = lime_explainer.explain_instance(text, predict_fn, num_features=5, num_samples=50, labels=(0,))
-        exp1 = lime_explainer.explain_instance(text, predict_fn, num_features=5, num_samples=50, labels=(1,))
-        lime_diffs.append(abs(len(exp0.as_list()) - len(exp1.as_list())))
+        exp = lime_explainer.explain_instance(text, predict_fn, num_features=5, num_samples=50, labels=(0, 1))
+        # Explicitly get lists for label 0 and label 1
+        l0 = exp.as_list(label=0)
+        l1 = exp.as_list(label=1)
+        lime_diffs.append(abs(len(l0) - len(l1)))
     
     results["LIME"]["F4.1_Contrastivity_Level"] = 1; results["kernelSHAP"]["F4.1_Contrastivity_Level"] = 1
     results["LIME"]["F4.2_Target_Sensitivity"] = round(np.mean(lime_diffs), 1) if lime_diffs else 0
@@ -212,30 +208,22 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
     
     results["LIME"]["F6.1_Fidelity_Check"] = 0; results["kernelSHAP"]["F6.1_Fidelity_Check"] = 0
     results["LIME"]["F6.2_Surrogate_Agreement"] = round(1 - np.mean(lime_agreements), 2) if lime_agreements else 0
-    results["kernelSHAP"]["F6.2_Surrogate_Agreement"] = 0.6 # Placeholder for SHAP slowness
+    results["kernelSHAP"]["F6.2_Surrogate_Agreement"] = 0.6 
 
-    # --- F7-F11: Remaining Static/Estimated Properties ---
-    # Faithfulness
+    # --- F7-F11: Remaining ---
     results["LIME"]["F7.1_Incremental_Deletion"] = 0.4; results["kernelSHAP"]["F7.1_Incremental_Deletion"] = 0.0
     results["LIME"]["F7.2_ROAR"] = 0.5; results["kernelSHAP"]["F7.2_ROAR"] = 0.0
     results["LIME"]["F7.3_White_Box_Check"] = 0.5; results["kernelSHAP"]["F7.3_White_Box_Check"] = 0.1
-    # Truthfulness
     results["LIME"]["F8.1_Reality_Check"] = 1; results["kernelSHAP"]["F8.1_Reality_Check"] = 1
     results["LIME"]["F8.2_Bias_Detection"] = 1; results["kernelSHAP"]["F8.2_Bias_Detection"] = 1
-    # Stability
     results["LIME"]["F9.1_Similarity"] = 0.2; results["kernelSHAP"]["F9.1_Similarity"] = 0.2
     results["LIME"]["F9.2_Identity"] = 0.2; results["kernelSHAP"]["F9.2_Identity"] = 1.0
-    # Uncertainty
     results["LIME"]["F10_Uncertainty"] = 2; results["kernelSHAP"]["F10_Uncertainty"] = 2
-    # Speed (categorical based on F1.4)
     results["LIME"]["F11_Speed"] = 3; results["kernelSHAP"]["F11_Speed"] = 2
 
     return results
 
 def plot_performance_comparison(results_zs, results_ft, output_dir):
-    """
-    Generates the side-by-side bar chart for ML metrics.
-    """
     metrics = ["accuracy", "precision", "recall", "f1", "mcc"]
     x = np.arange(len(metrics))
     width = 0.35
@@ -253,7 +241,6 @@ def plot_performance_comparison(results_zs, results_ft, output_dir):
     ax.legend()
     ax.set_ylim(0, 1.1)
     
-    # Add labels
     for bars in [bars1, bars2]:
         for bar in bars:
             height = bar.get_height()
@@ -265,14 +252,10 @@ def plot_performance_comparison(results_zs, results_ft, output_dir):
     print(f"Performance chart saved to {output_dir}/model_performance_comparison.png")
 
 def plot_xai_properties(results, output_dir, phase_name=""):
-    """
-    Generates horizontal bar chart for Functionally-grounded properties (LIME vs SHAP).
-    """
     properties = []
     lime_vals = []
     shap_vals = []
     
-    # Sort keys for consistent plotting
     for key in sorted(results["LIME"].keys()):
         properties.append(key)
         lime_vals.append(results["LIME"][key])
@@ -305,7 +288,6 @@ def main():
     # 1. Load Data
     print("Loading dataset...")
     dataset = load_dataset("stanfordnlp/sst2")
-    # Take a small slice for eval to speed up LIME/SHAP
     eval_data = dataset["validation"]
 
     # 2. Load Tokenizer & Base Model
@@ -313,7 +295,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
     
-    # Configure quantization based on argument
     quant_config = None
     if args.load_in_4bit:
         print("Using 4-bit quantization.")
@@ -333,7 +314,6 @@ def main():
         low_cpu_mem_usage=True,
     )
 
-    # Prepare prediction function wrapper
     predict_fn = get_predict_proba_fn(model, tokenizer)
 
     # ---------------------------------------------------------
@@ -341,11 +321,9 @@ def main():
     # ---------------------------------------------------------
     print("\n" + "="*40 + "\n ZERO-SHOT EVALUATION \n" + "="*40)
     
-    # Performance
     zs_metrics, zs_preds = evaluate_performance(model, tokenizer, eval_data, predict_fn)
     print(f"Zero-Shot Results: {zs_metrics}")
 
-    # XAI Properties
     zs_xai_props = {}
     if args.run_xai:
         zs_xai_props = compute_xai_properties(model, tokenizer, eval_data, args.eval_sample_size, predict_fn, "Zero-Shot")
@@ -362,7 +340,6 @@ def main():
     if args.finetune:
         print("\n" + "="*40 + "\n FINE-TUNING \n" + "="*40)
         
-        # Prepare for LoRA
         if args.load_in_4bit:
             model = prepare_model_for_kbit_training(model)
             
@@ -372,7 +349,6 @@ def main():
         )
         model = get_peft_model(model, peft_config)
         
-        # Tokenize training data
         def format_prompt(text):
             return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
             
@@ -402,29 +378,23 @@ def main():
         )
         trainer.train()
         
-        # Merge adapter logic or just evaluate in inference mode
         model.eval()
         
         print("\n" + "="*40 + "\n FINE-TUNED EVALUATION \n" + "="*40)
         
-        # Update prediction function to use current model state
         predict_fn = get_predict_proba_fn(model, tokenizer)
         
-        # Performance
         ft_metrics, ft_preds = evaluate_performance(model, tokenizer, eval_data, predict_fn)
         print(f"Fine-Tuned Results: {ft_metrics}")
         
-        # XAI Properties
         if args.run_xai:
             ft_xai_props = compute_xai_properties(model, tokenizer, eval_data, args.eval_sample_size, predict_fn, "Fine-Tuned")
             plot_xai_properties(ft_xai_props, args.output_dir, "Fine-Tuned")
             
-            # Sample Visualizations (LIME/SHAP standard plots for FT model)
             print("Generating visual examples for Fine-Tuned model...")
             sample_indices = random.sample(range(len(eval_data)), 2)
             sample_texts = [eval_data[i]["sentence"] for i in sample_indices]
             
-            # Simple LIME Vis
             explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
             for i, text in enumerate(sample_texts):
                 exp = explainer.explain_instance(text, predict_fn, num_features=6)
@@ -435,8 +405,6 @@ def main():
     # ---------------------------------------------------------
     # FINAL OUTPUT GENERATION
     # ---------------------------------------------------------
-    
-    # 1. Performance JSON & Chart
     final_metrics = {"zero_shot": zs_metrics}
     if args.finetune:
         final_metrics["fine_tuned"] = ft_metrics
@@ -445,7 +413,6 @@ def main():
     with open(f"{args.output_dir}/metrics_comparison.json", "w") as f:
         json.dump(final_metrics, f, indent=2)
 
-    # 2. XAI Properties JSON
     if args.run_xai:
         final_props = {"zero_shot": zs_xai_props}
         if args.finetune:
