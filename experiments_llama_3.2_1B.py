@@ -27,7 +27,7 @@ def parse_arguments():
     parser.add_argument("--epochs", type=float, default=1.0)
     parser.add_argument("--finetune", action="store_true", default=True)
     
-    # Restored arguments to fix the error
+    # Restored arguments for compatibility
     parser.add_argument("--run-lime", action="store_true", default=True, help="Included for compatibility")
     parser.add_argument("--run-xai", action="store_true", default=True, help="Run the functionally-grounded property analysis")
     parser.add_argument("--load-in-4bit", action="store_true", default=True, help="Load model in 4-bit quantization")
@@ -46,13 +46,18 @@ def get_predict_proba_fn(model, tokenizer):
         return f"Classify the sentiment as 0 (negative) or 1 (positive).\nText: {text}\nSentiment:"
 
     def predict_proba(texts):
+        # --- FIX FOR SHAP ---
+        # SHAP passes a numpy array. If it's 2D (from reshaped background), flatten it.
+        if isinstance(texts, np.ndarray):
+            texts = texts.flatten().tolist()
+        elif isinstance(texts, list) and len(texts) > 0 and isinstance(texts[0], (list, tuple, np.ndarray)):
+            # Flatten list of lists if necessary
+            texts = [t[0] for t in texts]
+        
         # Handle single string input
         if isinstance(texts, str):
             texts = [texts]
-        
-        # Ensure texts are strings (LIME passes numpy arrays of objects sometimes)
-        if isinstance(texts, np.ndarray):
-            texts = texts.astype(str).tolist()
+        # --------------------
 
         probs = []
         batch_size = 4
@@ -123,9 +128,14 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
     # Initialize Explainers
     lime_explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     
-    # SHAP Background (keep small for speed)
-    bg_texts = np.array(random.sample(list(eval_data["sentence"]), 5))
+    # --- FIX FOR SHAP ---
+    # KernelExplainer requires 2D data (samples x features). 
+    # For text treated as a single block, we reshape to (N, 1).
+    bg_texts_list = random.sample(list(eval_data["sentence"]), 5)
+    bg_texts = np.array(bg_texts_list).reshape(-1, 1)
+    
     shap_explainer = shap.KernelExplainer(predict_fn, bg_texts)
+    # --------------------
     
     results = {"LIME": {}, "kernelSHAP": {}}
 
@@ -147,7 +157,9 @@ def compute_xai_properties(model, tokenizer, eval_data, sample_size, predict_fn,
         # SHAP
         start = time.time()
         # nsamples is low to keep execution time reasonable for the script
-        _ = shap_explainer.shap_values([text], nsamples=20) 
+        # Reshape input text for SHAP to match background dims
+        text_reshaped = np.array([text]).reshape(1, -1)
+        _ = shap_explainer.shap_values(text_reshaped, nsamples=20) 
         shap_times.append(time.time() - start)
 
     # F1.1 Scope
