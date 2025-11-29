@@ -35,6 +35,7 @@ F1.4 Practicality: Measures the wall-clock time required to generate explanation
 F4.2 Target Sensitivity (LIME): Measures the divergence in explanations when querying opposite labels.
 F6.2 Surrogate Agreement (LIME): Measures the fidelity (R-squared/MAE) of the local linear approximation against the model's actual probabilities.
 2. Static (Hardcoded) Properties
+The following properties use fixed values. This section explains the rationale for each:
 | Property | Value Source | Rationale |
 | :--- | :--- | :--- |
 | **F9.2 Identity (Stability)** | **Theoretical** | **KernelSHAP (1.0)** is mathematically proven to be deterministic (output is constant for constant input). **LIME (0.2)** is inherently stochastic due to random neighborhood sampling, leading to known instability. |
@@ -43,6 +44,7 @@ F6.2 Surrogate Agreement (LIME): Measures the fidelity (R-squared/MAE) of the lo
 | **F7.2 ROAR (Faithfulness)** | **Literature / Computational** | *Remove And Retrain (ROAR)* requires retraining the LLM dozens of times to measure accuracy drops when top features are removed. Due to the high computational cost of retraining Llama-1B, we utilize literature baseline scores (LIME ~0.5, SHAP ~0.0) rather than running this benchmark dynamically. |
 | **F2.2 Graphical Integrity** | **Qualitative** | This measures the visual clarity of the output (e.g., bar charts). As this is a subjective Human-Computer Interaction (HCI) metric, it cannot be computed by a script. |
 | **F6.2 Surrogate Agreement (SHAP)** | **Computational** | **SHAP (0.6)**. Calculating exact fidelity for KernelSHAP requires convergence (thousands of samples), which is too slow for this script. A conservative estimate is used based on the low `nsamples` setting used in this experiment. |
+
 
 ## Getting Started
 
