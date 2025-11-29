@@ -17,13 +17,13 @@ The implementation is designed to be accessible and reproducible, with Colab-opt
 
 ## Interpretability Methods
 
-This implementation references three major approaches for model explanation:
+This implementation references two major approaches for model explanation:
 
 - **LIME (Local Interpretable Model-agnostic Explanations)**: A perturbation-based technique that trains local surrogate models to identify feature importance. While model-agnostic and easy to apply to text, it can be sensitive to sampling strategies.
 
 - **KernelSHAP**: Approximates Shapley values using a weighted kernel that emphasizes coalitions near the original input. It inherits desirable properties (local accuracy, missingness, consistency) while remaining practical for deep networks through sampling.
 
-- **TreeSHAP**: Provides exact and efficient Shapley value computation for tree ensembles by exploiting their structure. This is the preferred method for gradient-boosted trees and random forests.
+
 
 For classification evaluation, we complement accuracy-based metrics with the **Matthews Correlation Coefficient (MCC)**, which provides a balanced score (−1 to +1) that remains informative under class imbalance. An MCC of +1 indicates perfect predictions, 0 matches random guessing, and −1 reflects complete disagreement.
 
