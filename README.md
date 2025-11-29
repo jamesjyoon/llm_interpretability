@@ -121,6 +121,156 @@ The pipeline generates the following outputs in the specified `--output-dir`:
 - **Fine-Tuning Details**: During fine-tuning, instruction tokens are masked with `-100` so the loss only supervises the appended label token, keeping LoRA updates focused on classification decisions.
 - **Output Visualization**: Charts render inline in Colab notebooks when available; otherwise they are saved as PNG files.
 
+## Implementation Details: llama_3.2_1B_xai.py
+
+The `llama_3.2_1B_xai.py` script provides a focused implementation for XAI (Explainable AI) property analysis on the Llama 3.2 1B model. This file is specifically designed for detailed evaluation of model interpretability across zero-shot and fine-tuned configurations using functionally-grounded explanations.
+
+### Key Capabilities
+
+- **Functionally-Grounded Properties (F1-F11)**: Computes interpretability metrics based on the framework by Mohseni et al., including scope, structure, selectivity, contrastivity, interactivity, fidelity, faithfulness, rationality, alignment, uncertainty, and speed.
+- **LIME Explainer Integration**: Local Interpretable Model-agnostic Explanations for feature-level attribution analysis.
+- **KernelSHAP Integration**: Kernel-based Shapley value approximation for robust feature importance estimation.
+- **Standalone Execution**: Can be run independently or as part of the full pipeline for targeted XAI analysis.
+
+### Script Arguments
+
+- `--model-name`: Llama model checkpoint (default: `meta-llama/Llama-3.2-1B`)
+- `--output-dir`: Directory for saving metrics and visualizations
+- `--train-size`: Number of training samples for fine-tuning (default: 1000)
+- `--eval-sample-size`: Number of evaluation samples for XAI property computation (default: 50)
+- `--epochs`: Number of fine-tuning epochs (default: 1.0)
+- `--finetune`: Enable LoRA fine-tuning
+- `--run-xai`: Compute functionally-grounded XAI properties (default: True)
+- `--load-in-4bit`: Use 4-bit quantization for memory efficiency
+- `--huggingface-token`: Authentication token for gated models
+
+### Output Files
+
+- `metrics_comparison.json`: Performance metrics (accuracy, precision, recall, F1, MCC) for both zero-shot and fine-tuned models
+- `xai_properties_results.json`: Functionally-grounded property scores for LIME and KernelSHAP
+- `model_performance_comparison.png`: Bar chart comparing zero-shot vs. fine-tuned performance
+- `xai_properties_comparison_*.png`: Horizontal bar charts showing property scores across explainability methods
+- `ft_example_lime_*.png`: Visual LIME explanations for sample fine-tuned model predictions
+
+## Running on Georgia Tech ICE PACE Cluster
+
+The ICE (Interactive Cluster Environment) and PACE (Partnership for an Advanced Computing Environment) clusters at Georgia Tech provide high-performance GPU resources ideal for model training and interpretation analysis.
+
+### ICE PACE Setup
+
+1. **SSH into the cluster**:
+   ```bash
+   ssh <gt_username>@ice.cc.gatech.edu  # or ice-login.cc.gatech.edu
+   ```
+
+2. **Load necessary modules**:
+   ```bash
+   module load anaconda3/2023.09
+   module load cuda/12.2.0
+   module load cudnn/8.9.4
+   ```
+
+3. **Set up Python environment**:
+   ```bash
+   conda create -n llm_interpretability python=3.10
+   conda activate llm_interpretability
+   ```
+
+4. **Clone repository and install dependencies**:
+   ```bash
+   git clone https://github.com/jamesjyoon/llm_interpretability.git
+   cd llm_interpretability
+   pip install -r requirements.txt
+   ```
+
+### Submitting a Job via SLURM
+
+Create a submission script (e.g., `llama_xai.slurm`):
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=llama_xai_analysis
+#SBATCH --partition=gpu
+#SBATCH --time=04:00:00
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:A100:1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --output=%j.out
+#SBATCH --error=%j.err
+
+module load anaconda3/2023.09
+module load cuda/12.2.0
+module load cudnn/8.9.4
+
+conda activate llm_interpretability
+
+cd $HOME/llm_interpretability
+
+python llama_3.2_1B_xai.py \
+  --model-name meta-llama/Llama-3.2-1B \
+  --output-dir outputs/pace_xai_analysis \
+  --train-size 2000 \
+  --eval-sample-size 100 \
+  --epochs 2.0 \
+  --finetune \
+  --run-xai \
+  --load-in-4bit \
+  --huggingface-token <your_hf_token>
+```
+
+Submit the job:
+```bash
+sbatch llama_xai.slurm
+```
+
+### Monitoring Jobs
+
+```bash
+# Check job status
+squeue -u <gt_username>
+
+# View job details
+scontrol show job <job_id>
+
+# Cancel a job
+scancel <job_id>
+```
+
+### Transferring Results
+
+Transfer results from PACE to local machine:
+```bash
+scp -r <gt_username>@ice.cc.gatech.edu:/home/<gt_username>/llm_interpretability/outputs/pace_xai_analysis ./results_from_pace/
+```
+
+### PACE-Specific Considerations
+
+- **GPU Allocation**: Request appropriate GPU resources (A100 for larger models, V100/H100 for standard tasks)
+- **Memory Management**: Monitor memory usage with `nvidia-smi` in interactive sessions
+- **Job Time Limits**: Default partition has 4-hour limit; longer jobs may need `--partition=gpu-long` (up to 24 hours)
+- **Storage**: Store large datasets in `/scratch` directory for faster I/O; results in `$HOME` are automatically backed up
+- **Data Transfer**: For large models/datasets, use `rsync` or `globus` instead of `scp` for improved performance
+
+### Example: Interactive GPU Session
+
+For development and debugging:
+```bash
+interactive -p gpu -N 1 --gres=gpu:A100:1 -c 8 --mem=64G -t 120
+```
+
+Then run the script directly:
+```bash
+python llama_3.2_1B_xai.py --model-name meta-llama/Llama-3.2-1B --output-dir outputs/debug_run --train-size 100 --eval-sample-size 10
+```
+
+### Troubleshooting on PACE
+
+- **CUDA out of memory**: Reduce `--train-size` or `--eval-sample-size`, or enable `--load-in-4bit`
+- **Module not found**: Verify all modules are loaded and environment is activated
+- **Slow I/O**: Use `/scratch` for intermediate files instead of `$HOME`
+- **Job timeout**: Increase `--time` in SLURM header or reduce model size/data volume
+
 ## Citation
 
 If you use this work in your research, please cite:
