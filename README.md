@@ -23,9 +23,27 @@ This implementation references two major approaches for model explanation:
 
 - **KernelSHAP**: Approximates Shapley values using a weighted kernel that emphasizes coalitions near the original input. It inherits desirable properties (local accuracy, missingness, consistency) while remaining practical for deep networks through sampling.
 
-
-
 For classification evaluation, we complement accuracy-based metrics with the **Matthews Correlation Coefficient (MCC)**, which provides a balanced score (−1 to +1) that remains informative under class imbalance. An MCC of +1 indicates perfect predictions, 0 matches random guessing, and −1 reflects complete disagreement.
+
+
+Methodology: Computed vs. Static Properties
+The evaluation of XAI properties (F1–F11) in experiments_llama_3.2_1B.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
+1. Dynamically Computed Properties
+These scores are calculated during execution based on the specific Llama-3.2-1B model and SST-2 dataset:
+F1.1 Scope: Measures the diversity of features selected across the evaluation set.
+F1.4 Practicality: Measures the wall-clock time required to generate explanations.
+F4.2 Target Sensitivity (LIME): Measures the divergence in explanations when querying opposite labels.
+F6.2 Surrogate Agreement (LIME): Measures the fidelity (R-squared/MAE) of the local linear approximation against the model's actual probabilities.
+2. Static (Hardcoded) Properties
+The following properties use fixed values. This section explains the rationale for each:
+| Property                        | Value Source               | Rationale                                                                                                                                                                                                                |
+| ------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| F9.2 Identity (Stability)       | Theoretical                | KernelSHAP (1.0) is mathematically deterministic (output is constant for constant input), whereas LIME (0.2) is stochastic due to random neighborhood sampling, which leads to instability.                              |
+| F1.2 Portability                | Theoretical                | Both methods are model-agnostic by design and can be applied to any black-box model, so portability is treated as a binary algorithmic property rather than a runtime metric.                                            |
+| F2.1 Expressive Power           | Theoretical                | LIME (4.7) produces a weighted linear formula that is highly expressive, while SHAP (3.0) yields additive feature attributions that assume independence and capture interactions less richly.                            |
+| F7.2 ROAR (Faithfulness)        | Literature / Computational | Remove And Retrain (ROAR) requires retraining the LLM many times to measure accuracy drops when top features are removed, so literature baseline scores (LIME ~0.5, SHAP ~0.0) are used instead of dynamic benchmarking. |
+| F2.2 Graphical Integrity        | Qualitative                | This property reflects the visual clarity of explanation outputs (for example, bar charts) and is inherently subjective, so it is not computed programmatically.                                                         |
+| F6.2 Surrogate Agreement (SHAP) | Computational              | SHAP is assigned 0.6, using a conservative estimate because exact fidelity would require many samples for convergence, which is too slow given the low nsamples configuration in this experiment.                        |
 
 ## Getting Started
 
