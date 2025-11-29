@@ -244,7 +244,7 @@ This project utilizes the Functionally-Grounded Evaluation framework to assess X
 
 If you use this code, please cite the foundational work on this evaluation strategy:
 
-BibTeX:
+```bibtex
 @article{doshi2017towards,
   title={Towards a rigorous science of interpretable machine learning},
   author={Doshi-Velez, Finale and Kim, Been},
@@ -262,7 +262,7 @@ BibTeX:
   year={2023},
   publisher={ACM New York, NY}
 }
-
+```
 
 If you use this work in your research, please cite:
 
