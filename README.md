@@ -36,6 +36,7 @@ F4.2 Target Sensitivity (LIME): Measures the divergence in explanations when que
 F6.2 Surrogate Agreement (LIME): Measures the fidelity (R-squared/MAE) of the local linear approximation against the model's actual probabilities.
 2. Static (Hardcoded) Properties
 The following properties use fixed values. This section explains the rationale for each:
+
 | Property | Value Source | Rationale |
 | :--- | :--- | :--- |
 | **F9.2 Identity (Stability)** | **Theoretical** | **KernelSHAP (1.0)** is mathematically proven to be deterministic (output is constant for constant input). **LIME (0.2)** is inherently stochastic due to random neighborhood sampling, leading to known instability. |
