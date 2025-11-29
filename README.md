@@ -1,3 +1,5 @@
+45
+4545
 # LLM Interpretability: Zero-Shot vs. Fine-Tuned Comparison
 
 ## Overview
@@ -42,35 +44,7 @@ cd llm_interpretability
 pip install -r requirements.txt
 ```
 
-### Running on Google Colab
-
-1. **Start a new Colab notebook** with GPU runtime enabled.
-
-2. **Clone and install dependencies**:
-   ```python
-   !git clone https://github.com/jamesjyoon/llm_interpretability.git
-   %cd llm_interpretability
-   !pip install -r requirements.txt
-   ```
-
-3. **Authenticate with Hugging Face** (required for gated models):
-   ```python
-   # Option A: Set environment variable
-   import os
-   os.environ["HF_TOKEN"] = "<your_hf_token>"
    
-   # Option B: Manual login
-   from huggingface_hub import login
-   login("<your_hf_token>")
-   ```
-   
-   Alternatively, visit [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) and request access to the [Llama 3.2 1B model](https://huggingface.co/meta-llama/Llama-3.2-1B).
-
-4. **Launch the experiment**:
-   ```python
-   !python experiments_llama_3.2_1B.py --finetune --run-shap --output-dir outputs/tweet_sentiment_extraction
-   ```
-
 ## Output Artifacts
 
 The pipeline generates the following outputs in the specified `--output-dir`:
