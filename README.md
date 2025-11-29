@@ -238,7 +238,31 @@ python llama_3.2_1B_xai.py --model-name meta-llama/Llama-3.2-1B --output-dir out
 - **Slow I/O**: Use `/scratch` for intermediate files instead of `$HOME`
 - **Job timeout**: Increase `--time` in SLURM header or reduce model size/data volume
 
-## Citation
+## Citations
+
+This project utilizes the Functionally-Grounded Evaluation framework to assess XAI methods (LIME and KernelSHAP), focusing on proxy tasks and quantitative metrics rather than human-subject studies to evaluate explanation quality.
+
+If you use this code, please cite the foundational work on this evaluation strategy:
+
+BibTeX:
+@article{doshi2017towards,
+  title={Towards a rigorous science of interpretable machine learning},
+  author={Doshi-Velez, Finale and Kim, Been},
+  journal={arXiv preprint arXiv:1702.08608},
+  year={2017}
+}
+
+@article{nauta2023anecdotal,
+  title={From anecdotal evidence to quantitative evaluation methods: A systematic review on evaluating explainable AI},
+  author={Nauta, Meike and Trienes, Jan and Pathak, Shreyasi and Nguyen, Elisa and Peters, Michelle and Schmitt, Yasmin and Schl{\"o}tterer, J{\"o}rg and van Keulen, Maurice and Seifert, Christin},
+  journal={ACM Computing Surveys},
+  volume={55},
+  number={13s},
+  pages={1--42},
+  year={2023},
+  publisher={ACM New York, NY}
+}
+
 
 If you use this work in your research, please cite:
 
