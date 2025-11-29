@@ -1,5 +1,3 @@
-45
-4545
 # LLM Interpretability: Zero-Shot vs. Fine-Tuned Comparison
 
 ## Overview
