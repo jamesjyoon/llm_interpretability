@@ -163,34 +163,29 @@ Create a submission script (e.g., `llama_xai.sbatch`):
 
 ```bash
 #!/bin/bash
-#SBATCH --job-name=llama_xai_analysis
-#SBATCH --partition=gpu
+#SBATCH --job-name=llama-final
+#SBATCH --partition=coc-gpu
+#SBATCH --qos=coc-ice
+#SBATCH --gres=gpu:v100:1
+#SBATCH --cpus-per-task=12
+#SBATCH --mem=48G
 #SBATCH --time=04:00:00
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:A100:1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --output=%j.out
-#SBATCH --error=%j.err
+#SBATCH --output=logs/%j.out
+#SBATCH --error=logs/%j.err
 
-module load anaconda3/2023.09
-module load cuda/12.2.0
-module load cudnn/8.9.4
+source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
+conda activate llm1b
 
-conda activate llm_interpretability
-
-cd $HOME/llm_interpretability
-
-python llama_3.2_1B_xai.py \
-  --model-name meta-llama/Llama-3.2-1B \
-  --output-dir outputs/pace_xai_analysis \
-  --train-size 2000 \
-  --eval-sample-size 100 \
-  --epochs 2.0 \
-  --finetune \
-  --run-xai \
-  --load-in-4bit \
-  --huggingface-token <your_hf_token>
+python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
+    --model-name meta-llama/Llama-3.2-1B \
+    --train-size 8000 \
+    --epochs 3 \
+    --output-dir outputs/run_$(date +%m%d_%H%M) \
+    --finetune \
+    --run-lime \
+    --run-xai \
+    --load-in-4bit
+    --huggingface-token <your_hf_token>
 ```
 
 Submit the job:
