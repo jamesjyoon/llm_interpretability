@@ -159,7 +159,7 @@ The ICE (Interactive Cluster Environment) and PACE (Partnership for an Advanced 
 
 ### Submitting a Job via SLURM
 
-Create a submission script (e.g., `llama_xai.slurm`):
+Create a submission script (e.g., `llama_xai.sbatch`):
 
 ```bash
 #!/bin/bash
@@ -195,7 +195,7 @@ python llama_3.2_1B_xai.py \
 
 Submit the job:
 ```bash
-sbatch llama_xai.slurm
+sbatch llama_xai.sbatch
 ```
 
 ### Monitoring Jobs
