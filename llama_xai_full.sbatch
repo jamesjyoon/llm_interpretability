@@ -12,7 +12,7 @@
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
-python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_full.py \
+python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_xai_full.py \
     --model-name meta-llama/Llama-3.2-1B \
     --train-size -1 \
     --epochs 3 \
