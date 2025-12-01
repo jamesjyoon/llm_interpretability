@@ -17,17 +17,19 @@ The implementation is designed to be accessible and reproducible, with Colab-opt
 
 ## Interpretability Methods
 
-This implementation references two major approaches for model explanation:
+This implementation references three major approaches for model explanation:
 
 - **LIME (Local Interpretable Model-agnostic Explanations)**: A perturbation-based technique that trains local surrogate models to identify feature importance. While model-agnostic and easy to apply to text, it can be sensitive to sampling strategies.
 
 - **KernelSHAP**: Approximates Shapley values using a weighted kernel that emphasizes coalitions near the original input. It inherits desirable properties (local accuracy, missingness, consistency) while remaining practical for deep networks through sampling.
+- 
+- **ROAR (Remove And Retrain)**: A direct faithfulness evaluation method that measures how much model accuracy drops when top-ranked features are iteratively removed and the model is retrained. While computationally expensive for large models, ROAR provides a strong empirical measure of explanation fidelity.
 
 For classification evaluation, we complement accuracy-based metrics with the **Matthews Correlation Coefficient (MCC)**, which provides a balanced score (−1 to +1) that remains informative under class imbalance. An MCC of +1 indicates perfect predictions, 0 matches random guessing, and −1 reflects complete disagreement.
 
 
 Methodology: Computed vs. Static Properties
-The evaluation of XAI properties (F1–F11) in experiments_llama_3.2_1B.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
+The evaluation of XAI properties (F1–F11) in llama_3.2_1B_xai_full.py and llama_3.2_1B_roar.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
 1. Dynamically Computed Properties
 These scores are calculated during execution based on the specific Llama-3.2-1B model and SST-2 dataset:
 F1.1 Scope: Measures the diversity of features selected across the evaluation set.
@@ -254,7 +256,7 @@ Create a submission script (e.g., `llama_xai.sbatch`):
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
-python /storage/ice1/6/3/jyoon370/llm-interpretability/experiments_llama_3.2_1B.py \
+python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai_full.py and llama_3.2_1B_roar.py \
     --model-name meta-llama/Llama-3.2-1B \
     --train-size 8000 \
     --epochs 3 \
