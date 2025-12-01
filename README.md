@@ -113,6 +113,66 @@ The pipeline generates the following outputs in the specified `--output-dir`:
 - **Fine-Tuning Details**: During fine-tuning, instruction tokens are masked with `-100` so the loss only supervises the appended label token, keeping LoRA updates focused on classification decisions.
 - **Output Visualization**: Charts render inline in Colab notebooks when available; otherwise they are saved as PNG files.
 
+## Implementation Details: llama_3.2_1B_roar.py
+
+The `llama_3.2_1B_roar.py` script implements Remove And Retrain (ROAR) based faithfulness analysis for the Llama 3.2 1B model. ROAR is a direct faithfulness evaluation method that measures the impact of removing important features on model performance.
+
+### Key Capabilities
+
+- **ROAR Faithfulness Evaluation**: Iteratively removes top-ranked features and retrains the model to measure accuracy drops
+- **Attribution Integration**: Uses LIME and KernelSHAP feature importances as the basis for removal ranking
+- **Dual Path Evaluation**: Evaluates both zero-shot and fine-tuned models
+- **Metric Aggregation**: Computes fidelity scores by analyzing performance degradation curves
+
+### Script Arguments
+
+- `--model-name`: Llama model checkpoint (default: `meta-llama/Llama-3.2-1B`)
+- `--output-dir`: Directory for saving ROAR analysis results
+- `--train-size`: Number of training samples for retraining (default: 1000)
+- `--eval-sample-size`: Number of evaluation samples for ROAR computation (default: 50)
+- `--finetune`: Enable LoRA fine-tuning before ROAR analysis
+- `--load-in-4bit`: Use 4-bit quantization for memory efficiency
+- `--huggingface-token`: Authentication token for gated models
+
+### Output Files
+
+- `roar_metrics.json`: ROAR faithfulness scores for LIME and KernelSHAP
+- `roar_comparison.png`: Visualization of feature removal impact on accuracy
+- `roar_analysis_results.json`: Detailed results including per-feature removal metrics
+
+## Implementation Details: llama_3.2_1B_xai_full.py
+
+The `llama_3.2_1B_xai_full.py` script provides an extended implementation that combines multiple XAI evaluation methods including LIME, KernelSHAP, and ROAR in a unified pipeline. This comprehensive script enables side-by-side comparison of multiple faithfulness and interpretability metrics.
+
+### Key Capabilities
+
+- **Integrated XAI Pipeline**: Combines LIME, KernelSHAP, and ROAR evaluations in a single execution
+- **Comprehensive Metrics**: Computes functionally-grounded properties (F1-F11) alongside faithfulness metrics
+- **Multi-Method Comparison**: Enables detailed comparison of different XAI explanation methods
+- **Visualization Suite**: Generates comparative visualizations across all evaluation methods
+- **Dual Model Analysis**: Evaluates both zero-shot and fine-tuned configurations
+
+### Script Arguments
+
+- `--model-name`: Llama model checkpoint (default: `meta-llama/Llama-3.2-1B`)
+- `--output-dir`: Directory for saving comprehensive XAI analysis
+- `--train-size`: Number of training samples for fine-tuning (default: 1000)
+- `--eval-sample-size`: Number of evaluation samples (default: 50)
+- `--epochs`: Number of fine-tuning epochs (default: 1.0)
+- `--finetune`: Enable LoRA fine-tuning
+- `--run-xai`: Compute functionally-grounded XAI properties (default: True)
+- `--run-roar`: Compute ROAR faithfulness metrics (default: True)
+- `--load-in-4bit`: Use 4-bit quantization for memory efficiency
+- `--huggingface-token`: Authentication token for gated models
+
+### Output Files
+
+- `xai_full_metrics.json`: Complete metrics including XAI properties and ROAR scores
+- `xai_full_comparison.png`: Integrated comparison visualization of all XAI methods
+- `roar_metrics.json`: ROAR faithfulness scores
+- `xai_properties_results.json`: Functionally-grounded property scores
+- `model_performance_comparison.png`: Performance metrics comparison
+
 ## Implementation Details: llama_3.2_1B_xai.py
 
 The `llama_3.2_1B_xai.py` script provides a focused implementation for XAI (Explainable AI) property analysis on the Llama 3.2 1B model. This file is specifically designed for detailed evaluation of model interpretability across zero-shot and fine-tuned configurations using functionally-grounded explanations.
