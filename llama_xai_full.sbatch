@@ -20,4 +20,4 @@ python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai_full.py 
     --finetune \
     --run-lime \
     --run-xai \
-    --load-in-8bit
+    --load-in-4bit
