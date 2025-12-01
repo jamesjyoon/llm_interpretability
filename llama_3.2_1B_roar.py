@@ -18,8 +18,9 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model-name", default="meta-llama/Llama-3.2-1B")
     parser.add_argument("--output-dir", default="outputs/roar_experiment")
-    # ROAR requires explaining the TRAINING data. Keep small (e.g. 200-500) for speed.
-    parser.add_argument("--train-size", type=int, default=500) 
+    # ROAR requires explaining the TRAINING data.
+    # 200 samples is a good balance for a 4-hour job.
+    parser.add_argument("--train-size", type=int, default=200) 
     parser.add_argument("--mask-percentage", type=float, default=0.2, help="Remove top 20% of words")
     parser.add_argument("--huggingface-token", type=str, default=None)
     return parser.parse_args()
@@ -52,15 +53,9 @@ def create_modified_dataset(original_data, model, tokenizer, strategy="roar_lime
     print(f"\nGenerating modified dataset: STRATEGY = {strategy.upper()}...")
     predict_fn = get_predict_fn(model, tokenizer)
     
-    # Initialize Explainers
+    # Initialize LIME Explainer (SHAP will use a custom wrapper)
     lime_explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     
-    # SHAP Background setup
-    # Use a small background sample for speed
-    bg_data = [x['sentence'] for x in original_data.select(range(min(10, len(original_data))))]
-    bg_data_reshaped = np.array(bg_data).reshape(-1, 1) 
-    shap_explainer = shap.KernelExplainer(predict_fn, bg_data_reshaped)
-
     new_sentences = []
     new_labels = []
     
@@ -68,38 +63,58 @@ def create_modified_dataset(original_data, model, tokenizer, strategy="roar_lime
         text = original_data[i]['sentence']
         label = original_data[i]['label']
         words = text.split()
-        # Ensure we mask at least 1 word if text is short
-        num_to_mask = max(1, int(len(words) * percentage))
         
+        # Determine how many words to mask
+        num_to_mask = max(1, int(len(words) * percentage))
         words_to_mask = []
         
         if strategy == "roar_lime":
-            # num_samples=30 is low for speed; increase for precision
+            # num_samples=30 is low for speed; increase to 100+ for better precision if time allows
             exp = lime_explainer.explain_instance(text, predict_fn, num_features=num_to_mask, num_samples=30)
             words_to_mask = [x[0] for x in exp.as_list()]
             
         elif strategy == "roar_shap":
-            text_reshaped = np.array([text]).reshape(1, -1)
-            # nsamples=20 is very low for speed
-            shap_vals = shap_explainer.shap_values(text_reshaped, nsamples=20)
+            # --- CUSTOM SHAP WRAPPER FOR WORDS ---
+            # KernelSHAP needs a function that maps binary masks to predictions
+            # 1 = word present, 0 = word removed ([UNK])
+            def shap_target_fn(masks):
+                # masks shape: (nsamples, nwords)
+                texts_batch = []
+                for mask in masks:
+                    # Reconstruct text based on mask
+                    masked_words = [words[j] if mask[j] == 1 else "[UNK]" for j in range(len(words))]
+                    texts_batch.append(" ".join(masked_words))
+                return predict_fn(texts_batch)
             
-            # Extract top words. shap_vals is usually list [class0, class1] or array
-            vals = shap_vals[1][0] if isinstance(shap_vals, list) else shap_vals[0]
-            
-            # Get indices of top values (absolute magnitude)
-            top_indices = np.argsort(-np.abs(vals))[:num_to_mask]
-            
-            for idx in top_indices:
-                if idx < len(words):
+            # Background: All zeros (all words masked)
+            # Input: All ones (all words present)
+            num_features = len(words)
+            if num_features > 0:
+                background = np.zeros((1, num_features))
+                explainer = shap.KernelExplainer(shap_target_fn, background)
+                
+                # Run SHAP for the single instance (all words present)
+                # nsamples=30 matches LIME effort
+                shap_values = explainer.shap_values(np.ones((1, num_features)), nsamples=30, silent=True)
+                
+                # shap_values is list [class0_vals, class1_vals]. Take Class 1.
+                vals = shap_values[1][0] # Shape (n_features,)
+                
+                # Get indices of top words (highest absolute importance)
+                top_indices = np.argsort(-np.abs(vals))[:num_to_mask].flatten()
+                
+                for idx in top_indices:
                     words_to_mask.append(words[idx])
 
         elif strategy == "random":
-            words_to_mask = random.sample(words, min(len(words), num_to_mask))
+            if len(words) > 0:
+                words_to_mask = random.sample(words, min(len(words), num_to_mask))
             
         # --- MASKING LOGIC ---
         modified_text = text
         for w in words_to_mask:
             # Replace word with [UNK] marker
+            # Using split/join is safer to avoid substring replacement issues, but simple replace works for ROAR proxy
             modified_text = modified_text.replace(w, "[UNK]") 
             
         new_sentences.append(modified_text)
@@ -116,6 +131,7 @@ def train_and_evaluate(dataset_name, train_data, eval_data, args):
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, token=args.huggingface_token)
     tokenizer.pad_token = tokenizer.eos_token
     
+    # 4-bit Quantization
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, 
         bnb_4bit_use_double_quant=True, bnb_4bit_quant_type="nf4"
@@ -141,8 +157,7 @@ def train_and_evaluate(dataset_name, train_data, eval_data, args):
             input_ids = tokenized["input_ids"][i]
             labels = list(input_ids)
             
-            # 1. Mask Prompt
-            # add_special_tokens=True ensures we account for BOS token if present
+            # 1. Mask Prompt (Instruction)
             prompt_len = len(tokenizer(pt, add_special_tokens=True)["input_ids"])
             labels[:prompt_len] = [-100] * prompt_len
             
@@ -198,7 +213,7 @@ def main():
     
     # Load Data
     full_data = load_dataset("stanfordnlp/sst2")
-    # Small subset for ROAR generation
+    # Using small subset for speed. Increase to 500-1000 for better results if time permits.
     train_subset = full_data["train"].shuffle(seed=42).select(range(args.train_size))
     eval_data = full_data["validation"]
     
@@ -239,9 +254,10 @@ def main():
     print("\n" + "="*50)
     print("FINAL ROAR SCORES (F7.2)")
     print("="*50)
-    print(f"Accuracy Random: {acc_rand:.4f}")
-    print(f"Accuracy LIME:   {acc_lime:.4f}")
-    print(f"Accuracy SHAP:   {acc_shap:.4f}")
+    print(f"Accuracy Baseline: {acc_base:.4f}")
+    print(f"Accuracy Random:   {acc_rand:.4f}")
+    print(f"Accuracy LIME:     {acc_lime:.4f}")
+    print(f"Accuracy SHAP:     {acc_shap:.4f}")
     print("-" * 30)
     
     # Calculate Score: (Random Acc - XAI Acc)
