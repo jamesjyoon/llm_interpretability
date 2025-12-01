@@ -53,7 +53,7 @@ def create_modified_dataset(original_data, model, tokenizer, strategy="roar_lime
     print(f"\nGenerating modified dataset: STRATEGY = {strategy.upper()}...")
     predict_fn = get_predict_fn(model, tokenizer)
     
-    # Initialize LIME Explainer (SHAP will use a custom wrapper)
+    # Initialize LIME Explainer
     lime_explainer = LimeTextExplainer(class_names=["Negative", "Positive"])
     
     new_sentences = []
@@ -75,36 +75,45 @@ def create_modified_dataset(original_data, model, tokenizer, strategy="roar_lime
             
         elif strategy == "roar_shap":
             # --- CUSTOM SHAP WRAPPER FOR WORDS ---
-            # KernelSHAP needs a function that maps binary masks to predictions
-            # 1 = word present, 0 = word removed ([UNK])
+            # 1. Define wrapper that maps binary masks to Class 1 Probability
             def shap_target_fn(masks):
                 # masks shape: (nsamples, nwords)
                 texts_batch = []
                 for mask in masks:
-                    # Reconstruct text based on mask
                     masked_words = [words[j] if mask[j] == 1 else "[UNK]" for j in range(len(words))]
                     texts_batch.append(" ".join(masked_words))
-                return predict_fn(texts_batch)
+                
+                # Predict and return ONLY Class 1 probability
+                # This ensures SHAP returns a single output array, avoiding IndexError
+                preds = predict_fn(texts_batch)
+                return preds[:, 1]
             
-            # Background: All zeros (all words masked)
-            # Input: All ones (all words present)
+            # 2. Run SHAP
             num_features = len(words)
             if num_features > 0:
                 background = np.zeros((1, num_features))
                 explainer = shap.KernelExplainer(shap_target_fn, background)
                 
-                # Run SHAP for the single instance (all words present)
-                # nsamples=30 matches LIME effort
+                # Run for single instance (all words present)
                 shap_values = explainer.shap_values(np.ones((1, num_features)), nsamples=30, silent=True)
                 
-                # shap_values is list [class0_vals, class1_vals]. Take Class 1.
-                vals = shap_values[1][0] # Shape (n_features,)
+                # 3. Safe Extraction of Values
+                # If list (from some shap versions), take first element. If array, take it directly.
+                if isinstance(shap_values, list):
+                    vals = shap_values[0] 
+                else:
+                    vals = shap_values
                 
-                # Get indices of top words (highest absolute importance)
-                top_indices = np.argsort(-np.abs(vals))[:num_to_mask].flatten()
+                # vals is now shape (1, features). Flatten to (features,)
+                vals = vals.flatten()
+                
+                # 4. Get indices of top words (highest absolute importance)
+                top_indices = np.argsort(-np.abs(vals))[:num_to_mask]
                 
                 for idx in top_indices:
-                    words_to_mask.append(words[idx])
+                    # idx should be integer, but double check bounds
+                    if idx < len(words):
+                        words_to_mask.append(words[idx])
 
         elif strategy == "random":
             if len(words) > 0:
@@ -114,7 +123,6 @@ def create_modified_dataset(original_data, model, tokenizer, strategy="roar_lime
         modified_text = text
         for w in words_to_mask:
             # Replace word with [UNK] marker
-            # Using split/join is safer to avoid substring replacement issues, but simple replace works for ROAR proxy
             modified_text = modified_text.replace(w, "[UNK]") 
             
         new_sentences.append(modified_text)
