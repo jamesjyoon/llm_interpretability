@@ -3,6 +3,8 @@ import random
 import numpy as np
 import torch
 import copy
+import os  # Added for directory management
+import matplotlib.pyplot as plt # Added for plotting
 from datasets import load_dataset, Dataset
 from sklearn.metrics import accuracy_score
 from transformers import AutoTokenizer, AutoModelForCausalLM, Trainer, TrainingArguments, DataCollatorForLanguageModeling, BitsAndBytesConfig, set_seed
@@ -215,6 +217,41 @@ def train_and_evaluate(dataset_name, train_data, eval_data, args):
     print(f"Result for {dataset_name}: Accuracy = {acc:.4f}")
     return acc
 
+def plot_roar_results(acc_base, acc_rand, acc_lime, acc_shap, output_dir):
+    """
+    Generates and saves a bar chart comparing ROAR accuracies.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Data configuration
+    labels = ['Baseline', 'Random\n(Control)', 'LIME\n(ROAR)', 'SHAP\n(ROAR)']
+    values = [acc_base, acc_rand, acc_lime, acc_shap]
+    colors = ['#bdc3c7', '#f1c40f', '#3498db', '#e74c3c'] # Gray, Yellow, Blue, Red
+    
+    # Create figure
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(labels, values, color=colors, edgecolor='black', alpha=0.9)
+    
+    # Formatting
+    plt.ylabel('Model Accuracy', fontsize=12)
+    plt.title('ROAR Experiment Results\n(Lower Accuracy = Better Explanation Faithfulness)', fontsize=14, fontweight='bold')
+    plt.ylim(0, 1.05) # Set limit slightly above 1.0 for label space
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    
+    # Add value labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height + 0.01,
+                 f'{height:.4f}',
+                 ha='center', va='bottom', fontsize=11, fontweight='bold')
+    
+    # Save
+    save_path = f"{output_dir}/roar_comparison_chart.png"
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+    print(f"\nChart saved to: {save_path}")
+
 def main():
     args = parse_args()
     set_seed(42)
@@ -258,7 +295,7 @@ def main():
     print("\nTraining SHAP ROAR...")
     acc_shap = train_and_evaluate("ROAR_SHAP", shap_dataset, eval_data, args)
     
-    # 3. Final Comparison
+    # 3. Final Comparison & Plotting
     print("\n" + "="*50)
     print("FINAL ROAR SCORES (F7.2)")
     print("="*50)
@@ -281,6 +318,9 @@ def main():
         print("\nWINNER: SHAP identified more faithful features.")
     else:
         print("\nTIE or FAILURE (Both performed worse than or equal to random).")
+
+    # Generate the Chart
+    plot_roar_results(acc_base, acc_rand, acc_lime, acc_shap, args.output_dir)
 
 if __name__ == "__main__":
     main()
