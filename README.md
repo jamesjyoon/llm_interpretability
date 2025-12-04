@@ -51,7 +51,7 @@ The following properties use fixed values. This section explains the rationale f
 | **F9.2 Identity (Stability)** | **Theoretical** | **KernelSHAP (5)** is mathematically proven to be deterministic (output is constant for constant input). **LIME (0.2)** is inherently stochastic due to random neighborhood sampling, leading to known instability. |
 | **F10 Uncertainty** | **Theoretical** | Uncertainty quantification is not implemented in the standard LIME/SHAP libraries. |
 
-**Note on ROAR Implementation:** The `llama_3.2_1B_xai_full.py` script uses the hardcoded ROAR scores shown above. For a computationally-driven, dynamic ROAR evaluation that trains multiple models, see `llama_3.2_1B_roar.py`.
+**Note on ROAR Implementation:** The `llama_3.2_1B_xai.py` script uses the hardcoded ROAR scores shown above. For a computationally-driven, dynamic ROAR evaluation that trains multiple models, see `llama_3.2_1B_roar.py`.
 
 
 ## Getting Started
@@ -147,39 +147,6 @@ The `llama_3.2_1B_roar.py` script implements Remove And Retrain (ROAR) based fai
 - `roar_comparison.png`: Visualization of feature removal impact on accuracy
 - `roar_analysis_results.json`: Detailed results including per-feature removal metrics
 
-## Implementation Details: llama_3.2_1B_xai_full.py
-
-The `llama_3.2_1B_xai_full.py` script provides an extended implementation that combines multiple XAI evaluation methods including LIME, KernelSHAP, and ROAR in a unified pipeline. This comprehensive script enables side-by-side comparison of multiple faithfulness and interpretability metrics.
-
-### Key Capabilities
-
-- **Integrated XAI Pipeline**: Combines LIME, KernelSHAP, and ROAR evaluations in a single execution
-- **Comprehensive Metrics**: Computes functionally-grounded properties (F1-F11) alongside faithfulness metrics
-- **Multi-Method Comparison**: Enables detailed comparison of different XAI explanation methods
-- **Visualization Suite**: Generates comparative visualizations across all evaluation methods
-- **Dual Model Analysis**: Evaluates both zero-shot and fine-tuned configurations
-
-### Script Arguments
-
-- `--model-name`: Llama model checkpoint (default: `meta-llama/Llama-3.2-1B`)
-- `--output-dir`: Directory for saving comprehensive XAI analysis
-- `--train-size`: Number of training samples for fine-tuning (default: 1000)
-- `--eval-sample-size`: Number of evaluation samples (default: 50)
-- `--epochs`: Number of fine-tuning epochs (default: 1.0)
-- `--finetune`: Enable LoRA fine-tuning
-- `--run-xai`: Compute functionally-grounded XAI properties (default: True)
-- `--run-roar`: Compute ROAR faithfulness metrics (default: True)
-- `--load-in-4bit`: Use 4-bit quantization for memory efficiency
-- `--huggingface-token`: Authentication token for gated models
-
-### Output Files
-
-- `xai_full_metrics.json`: Complete metrics including XAI properties and ROAR scores
-- `xai_full_comparison.png`: Integrated comparison visualization of all XAI methods
-- `roar_metrics.json`: ROAR faithfulness scores
-- `xai_properties_results.json`: Functionally-grounded property scores
-- `model_performance_comparison.png`: Performance metrics comparison
-
 ## Implementation Details: llama_3.2_1B_xai.py
 
 The `llama_3.2_1B_xai.py` script provides a focused implementation for XAI (Explainable AI) property analysis on the Llama 3.2 1B model. This file is specifically designed for detailed evaluation of model interpretability across zero-shot and fine-tuned configurations using functionally-grounded explanations.
@@ -261,7 +228,7 @@ Create a submission script (e.g., `llama_xai.sbatch`):
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
-python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai_full.py and llama_3.2_1B_roar.py \
+python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai.py and llama_3.2_1B_roar.py \
     --model-name meta-llama/Llama-3.2-1B \
     --train-size 8000 \
     --epochs 3 \
