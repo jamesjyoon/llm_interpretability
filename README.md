@@ -8,7 +8,7 @@ The implementation is designed to be accessible and reproducible, with Colab-opt
 
 ## Key Features
 
-- **Binary Classification Experiments**: Token-level interpretability analysis on the [Tweet Sentiment Extraction dataset](https://huggingface.co/datasets/mteb/tweet_sentiment_extraction)
+- **Binary Classification Experiments**: Token-level interpretability analysis on the The Stanford Sentiment Treebank (https://huggingface.co/datasets/stanfordnlp/sst2)
 - **Dual-Path Evaluation**: Direct comparison of zero-shot model behavior versus LoRA-adapted fine-tuned variants
 - **SHAP-Based Attribution**: Token-level explanation extraction with statistical aggregation
 - **Comprehensive Metrics**: Performance evaluation (accuracy, precision, recall, F1), interpretability metrics (sparsity, entropy, agreement), and effect size analysis
@@ -29,9 +29,11 @@ For classification evaluation, we complement accuracy-based metrics with the **M
 
 Methodology: Computed vs. Static Properties
 The evaluation of XAI properties (F1–F11) in llama_3.2_1B_xai_full.py and llama_3.2_1B_roar.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
-1. Dynamically Computed Properties
+# 1. Dynamically Computed Properties
 These scores are calculated during execution based on the specific Llama-3.2-1B model and SST-2 dataset: F1.1 Scope: Measures the diversity of features selected across the evaluation set. F1.4 Practicality: Calculated as the average of F11 (Speed) and F1.3 (Access). F3 Selectivity: Measures feature selectivity using Gini coefficient based on LIME/SHAP weights. F4.1 Contrastivity: Measures whether explanations contain both positive and negative contributions. F4.2 Target Sensitivity: Measures divergence in LIME explanations between opposite class labels. F6.1 Fidelity Check: Measures how well LIME/SHAP approximations match the model's predicted probabilities (scaled 0-5). F6.2 Surrogate Agreement: Measures fidelity on the original scale (0-1) for the local linear approximation. F7.1 Incremental Deletion: Measures prediction drop when top features are iteratively masked from the input. F9.1 Similarity (Stability): Measures consistency of explanations under input perturbations. F9.2 Identity: Measures consistency of feature rankings across multiple explanation runs. F11 Speed: Measures execution time per explanation (scaled to 1-5).
-2. Static (Hardcoded) Properties
+
+###########################################################################################################################################################
+3. Static (Hardcoded) Properties
 The following properties use fixed values. This section explains the rationale for each:
 
 | Property | Value Source | Rationale |
@@ -52,7 +54,7 @@ The following properties use fixed values. This section explains the rationale f
 | **F10 Uncertainty** | **Theoretical** | Uncertainty quantification is not implemented in the standard LIME/SHAP libraries. |
 
 **Note on ROAR Implementation:** The `llama_3.2_1B_xai.py` script uses the hardcoded ROAR scores shown above. For a computationally-driven, dynamic ROAR evaluation that trains multiple models, see `llama_3.2_1B_roar.py`.
-
+#############################################################################################################################################################
 
 ## Getting Started
 
