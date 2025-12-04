@@ -30,22 +30,26 @@ For classification evaluation, we complement accuracy-based metrics with the **M
 Methodology: Computed vs. Static Properties
 The evaluation of XAI properties (F1–F11) in llama_3.2_1B_xai_full.py and llama_3.2_1B_roar.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
 1. Dynamically Computed Properties
-These scores are calculated during execution based on the specific Llama-3.2-1B model and SST-2 dataset:
-F1.1 Scope: Measures the diversity of features selected across the evaluation set.
-F1.4 Practicality: Measures the wall-clock time required to generate explanations.
-F4.2 Target Sensitivity (LIME): Measures the divergence in explanations when querying opposite labels.
-F6.2 Surrogate Agreement (LIME): Measures the fidelity (R-squared/MAE) of the local linear approximation against the model's actual probabilities.
+These scores are calculated during execution based on the specific Llama-3.2-1B model and SST-2 dataset: F1.1 Scope: Measures the diversity of features selected across the evaluation set. F1.4 Practicality: Calculated as the average of F11 (Speed) and F1.3 (Access). F3 Selectivity: Measures feature selectivity using Gini coefficient based on LIME/SHAP weights. F4.1 Contrastivity: Measures whether explanations contain both positive and negative contributions. F4.2 Target Sensitivity: Measures divergence in LIME explanations between opposite class labels. F6.1 Fidelity Check: Measures how well LIME/SHAP approximations match the model's predicted probabilities (scaled 0-5). F6.2 Surrogate Agreement: Measures fidelity on the original scale (0-1) for the local linear approximation. F7.1 Incremental Deletion: Measures prediction drop when top features are iteratively masked from the input. F9.1 Similarity (Stability): Measures consistency of explanations under input perturbations. F9.2 Identity: Measures consistency of feature rankings across multiple explanation runs. F11 Speed: Measures execution time per explanation (scaled to 1-5).
 2. Static (Hardcoded) Properties
 The following properties use fixed values. This section explains the rationale for each:
 
 | Property | Value Source | Rationale |
-| :--- | :--- | :--- |
-| **F9.2 Identity (Stability)** | **Theoretical** | **KernelSHAP (1.0)** is mathematically proven to be deterministic (output is constant for constant input). **LIME (0.2)** is inherently stochastic due to random neighborhood sampling, leading to known instability. |
+| --- | --- | --- |
 | **F1.2 Portability** | **Theoretical** | Both methods are "Model-Agnostic" by design, meaning they can be applied to any black-box model. This is a binary feature of the algorithm, not a runtime metric. |
-| **F2.1 Expressive Power** | **Theoretical** | **LIME (4.7)** generates a weighted linear formula, which is considered highly expressive. **SHAP (3.0)** generates additive feature values, which implies feature independence and is slightly less expressive regarding interactions. |
-| **F7.2 ROAR (Faithfulness)** | **Computational** | *Remove And Retrain (ROAR)* requires retraining the LLM dozens of times to measure accuracy drops when top features are removed. We utilize scores (LIME 0.58, SHAP 0.60) obtained from running this benchmark. 
+| **F1.3 Access** | **Theoretical** | Both LIME and KernelSHAP are readily accessible through scikit-learn and SHAP libraries, requiring minimal setup. |
+| **F2.1 Expressive Power** | **Theoretical** | **LIME (3)** generates a weighted linear formula. **KernelSHAP (3)** generates additive feature values, both are moderately expressive. |
 | **F2.2 Graphical Integrity** | **Qualitative** | This measures the visual clarity of the output (e.g., bar charts). As this is a subjective Human-Computer Interaction (HCI) metric, it cannot be computed by a script. |
-| **F6.2 Surrogate Agreement (SHAP)** | **Computational** | **SHAP (0.6)**. Calculating exact fidelity for KernelSHAP requires convergence (thousands of samples), which is too slow for this script. A conservative estimate is used based on the low `nsamples` setting used in this experiment. |
+| **F2.3 Morphological Clarity** | **Theoretical** | Both methods produce interpretable feature-importance visualizations with clear structure. |
+| **F2.4 Layer Separation** | **Theoretical** | Both methods operate as post-hoc explainers without layer-specific separation; assigned minimal value. |
+| **F5.1 Interaction Level** | **Theoretical** | Both methods handle feature interactions implicitly but do not explicitly model them. |
+| **F5.2 Controllability** | **Theoretical** | Limited user control over explanation generation process in the default implementation. |
+| **F7.2 ROAR (Faithfulness)** | **Computational** | Remove And Retrain (ROAR) requires retraining the LLM dozens of times. We utilize scores (LIME 0.58, SHAP 0.60) obtained from running this benchmark. |
+| **F7.3 White Box Check** | **Theoretical** | Both LIME and KernelSHAP are model-agnostic (treat model as black-box); no white-box adaptation provided. |
+| **F8.1 Reality Check** | **Theoretical** | Explanations remain grounded in actual model predictions and feature importance. |
+| **F8.2 Bias Detection** | **Qualitative** | Bias detection requires domain expertise and manual inspection; not automatically computed. |
+| **F9.2 Identity (Stability)** | **Theoretical** | **KernelSHAP (5)** is mathematically proven to be deterministic (output is constant for constant input). **LIME (0.2)** is inherently stochastic due to random neighborhood sampling, leading to known instability. |
+| **F10 Uncertainty** | **Theoretical** | Uncertainty quantification is not implemented in the standard LIME/SHAP libraries. |
 
 **Note on ROAR Implementation:** The `llama_3.2_1B_xai_full.py` script uses the hardcoded ROAR scores shown above. For a computationally-driven, dynamic ROAR evaluation that trains multiple models, see `llama_3.2_1B_roar.py`.
 
