@@ -28,7 +28,7 @@ For classification evaluation, we complement accuracy-based metrics with the **M
 
 
 Methodology: Computed vs. Static Properties
-The evaluation of XAI properties (F1–F11) in llama_3.2_1B_xai_full.py and llama_3.2_1B_roar.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
+The evaluation of XAI properties (F1–F11) in llama_3.2_1B_xai_2.py and llama_3.2_1B_roar.py utilizes a hybrid approach. While properties dependent on the data distribution are calculated at runtime, properties inherent to the algorithmic design of LIME/SHAP or those requiring prohibitive computational resources are assigned static values based on established literature.
 
 Dynamically Computed Properties
 
@@ -209,9 +209,9 @@ Create a submission script (e.g., `llama_xai.sbatch`):
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
 
-python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai.py and llama_3.2_1B_roar.py \
+python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai.py and llama_3.2_1B_xai_2.py \
     --model-name meta-llama/Llama-3.2-1B \
-    --train-size 8000 \
+    --train-size -1 \
     --epochs 3 \
     --output-dir outputs/run_$(date +%m%d_%H%M) \
     --finetune \
