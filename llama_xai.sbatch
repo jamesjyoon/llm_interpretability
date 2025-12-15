@@ -11,6 +11,7 @@
 
 source /storage/ice1/6/3/jyoon370/miniconda3/etc/profile.d/conda.sh
 conda activate llm1b
+module load cudnn/9.2.0.82-12-cuda
 
 python /storage/ice1/6/3/jyoon370/llm-interpretability/llama_3.2_1B_xai_3.py \
     --model-name meta-llama/Llama-3.2-1B \
