@@ -499,11 +499,22 @@ def plot_xai_properties(results, output_dir, phase_name=""):
     plt.savefig(f"{output_dir}/xai_properties_comparison_{phase_name.lower().replace(' ', '_')}.png", dpi=300)
     plt.close()
 
+class NumpyEncoder(json.JSONEncoder):
+    """ Special json encoder for numpy types """
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+        
 def save_data(output_dir, metrics, props):
     with open(f"{output_dir}/metrics_comparison.json", "w") as f: 
-        json.dump(metrics, f, indent=2)
+        json.dump(metrics, f, indent=2, cls=NumpyEncoder)
     with open(f"{output_dir}/xai_properties_results.json", "w") as f: 
-        json.dump(props, f, indent=2)
+        json.dump(props, f, indent=2, cls=NumpyEncoder)
 
 def main():
     args = parse_arguments()
