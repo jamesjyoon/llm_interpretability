@@ -1,11 +1,19 @@
+import sys
+import warnings
+import torch
+
+try:
+    import torch._inductor.config
+except ImportError:
+    pass
 from unsloth import FastLanguageModel
+
 import argparse
 import json
 import os
 import random
 import time
 import numpy as np
-import torch
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, matthews_corrcoef
@@ -14,9 +22,7 @@ from trl import SFTTrainer
 from lime.lime_text import LimeTextExplainer
 import shap
 from tqdm import tqdm
-import warnings
 
-# Suppress warnings
 warnings.filterwarnings("ignore")
 
 def parse_arguments():
