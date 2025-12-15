@@ -12,3 +12,4 @@ lime
 tqdm
 captum==0.8.0
 shap
+unsloth
